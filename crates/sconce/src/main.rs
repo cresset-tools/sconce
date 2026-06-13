@@ -1,9 +1,10 @@
 //! `sconce` — a self-hostable, Composer-compatible private repository.
 //!
-//! This binary is in its earliest form: it exposes the deterministic archiver
-//! ([`sconce_archive`]), the git-tree reader ([`sconce_git`]), and the
-//! content-addressed store ([`sconce_cas`]) over the command line. The catalog,
-//! mirror workers, and dynamic Composer serving land on top of this foundation.
+//! The CLI over the whole engine: mirror git sources into a repository, serve
+//! the Composer v2 wire API, manage orgs/repos, read tokens, supply-chain
+//! controls (cooldown / hold / approve), agency curation (`grant`), and seller
+//! license keys (`license-create`). The low-level `archive`/`ingest` commands
+//! expose the deterministic archiver + CAS directly.
 
 use std::path::{Path, PathBuf};
 
