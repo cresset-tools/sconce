@@ -2564,6 +2564,7 @@ dependencies = [
  "sconce-cas",
  "sconce-catalog",
  "sconce-metadata",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

@@ -159,6 +159,20 @@ enum Command {
         base_url: String,
     },
 
+    /// Serve the admin web UI (operator dashboard). No auth — bind to localhost
+    /// or put behind your own auth.
+    Ui {
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8081")]
+        listen: std::net::SocketAddr,
+        /// Public base URL of the Composer endpoint (for install snippets).
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        public_base_url: String,
+    },
+
     /// Manage read tokens (the repo is private; clients authenticate with one).
     Token {
         #[command(subcommand)]
@@ -265,6 +279,11 @@ fn main() -> Result<()> {
             listen,
             base_url,
         } => serve(&cas, &database_url, listen, base_url),
+        Command::Ui {
+            database_url,
+            listen,
+            public_base_url,
+        } => ui(&database_url, listen, public_base_url),
         Command::OrgCreate {
             slug,
             name,
@@ -503,6 +522,23 @@ fn serve(
         sconce_server::serve(catalog, store, base_url, listen)
             .await
             .context("serving")?;
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn ui(database_url: &str, listen: std::net::SocketAddr, public_base_url: String) -> Result<()> {
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+        println!("sconce admin UI on http://{listen}");
+        sconce_server::ui::serve(catalog, public_base_url, listen)
+            .await
+            .context("serving UI")?;
         Ok::<_, anyhow::Error>(())
     })
 }

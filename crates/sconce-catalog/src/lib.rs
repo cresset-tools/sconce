@@ -57,6 +57,29 @@ pub struct Catalog {
     pool: PgPool,
 }
 
+/// A repository in the admin listing.
+#[derive(Debug, Clone)]
+pub struct RepoSummary {
+    pub org: String,
+    pub repo: String,
+    pub id: Uuid,
+    pub update_mode: String,
+    pub cooldown_days: i32,
+}
+
+/// A version row for the admin UI, with its control state.
+#[derive(Debug, Clone)]
+pub struct AdminVersion {
+    pub package: String,
+    pub version: String,
+    pub normalized_version: String,
+    pub stability: String,
+    pub held: bool,
+    pub approved: bool,
+    /// Release time as text (`null` if unknown).
+    pub released_at: Option<String>,
+}
+
 /// A package version as stored in the catalog.
 #[derive(Debug, Clone)]
 pub struct PackageVersion {
@@ -128,6 +151,70 @@ impl Catalog {
         .bind(repo_slug)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// All repositories, for the admin dashboard.
+    pub async fn list_repositories(&self) -> Result<Vec<RepoSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select o.slug as org, r.slug as repo, r.id as id, \
+                    r.update_mode as update_mode, r.cooldown_days as cooldown_days \
+             from repositories r join organizations o on o.id = r.org_id \
+             order by o.slug, r.slug",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RepoSummary {
+                    org: row.try_get("org")?,
+                    repo: row.try_get("repo")?,
+                    id: row.try_get("id")?,
+                    update_mode: row.try_get("update_mode")?,
+                    cooldown_days: row.try_get("cooldown_days")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every version of every package **owned** by a repo, with control state —
+    /// the admin view (unlike `visible_versions`, it ignores policy/holds so the
+    /// operator can see and act on everything).
+    pub async fn admin_package_versions(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<Vec<AdminVersion>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select p.name as package, pv.version, pv.normalized_version, pv.stability, \
+                    (pv.held_at is not null) as held, (pv.approved_at is not null) as approved, \
+                    pv.released_at::text as released_at \
+             from package_versions pv join packages p on p.id = pv.package_id \
+             where p.repo_id = $1 \
+             order by p.name, pv.normalized_version",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(AdminVersion {
+                    package: row.try_get("package")?,
+                    version: row.try_get("version")?,
+                    normalized_version: row.try_get("normalized_version")?,
+                    stability: row.try_get("stability")?,
+                    held: row.try_get("held")?,
+                    approved: row.try_get("approved")?,
+                    released_at: row.try_get("released_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Number of read tokens for a repository.
+    pub async fn repo_token_count(&self, repo_id: Uuid) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("select count(*) from tokens where repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
     }
 
     /// Apply any pending migrations. Idempotent; safe to call on every startup.

@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ui;
+
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
