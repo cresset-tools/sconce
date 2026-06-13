@@ -1,0 +1,20 @@
+[package]
+name = "sconce-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Closed-source for now: sconce is the internal engine behind Bougie Repo, not
+# a published crate. Flip to publish normally if/when we open-source.
+publish = false
+description = "Deterministic, content-addressable archive writer for sconce. Same file tree → byte-identical ZIP, so identical packages dedupe in CAS and dist.shasum stays stable."
+
+[dependencies]
+
+[dev-dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

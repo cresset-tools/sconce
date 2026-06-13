@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sconce",
+    "crates/sconce-archive",
+]
+
+[workspace.package]
+version = "0.1.0" # x-release-please-version
+edition = "2024"
+rust-version = "1.96"
+# Proprietary, all rights reserved (see LICENSE). Diverges from the rest of the
+# cresset-tools family (EUPL-1.2) — sconce is closed-source. SPDX custom ref;
+# crates are `publish = false` so this never reaches a registry.
+license = "LicenseRef-Proprietary"
+authors = ["Jelle Besseling <jelle@pingiun.com>"]
+repository = "https://github.com/cresset-tools/sconce"
+
+# Intra-workspace deps centralized so members reference them with
+# `{ workspace = true }`. Each carries both `path` (local builds) and a
+# `version` (crates.io publish — cargo rejects a published crate whose deps
+# lack a version). The trailing release-please marker lets the tool rewrite
+# all of them in lockstep with `[workspace.package].version` above.
+[workspace.dependencies]
+sconce-archive = { path = "crates/sconce-archive", version = "0.1.0" } # x-release-please-version
+
+# Shared external deps.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+# Smaller, faster, no panic-unwinder — mirrors the family default.
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+
+[profile.dist]
+inherits = "release"

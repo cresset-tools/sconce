@@ -1,0 +1,8 @@
+# Force LF line endings for every text file, regardless of contributors'
+# `core.autocrlf` setting — keeps diffs clean and, crucially, keeps the
+# archiver's golden-byte tests stable across platforms.
+* text=auto eol=lf
+
+# Cargo.lock is committed (sconce ships binaries) but is churny; treat
+# conflicts as binary so git doesn't try to 3-way-merge the lockfile.
+Cargo.lock merge=binary
