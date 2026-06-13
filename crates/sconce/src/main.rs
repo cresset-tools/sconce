@@ -71,8 +71,11 @@ enum Command {
     /// upserts the catalog. Idempotent — re-running dedupes blobs and upserts
     /// the same rows.
     Mirror {
-        /// Path to the git repository.
-        repo: PathBuf,
+        /// Path to the git checkout to mirror.
+        source: PathBuf,
+        /// Target catalog repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
         /// Public source URL recorded for the package (e.g. the git remote).
         #[arg(long)]
         git_url: String,
@@ -80,6 +83,26 @@ enum Command {
         #[arg(long)]
         cas: PathBuf,
         /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Create an organization.
+    OrgCreate {
+        /// Slug, e.g. `acme`.
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Create a repository in an organization.
+    RepoCreate {
+        /// Organization slug.
+        org: String,
+        /// Repository slug.
+        repo: String,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -114,6 +137,9 @@ enum Command {
 
     /// Place a security hold on a version (hides it from clients immediately).
     Hold {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
         /// Package name, e.g. `acme/widget`.
         package: String,
         /// Version/tag, e.g. `v1.2.0`.
@@ -124,6 +150,8 @@ enum Command {
 
     /// Release a hold on a version.
     Unhold {
+        #[arg(long)]
+        repo: String,
         package: String,
         version: String,
         #[arg(long, env = "DATABASE_URL")]
@@ -132,6 +160,8 @@ enum Command {
 
     /// Approve a version (reveal it under `manual`, or early under `delayed`).
     Approve {
+        #[arg(long)]
+        repo: String,
         package: String,
         version: String,
         #[arg(long, env = "DATABASE_URL")]
@@ -141,13 +171,17 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum PolicyAction {
-    /// Show the current update policy.
+    /// Show a repository's update policy.
     Show {
+        #[arg(long)]
+        repo: String,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
-    /// Set the update policy.
+    /// Set a repository's update policy.
     Set {
+        #[arg(long)]
+        repo: String,
         /// `auto` (everything visible), `manual` (only approved), or `delayed`
         /// (visible after the cooldown).
         #[arg(long)]
@@ -162,8 +196,11 @@ enum PolicyAction {
 
 #[derive(Subcommand, Debug)]
 enum TokenAction {
-    /// Create a new token and print it once (it is not recoverable afterward).
+    /// Create a new token for a repository and print it once.
     Create {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
         /// Optional human label.
         #[arg(long)]
         label: Option<String>,
@@ -180,46 +217,62 @@ fn main() -> Result<()> {
         Command::ArchiveRef { repo, r#ref, out } => archive_ref(&repo, &r#ref, &out),
         Command::Ingest { repo, r#ref, cas } => ingest(&repo, &r#ref, &cas),
         Command::Mirror {
+            source,
             repo,
             git_url,
             cas,
             database_url,
-        } => mirror(&repo, &git_url, &cas, &database_url),
+        } => mirror(&source, &repo, &git_url, &cas, &database_url),
         Command::Serve {
             cas,
             database_url,
             listen,
             base_url,
         } => serve(&cas, &database_url, listen, base_url),
+        Command::OrgCreate {
+            slug,
+            name,
+            database_url,
+        } => org_create(&slug, name.as_deref(), &database_url),
+        Command::RepoCreate {
+            org,
+            repo,
+            database_url,
+        } => repo_create(&org, &repo, &database_url),
         Command::Token { action } => match action {
             TokenAction::Create {
+                repo,
                 label,
                 database_url,
-            } => token_create(label.as_deref(), &database_url),
+            } => token_create(&repo, label.as_deref(), &database_url),
         },
         Command::Policy { action } => match action {
-            PolicyAction::Show { database_url } => policy_show(&database_url),
+            PolicyAction::Show { repo, database_url } => policy_show(&repo, &database_url),
             PolicyAction::Set {
+                repo,
                 mode,
                 cooldown_days,
                 database_url,
-            } => policy_set(&mode, cooldown_days, &database_url),
+            } => policy_set(&repo, &mode, cooldown_days, &database_url),
         },
         Command::Hold {
+            repo,
             package,
             version,
             database_url,
-        } => version_action("hold", &package, &version, &database_url),
+        } => version_action("hold", &repo, &package, &version, &database_url),
         Command::Unhold {
+            repo,
             package,
             version,
             database_url,
-        } => version_action("unhold", &package, &version, &database_url),
+        } => version_action("unhold", &repo, &package, &version, &database_url),
         Command::Approve {
+            repo,
             package,
             version,
             database_url,
-        } => version_action("approve", &package, &version, &database_url),
+        } => version_action("approve", &repo, &package, &version, &database_url),
     }
 }
 
@@ -238,63 +291,105 @@ where
     })
 }
 
-fn policy_show(database_url: &str) -> Result<()> {
-    with_catalog(database_url, async |catalog| {
-        let (mode, cooldown_days) = catalog.update_policy().await?;
-        println!("mode: {mode}");
-        println!("cooldown_days: {cooldown_days}");
-        Ok(())
+/// Resolve a `<org>/<repo>` spec to a repository id, erroring if unknown.
+async fn resolve_repo(catalog: &sconce_catalog::Catalog, spec: &str) -> Result<uuid::Uuid> {
+    let (org, repo) = spec
+        .split_once('/')
+        .with_context(|| format!("--repo must be <org>/<repo>, got '{spec}'"))?;
+    catalog.resolve_repo(org, repo).await?.with_context(|| {
+        format!("no such repository: {spec} (create it with `sconce repo-create`)")
     })
 }
 
-fn policy_set(mode: &str, cooldown_days: i32, database_url: &str) -> Result<()> {
+fn org_create(slug: &str, name: Option<&str>, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         catalog
-            .set_update_policy(mode, cooldown_days)
+            .create_org(slug, name)
             .await
-            .context("setting policy")?;
-        println!("policy set: mode={mode}, cooldown_days={cooldown_days}");
+            .context("creating org")?;
+        println!("org created: {slug}");
         Ok(())
     })
 }
 
-fn version_action(action: &str, package: &str, version: &str, database_url: &str) -> Result<()> {
+fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        catalog
+            .create_repo(org, repo)
+            .await
+            .with_context(|| format!("creating repo (does org '{org}' exist?)"))?;
+        println!("repo created: {org}/{repo}");
+        Ok(())
+    })
+}
+
+fn policy_show(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let (mode, cooldown_days) = catalog.update_policy(repo_id).await?;
+        println!("{repo}: mode={mode}, cooldown_days={cooldown_days}");
+        Ok(())
+    })
+}
+
+fn policy_set(repo: &str, mode: &str, cooldown_days: i32, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        catalog
+            .set_update_policy(repo_id, mode, cooldown_days)
+            .await
+            .context("setting policy")?;
+        println!("policy set for {repo}: mode={mode}, cooldown_days={cooldown_days}");
+        Ok(())
+    })
+}
+
+fn version_action(
+    action: &str,
+    repo: &str,
+    package: &str,
+    version: &str,
+    database_url: &str,
+) -> Result<()> {
     let normalized = sconce_mirror::normalize_tag(version)
         .map(|p| p.normalized)
         .with_context(|| format!("'{version}' is not a recognizable version"))?;
     with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
         let changed = match action {
-            "hold" => catalog.hold_version(package, &normalized).await?,
-            "unhold" => catalog.unhold_version(package, &normalized).await?,
-            "approve" => catalog.approve_version(package, &normalized).await?,
+            "hold" => catalog.hold_version(repo_id, package, &normalized).await?,
+            "unhold" => {
+                catalog
+                    .unhold_version(repo_id, package, &normalized)
+                    .await?
+            }
+            "approve" => {
+                catalog
+                    .approve_version(repo_id, package, &normalized)
+                    .await?
+            }
             _ => unreachable!(),
         };
         if changed {
-            println!("{action}: {package} {version} ({normalized})");
+            println!("{action}: {repo} {package} {version} ({normalized})");
             Ok(())
         } else {
-            anyhow::bail!("no such version: {package} {version} ({normalized})")
+            anyhow::bail!("no such version: {repo} {package} {version} ({normalized})")
         }
     })
 }
 
-fn token_create(label: Option<&str>, database_url: &str) -> Result<()> {
-    use sconce_catalog::Catalog;
-
-    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
-    runtime.block_on(async {
-        let catalog = Catalog::connect(database_url)
-            .await
-            .context("connecting to Postgres")?;
-        catalog.migrate().await.context("applying migrations")?;
+fn token_create(repo: &str, label: Option<&str>, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
         let token = catalog
-            .create_token(label)
+            .create_token(repo_id, label)
             .await
             .context("creating token")?;
         // The token itself goes to stdout (scriptable); the notice to stderr.
         println!("{token}");
-        eprintln!("Token created — store it now; it will not be shown again.");
-        Ok::<_, anyhow::Error>(())
+        eprintln!("Token created for {repo} — store it now; it will not be shown again.");
+        Ok(())
     })
 }
 
@@ -324,7 +419,7 @@ fn serve(
     })
 }
 
-fn mirror(repo: &Path, git_url: &str, cas: &Path, database_url: &str) -> Result<()> {
+fn mirror(source: &Path, repo: &str, git_url: &str, cas: &Path, database_url: &str) -> Result<()> {
     use sconce_cas::FsBlobStore;
     use sconce_catalog::Catalog;
 
@@ -338,10 +433,11 @@ fn mirror(repo: &Path, git_url: &str, cas: &Path, database_url: &str) -> Result<
             .await
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
+        let repo_id = resolve_repo(&catalog, repo).await?;
 
-        let report = sconce_mirror::mirror_git_source(repo, git_url, &store, &catalog)
+        let report = sconce_mirror::mirror_git_source(repo_id, source, git_url, &store, &catalog)
             .await
-            .with_context(|| format!("mirroring {}", repo.display()))?;
+            .with_context(|| format!("mirroring {} into {repo}", source.display()))?;
 
         for m in &report.mirrored {
             println!(

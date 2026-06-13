@@ -27,6 +27,7 @@ sconce-server = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

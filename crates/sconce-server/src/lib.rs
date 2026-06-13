@@ -1,70 +1,81 @@
 //! HTTP server for the Composer **v2** wire API.
 //!
-//! Three routes, mapped onto [`sconce_metadata`] + the [`sconce_cas`] blob store:
+//! Multi-tenant: each repository is served under `/{org}/{repo}/…`, mapped onto
+//! [`sconce_metadata`] + the [`sconce_cas`] blob store:
 //!
-//! - `GET /packages.json` — the root document (`metadata-url` + available list).
-//! - `GET /p2/{vendor}/{name}.json` — per-package metadata. The `~dev` variant
-//!   Composer also requests is served as an empty set (we only mirror tags, no
-//!   dev branches yet).
-//! - `GET /dist/{vendor}/{name}/{sha256}.zip` — the content-addressed download;
-//!   the sha256 in the path resolves the blob in the CAS.
+//! - `GET /{org}/{repo}/packages.json` — root document (`metadata-url` + list).
+//! - `GET /{org}/{repo}/p2/{vendor}/{name}.json` — per-package metadata, filtered
+//!   by that repo's update policy. The `~dev` variant is served empty (we only
+//!   mirror tags, no dev branches yet).
+//! - `GET /{org}/{repo}/dist/{vendor}/{name}/{sha256}.zip` — content-addressed
+//!   download; the sha256 resolves the blob in the CAS.
 //!
-//! Every route requires a valid read token (`Authorization: Bearer <token>` or
-//! HTTP basic with the token as the password). A fresh, tokenless install is
-//! fully closed — secure by default; create a token with `sconce token create`.
-//! Per-token scoping / multi-tenant access control arrives with that phase.
+//! Every route requires a token **valid for that repository** (`Authorization:
+//! Bearer <token>` or HTTP basic with the token as the password) — a token from
+//! one repo can't read another. An unknown repo is 404; a missing/invalid token
+//! is 401. Repos are fully closed until a token is minted (`sconce token create
+//! --repo <org>/<repo>`).
 
 #![forbid(unsafe_code)]
 
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use base64::Engine as _;
 use sconce_cas::{BlobId, BlobStore, FsBlobStore};
 use sconce_catalog::Catalog;
 use serde_json::json;
+use uuid::Uuid;
 
 /// Shared handler state.
 #[derive(Clone)]
 struct AppState {
     catalog: Catalog,
     store: FsBlobStore,
-    /// Public base URL used to build absolute metadata/dist URLs.
+    /// Public base URL; each repository is served under `<base>/<org>/<repo>`.
     base_url: String,
 }
 
-/// Build the router for a repository served from `catalog` + `store` at
-/// `base_url`.
+/// Build the router. Repositories are served under `/{org}/{repo}/…`, each
+/// gated by a token valid *for that repository*.
 pub fn router(catalog: Catalog, store: FsBlobStore, base_url: String) -> Router {
-    let state = AppState {
-        catalog,
-        store,
-        base_url,
-    };
     Router::new()
-        .route("/packages.json", get(packages_json))
-        .route("/p2/{*rest}", get(p2))
-        .route("/dist/{*rest}", get(dist))
-        // Every route requires a valid token — the repo is private. A fresh,
-        // tokenless install is fully closed; create one with `sconce token create`.
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
-        .with_state(state)
+        .route("/{org}/{repo}/packages.json", get(packages_json))
+        .route("/{org}/{repo}/p2/{*rest}", get(p2))
+        .route("/{org}/{repo}/dist/{*rest}", get(dist))
+        .with_state(AppState {
+            catalog,
+            store,
+            base_url,
+        })
 }
 
-/// Auth gate: accept a valid token via `Authorization: Bearer <token>` or
-/// HTTP basic (token as the password), else 401.
-async fn require_token(State(s): State<AppState>, req: Request, next: Next) -> Response {
-    match extract_token(req.headers()) {
-        Some(token) => match s.catalog.token_valid(&token).await {
-            Ok(true) => next.run(req).await,
-            Ok(false) => unauthorized(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
-        None => unauthorized(),
+/// Resolve `(org, repo)` to a repository id and require a token valid for it.
+/// 404 if the repository is unknown, 401 if the token is missing/invalid.
+async fn authorize(
+    s: &AppState,
+    org: &str,
+    repo: &str,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppError> {
+    let repo_id = s
+        .catalog
+        .resolve_repo(org, repo)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let token = extract_token(headers).ok_or(AppError::Unauthorized)?;
+    if s.catalog.token_valid(repo_id, &token).await? {
+        Ok(repo_id)
+    } else {
+        Err(AppError::Unauthorized)
     }
+}
+
+/// The absolute base URL for one repository, e.g. `https://host/acme/client-a`.
+fn repo_base(base_url: &str, org: &str, repo: &str) -> String {
+    format!("{}/{org}/{repo}", base_url.trim_end_matches('/'))
 }
 
 /// Pull a token from the `Authorization` header (Bearer, or basic-auth password).
@@ -105,15 +116,26 @@ pub async fn serve(
     axum::serve(listener, app).await
 }
 
-async fn packages_json(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    let names = s.catalog.all_package_names().await?;
-    Ok(Json(sconce_metadata::render_root(&names, &s.base_url)))
+async fn packages_json(
+    State(s): State<AppState>,
+    Path((org, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let repo_id = authorize(&s, &org, &repo, &headers).await?;
+    let names = s.catalog.all_package_names(repo_id).await?;
+    Ok(Json(sconce_metadata::render_root(
+        &names,
+        &repo_base(&s.base_url, &org, &repo),
+    )))
 }
 
 async fn p2(
     State(s): State<AppState>,
-    Path(rest): Path<String>,
+    Path((org, repo, rest)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let repo_id = authorize(&s, &org, &repo, &headers).await?;
+
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
     let (package, is_dev) = match stem.strip_suffix("~dev") {
@@ -128,19 +150,25 @@ async fn p2(
 
     // Apply the repo's update policy (cooldown / manual approval / holds) so
     // clients only ever see versions that have cleared the supply-chain gate.
-    let (mode, cooldown_days) = s.catalog.update_policy().await?;
+    let (mode, cooldown_days) = s.catalog.update_policy(repo_id).await?;
     let versions = s
         .catalog
-        .visible_versions(package, &mode, cooldown_days)
+        .visible_versions(repo_id, package, &mode, cooldown_days)
         .await?;
     Ok(Json(sconce_metadata::render_package(
         package,
         &versions,
-        &s.base_url,
+        &repo_base(&s.base_url, &org, &repo),
     )))
 }
 
-async fn dist(State(s): State<AppState>, Path(rest): Path<String>) -> Result<Response, AppError> {
+async fn dist(
+    State(s): State<AppState>,
+    Path((org, repo, rest)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    authorize(&s, &org, &repo, &headers).await?;
+
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
     let file = rest.rsplit('/').next().ok_or(AppError::NotFound)?;
     let hex = file.strip_suffix(".zip").ok_or(AppError::NotFound)?;
@@ -169,6 +197,8 @@ fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
 enum AppError {
     #[error("not found")]
     NotFound,
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("catalog error")]
     Catalog(#[from] sconce_catalog::SqlxError),
     #[error("storage error")]
@@ -179,6 +209,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND.into_response(),
+            AppError::Unauthorized => unauthorized(),
             AppError::Catalog(_) | AppError::Storage(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }

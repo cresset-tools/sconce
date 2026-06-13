@@ -53,9 +53,11 @@ pub struct Report {
     pub skipped: Vec<(String, String)>,
 }
 
-/// Mirror every tagged version of the git repository at `repo_path` into
-/// `store` + `catalog`. `git_url` is recorded as the package source.
+/// Mirror every tagged version of the git repository at `repo_path` into the
+/// catalog **repository** `repo_id` + `store`. `git_url` is recorded as the
+/// package source.
 pub async fn mirror_git_source(
+    repo_id: uuid::Uuid,
     repo_path: &Path,
     git_url: &str,
     store: &(impl BlobStore + Sync),
@@ -102,7 +104,7 @@ pub async fn mirror_git_source(
             .await
             .map_err(|e| Error::Catalog(Box::new(e)))?;
         let package_id = catalog
-            .upsert_package(&name, "git", Some(&source))
+            .upsert_package(repo_id, &name, "git", Some(&source))
             .await
             .map_err(|e| Error::Catalog(Box::new(e)))?;
         catalog
@@ -205,23 +207,31 @@ mod tests {
         };
         let catalog = Catalog::connect(&url).await.unwrap();
         catalog.migrate().await.unwrap();
+        let slug = format!("m{}", std::process::id());
+        catalog.create_org(&slug, None).await.unwrap();
+        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
 
         let name = format!("acme/lib-{}", std::process::id());
         let repo = fixture_repo(&name);
         let cas = unique_temp("cas");
         let store = FsBlobStore::open(&cas).unwrap();
 
-        let report =
-            mirror_git_source(&repo, "https://example.test/acme/lib.git", &store, &catalog)
-                .await
-                .unwrap();
+        let report = mirror_git_source(
+            repo_id,
+            &repo,
+            "https://example.test/acme/lib.git",
+            &store,
+            &catalog,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.mirrored.len(), 2, "two tagged versions mirrored");
         assert_eq!(report.skipped.len(), 1, "the 'nightly' tag was skipped");
         assert_eq!(report.skipped[0].0, "nightly");
 
         // Catalog has both versions, each pointing at a stored blob.
-        let mut versions = catalog.package_versions(&name).await.unwrap();
+        let mut versions = catalog.package_versions(repo_id, &name).await.unwrap();
         versions.sort_by(|a, b| a.normalized_version.cmp(&b.normalized_version));
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].normalized_version, "1.0.0.0");

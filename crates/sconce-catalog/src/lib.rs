@@ -36,6 +36,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0004_update_policy",
         include_str!("../migrations/0004_update_policy.sql"),
     ),
+    (
+        "0005_multitenancy",
+        include_str!("../migrations/0005_multitenancy.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -76,6 +80,51 @@ impl Catalog {
         Self { pool }
     }
 
+    /// Create an organization (idempotent on slug), returning its id.
+    pub async fn create_org(&self, slug: &str, name: Option<&str>) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "insert into organizations (slug, name) values ($1, $2) \
+             on conflict (slug) do update set name = coalesce(excluded.name, organizations.name) \
+             returning id",
+        )
+        .bind(slug)
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Create a repository under the org with slug `org_slug` (idempotent on the
+    /// `(org, repo)` slug pair), returning its id. Errors if the org is unknown.
+    pub async fn create_repo(&self, org_slug: &str, repo_slug: &str) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "insert into repositories (org_id, slug) \
+             select o.id, $2 from organizations o where o.slug = $1 \
+             on conflict (org_id, slug) do update set slug = excluded.slug \
+             returning id",
+        )
+        .bind(org_slug)
+        .bind(repo_slug)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Resolve `(org slug, repo slug)` to a repository id.
+    pub async fn resolve_repo(
+        &self,
+        org_slug: &str,
+        repo_slug: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "select r.id from repositories r \
+             join organizations o on o.id = r.org_id \
+             where o.slug = $1 and r.slug = $2",
+        )
+        .bind(org_slug)
+        .bind(repo_slug)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
     ///
     /// Concurrent migrators (multiple app instances starting at once, or
@@ -110,18 +159,20 @@ impl Catalog {
         Ok(())
     }
 
-    /// Upsert a package by name, returning its id.
+    /// Upsert a package by name **within a repository**, returning its id.
     pub async fn upsert_package(
         &self,
+        repo_id: Uuid,
         name: &str,
         kind: &str,
         source: Option<&Value>,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
-            "insert into packages (name, kind, source) values ($1, $2, $3) \
-             on conflict (name) do update set kind = excluded.kind, source = excluded.source \
+            "insert into packages (repo_id, name, kind, source) values ($1, $2, $3, $4) \
+             on conflict (repo_id, name) do update set kind = excluded.kind, source = excluded.source \
              returning id",
         )
+        .bind(repo_id)
         .bind(name)
         .bind(kind)
         .bind(source)
@@ -176,11 +227,17 @@ impl Catalog {
         .await
     }
 
-    /// Create a new read token: generate a high-entropy secret, store only its
-    /// sha256, and return the plaintext **once** (it is never recoverable after).
-    pub async fn create_token(&self, label: Option<&str>) -> Result<String, sqlx::Error> {
+    /// Create a new read token for a repository: generate a high-entropy secret,
+    /// store only its sha256, and return the plaintext **once** (never
+    /// recoverable after).
+    pub async fn create_token(
+        &self,
+        repo_id: Uuid,
+        label: Option<&str>,
+    ) -> Result<String, sqlx::Error> {
         let token = generate_token();
-        sqlx::query("insert into tokens (token_hash, label) values ($1, $2)")
+        sqlx::query("insert into tokens (repo_id, token_hash, label) values ($1, $2, $3)")
+            .bind(repo_id)
             .bind(token_hash(&token))
             .bind(label)
             .execute(&self.pool)
@@ -188,42 +245,44 @@ impl Catalog {
         Ok(token)
     }
 
-    /// Whether `token` matches a stored token. Bumps `last_used_at` on a hit.
-    pub async fn token_valid(&self, token: &str) -> Result<bool, sqlx::Error> {
-        let updated = sqlx::query("update tokens set last_used_at = now() where token_hash = $1")
-            .bind(token_hash(token))
-            .execute(&self.pool)
-            .await?;
+    /// Whether `token` is valid **for this repository**. Bumps `last_used_at`.
+    pub async fn token_valid(&self, repo_id: Uuid, token: &str) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query(
+            "update tokens set last_used_at = now() where repo_id = $1 and token_hash = $2",
+        )
+        .bind(repo_id)
+        .bind(token_hash(token))
+        .execute(&self.pool)
+        .await?;
         Ok(updated.rows_affected() > 0)
     }
 
-    /// Number of tokens that exist (a fresh, tokenless repo is fully closed).
-    pub async fn token_count(&self) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar("select count(*) from tokens")
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    /// All package names, sorted — used to build the root `available-packages`.
-    pub async fn all_package_names(&self) -> Result<Vec<String>, sqlx::Error> {
-        let rows = sqlx::query("select name from packages order by name")
+    /// All package names in a repository, sorted — for `available-packages`.
+    pub async fn all_package_names(&self, repo_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query("select name from packages where repo_id = $1 order by name")
+            .bind(repo_id)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(|r| r.try_get("name")).collect()
     }
 
-    /// All non-yanked versions of a package — the raw catalog view (ignores
-    /// holds and update policy). Use [`Self::visible_versions`] for the serving
-    /// read path.
-    pub async fn package_versions(&self, name: &str) -> Result<Vec<PackageVersion>, sqlx::Error> {
+    /// All non-yanked versions of a package in a repository — the raw catalog
+    /// view (ignores holds and update policy). Use [`Self::visible_versions`]
+    /// for the serving read path.
+    pub async fn package_versions(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+    ) -> Result<Vec<PackageVersion>, sqlx::Error> {
         let rows = sqlx::query(
             "select pv.version, pv.normalized_version, pv.stability, pv.composer_json, \
                     pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             where p.name = $1 and pv.yanked_at is null \
+             where p.repo_id = $1 and p.name = $2 and pv.yanked_at is null \
              order by pv.normalized_version",
         )
+        .bind(repo_id)
         .bind(name)
         .fetch_all(&self.pool)
         .await?;
@@ -240,6 +299,7 @@ impl Catalog {
     /// keeps this pure and testable without mutating shared global state.
     pub async fn visible_versions(
         &self,
+        repo_id: Uuid,
         name: &str,
         mode: &str,
         cooldown_days: i32,
@@ -249,16 +309,17 @@ impl Catalog {
                     pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             where p.name = $1 \
+             where p.repo_id = $1 and p.name = $2 \
                and pv.yanked_at is null \
                and pv.held_at is null \
-               and ( $2 = 'auto' \
+               and ( $3 = 'auto' \
                      or pv.approved_at is not null \
-                     or ( $2 = 'delayed' \
+                     or ( $3 = 'delayed' \
                           and pv.released_at is not null \
-                          and pv.released_at + make_interval(days => $3) <= now() ) ) \
+                          and pv.released_at + make_interval(days => $4) <= now() ) ) \
              order by pv.normalized_version",
         )
+        .bind(repo_id)
         .bind(name)
         .bind(mode)
         .bind(cooldown_days)
@@ -267,50 +328,52 @@ impl Catalog {
         rows.iter().map(row_to_version).collect()
     }
 
-    /// The global update policy: `(update_mode, cooldown_days)`.
-    pub async fn update_policy(&self) -> Result<(String, i32), sqlx::Error> {
-        let row =
-            sqlx::query("select update_mode, cooldown_days from repo_settings where id = true")
-                .fetch_one(&self.pool)
-                .await?;
+    /// A repository's update policy: `(update_mode, cooldown_days)`.
+    pub async fn update_policy(&self, repo_id: Uuid) -> Result<(String, i32), sqlx::Error> {
+        let row = sqlx::query("select update_mode, cooldown_days from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok((row.try_get("update_mode")?, row.try_get("cooldown_days")?))
     }
 
-    /// Set the global update policy. `mode` must be `auto`/`manual`/`delayed`
+    /// Set a repository's update policy. `mode` must be `auto`/`manual`/`delayed`
     /// (enforced by a check constraint).
     pub async fn set_update_policy(
         &self,
+        repo_id: Uuid,
         mode: &str,
         cooldown_days: i32,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "update repo_settings set update_mode = $1, cooldown_days = $2 where id = true",
-        )
-        .bind(mode)
-        .bind(cooldown_days)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("update repositories set update_mode = $1, cooldown_days = $2 where id = $3")
+            .bind(mode)
+            .bind(cooldown_days)
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    /// Place a security hold on a version (hides it immediately, even if it was
-    /// already visible). Returns whether a matching version was found.
+    /// Place a security hold on a version (hides it immediately). Returns whether
+    /// a matching version was found in the repository.
     pub async fn hold_version(
         &self,
+        repo_id: Uuid,
         package: &str,
         normalized_version: &str,
     ) -> Result<bool, sqlx::Error> {
-        self.set_version_timestamp("held_at", "now()", package, normalized_version)
+        self.set_version_timestamp("held_at", "now()", repo_id, package, normalized_version)
             .await
     }
 
     /// Release a hold.
     pub async fn unhold_version(
         &self,
+        repo_id: Uuid,
         package: &str,
         normalized_version: &str,
     ) -> Result<bool, sqlx::Error> {
-        self.set_version_timestamp("held_at", "null", package, normalized_version)
+        self.set_version_timestamp("held_at", "null", repo_id, package, normalized_version)
             .await
     }
 
@@ -318,29 +381,33 @@ impl Catalog {
     /// `delayed`).
     pub async fn approve_version(
         &self,
+        repo_id: Uuid,
         package: &str,
         normalized_version: &str,
     ) -> Result<bool, sqlx::Error> {
-        self.set_version_timestamp("approved_at", "now()", package, normalized_version)
+        self.set_version_timestamp("approved_at", "now()", repo_id, package, normalized_version)
             .await
     }
 
-    /// Set `held_at`/`approved_at` to `now()`/`null` for one version. `column`
-    /// and `value` are fixed literals chosen by the callers above — never user
-    /// input — so interpolating them is safe.
+    /// Set `held_at`/`approved_at` to `now()`/`null` for one version in a repo.
+    /// `column` and `value` are fixed literals chosen by the callers above —
+    /// never user input — so interpolating them is safe.
     async fn set_version_timestamp(
         &self,
         column: &str,
         value: &str,
+        repo_id: Uuid,
         package: &str,
         normalized_version: &str,
     ) -> Result<bool, sqlx::Error> {
         let sql = format!(
             "update package_versions pv set {column} = {value} \
              from packages p \
-             where p.id = pv.package_id and p.name = $1 and pv.normalized_version = $2"
+             where p.id = pv.package_id and p.repo_id = $1 and p.name = $2 \
+               and pv.normalized_version = $3"
         );
         let done = sqlx::query(&sql)
+            .bind(repo_id)
             .bind(package)
             .bind(normalized_version)
             .execute(&self.pool)
@@ -431,49 +498,45 @@ mod tests {
 
     /// Tests need a Postgres; they're skipped unless `DATABASE_URL` is set, so
     /// `cargo test` stays green on machines without one. CI sets it against a
-    /// postgres service.
-    async fn catalog() -> Option<Catalog> {
+    /// postgres service. Each test gets its own fresh repository, so they're
+    /// fully isolated and can't collide on names or policy.
+    async fn repo() -> Option<(Catalog, Uuid)> {
+        static C: AtomicU64 = AtomicU64::new(0);
         let url = std::env::var("DATABASE_URL").ok()?;
         let cat = Catalog::connect(&url).await.expect("connect");
         cat.migrate().await.expect("migrate");
-        Some(cat)
-    }
-
-    /// Unique package name per test invocation so parallel tests don't collide
-    /// on the global package-name uniqueness.
-    fn unique_name(stem: &str) -> String {
-        static C: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "test/{stem}-{}-{}",
-            std::process::id(),
-            C.fetch_add(1, Ordering::Relaxed)
-        )
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let slug = format!("t{}-{n}", std::process::id());
+        cat.create_org(&slug, None).await.expect("org");
+        let repo_id = cat.create_repo(&slug, "r").await.expect("repo");
+        Some((cat, repo_id))
     }
 
     #[tokio::test]
     async fn migrate_is_idempotent() {
-        let Some(cat) = catalog().await else { return };
-        // Second call must be a no-op, not an error.
+        let Some((cat, _)) = repo().await else { return };
         cat.migrate().await.expect("re-migrate");
     }
 
     #[tokio::test]
     async fn upsert_and_read_back_a_version() {
-        let Some(cat) = catalog().await else { return };
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
         let sha = [7u8; 32];
         cat.upsert_blob(&sha, 1234).await.unwrap();
 
-        let name = unique_name("pkg");
         let pkg = cat
             .upsert_package(
-                &name,
+                repo_id,
+                "acme/lib",
                 "git",
                 Some(&serde_json::json!({"git": "https://x/y"})),
             )
             .await
             .unwrap();
 
-        let cj = serde_json::json!({"name": name, "version": "1.2.0"});
+        let cj = serde_json::json!({"name": "acme/lib", "version": "1.2.0"});
         cat.upsert_package_version(
             pkg,
             "v1.2.0",
@@ -488,11 +551,10 @@ mod tests {
         .await
         .unwrap();
 
-        let versions = cat.package_versions(&name).await.unwrap();
+        let versions = cat.package_versions(repo_id, "acme/lib").await.unwrap();
         assert_eq!(versions.len(), 1);
         let v = &versions[0];
         assert_eq!(v.version, "v1.2.0");
-        assert_eq!(v.stability, "stable");
         assert_eq!(v.dist_blob_sha256, Some(sha));
         assert_eq!(
             v.dist_shasum.as_deref(),
@@ -503,57 +565,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_version_is_idempotent_on_normalized_version() {
-        let Some(cat) = catalog().await else { return };
-        let name = unique_name("pkg");
-        let pkg = cat.upsert_package(&name, "git", None).await.unwrap();
-        let cj = serde_json::json!({"name": name});
-
-        let a = cat
-            .upsert_package_version(
-                pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None,
-            )
+    async fn repos_are_isolated() {
+        let Some((cat, repo_a)) = repo().await else {
+            return;
+        };
+        let repo_b = {
+            // A second repo in a fresh org.
+            let (_, b) = repo().await.unwrap();
+            b
+        };
+        let cj = serde_json::json!({"name": "shared/name"});
+        // The SAME package name in two repos is two independent packages.
+        let pa = cat
+            .upsert_package(repo_a, "shared/name", "git", None)
             .await
             .unwrap();
-        // Same normalized version → update, not a second row.
-        let b = cat
-            .upsert_package_version(
-                pkg,
-                "v1.0.0",
-                "1.0.0.0",
-                "stable",
-                &cj,
-                None,
-                None,
-                Some("ref2"),
-                None,
-            )
+        let pb = cat
+            .upsert_package(repo_b, "shared/name", "git", None)
             .await
             .unwrap();
-        assert_eq!(a, b, "same (package, normalized_version) → same row id");
-        assert_eq!(cat.package_versions(&name).await.unwrap().len(), 1);
-    }
+        assert_ne!(pa, pb);
+        cat.upsert_package_version(
+            pa, "v1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None,
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn unknown_package_has_no_versions() {
-        let Some(cat) = catalog().await else { return };
+        // The version exists only in repo_a; repo_b's same-named package has none.
+        assert_eq!(
+            cat.package_versions(repo_a, "shared/name")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
-            cat.package_versions(&unique_name("missing"))
+            cat.package_versions(repo_b, "shared/name")
                 .await
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(
+            cat.all_package_names(repo_a).await.unwrap(),
+            ["shared/name"]
+        );
+        assert_eq!(
+            cat.all_package_names(repo_b).await.unwrap(),
+            ["shared/name"]
+        );
     }
 
-    /// The supply-chain controls: cooldown hides fresh releases, holds hide any
-    /// version, approval reveals early. Uses explicit policy params + unique
-    /// package names, so it never touches the global singleton (no test races).
+    /// The supply-chain controls, now per-repo: cooldown hides fresh releases,
+    /// holds hide any version, approval reveals early.
     #[tokio::test]
     async fn cooldown_hold_and_approval_gate_visibility() {
-        let Some(cat) = catalog().await else { return };
-        let name = unique_name("pkg");
-        let pkg = cat.upsert_package(&name, "git", None).await.unwrap();
-        let cj = serde_json::json!({"name": name});
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let pkg = cat
+            .upsert_package(repo_id, "acme/lib", "git", None)
+            .await
+            .unwrap();
+        let cj = serde_json::json!({"name": "acme/lib"});
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -563,7 +636,6 @@ mod tests {
         .unwrap();
         let day = 86_400;
 
-        // An old release (30 days ago) and a fresh one (just now).
         cat.upsert_package_version(
             pkg,
             "v1.0.0",
@@ -594,55 +666,77 @@ mod tests {
         let norm = |vs: Vec<PackageVersion>| -> Vec<String> {
             vs.into_iter().map(|v| v.normalized_version).collect()
         };
+        let p = "acme/lib";
 
-        // auto: both visible.
         assert_eq!(
-            norm(cat.visible_versions(&name, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
             ["1.0.0.0", "1.1.0.0"]
         );
-
-        // delayed, 7-day cooldown: only the old release is past cooldown.
         assert_eq!(
-            norm(cat.visible_versions(&name, "delayed", 7).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "delayed", 7)
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0"]
         );
 
-        // approve the fresh one → visible early even under delayed.
-        assert!(cat.approve_version(&name, "1.1.0.0").await.unwrap());
+        assert!(cat.approve_version(repo_id, p, "1.1.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(&name, "delayed", 7).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "delayed", 7)
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0", "1.1.0.0"]
         );
-
-        // manual: nothing visible unless approved → only the approved fresh one.
         assert_eq!(
-            norm(cat.visible_versions(&name, "manual", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "manual", 0).await.unwrap()),
             ["1.1.0.0"]
         );
 
-        // hold the old one → hidden under any mode.
-        assert!(cat.hold_version(&name, "1.0.0.0").await.unwrap());
+        assert!(cat.hold_version(repo_id, p, "1.0.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(&name, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
             ["1.1.0.0"]
         );
-        // ...and unhold restores it.
-        assert!(cat.unhold_version(&name, "1.0.0.0").await.unwrap());
+        assert!(cat.unhold_version(repo_id, p, "1.0.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(&name, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
             ["1.0.0.0", "1.1.0.0"]
         );
     }
 
     #[tokio::test]
-    async fn update_policy_roundtrips() {
-        let Some(cat) = catalog().await else { return };
-        cat.set_update_policy("delayed", 5).await.unwrap();
+    async fn update_policy_is_per_repo() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
         assert_eq!(
-            cat.update_policy().await.unwrap(),
+            cat.update_policy(repo_id).await.unwrap(),
+            ("auto".to_owned(), 0)
+        );
+        cat.set_update_policy(repo_id, "delayed", 5).await.unwrap();
+        assert_eq!(
+            cat.update_policy(repo_id).await.unwrap(),
             ("delayed".to_owned(), 5)
         );
-        // restore the default so this global singleton doesn't disturb a re-run.
-        cat.set_update_policy("auto", 0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tokens_are_scoped_to_their_repo() {
+        let Some((cat, repo_a)) = repo().await else {
+            return;
+        };
+        let (_, repo_b) = repo().await.unwrap();
+        let token = cat.create_token(repo_a, None).await.unwrap();
+        assert!(
+            cat.token_valid(repo_a, &token).await.unwrap(),
+            "valid for its repo"
+        );
+        assert!(
+            !cat.token_valid(repo_b, &token).await.unwrap(),
+            "not valid for another repo"
+        );
     }
 }
