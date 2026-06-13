@@ -159,8 +159,8 @@ enum Command {
         base_url: String,
     },
 
-    /// Serve the admin web UI (operator dashboard). No auth — bind to localhost
-    /// or put behind your own auth.
+    /// Serve the admin web UI (operator dashboard). Set `--admin-password` to
+    /// require HTTP basic auth; otherwise it's open — bind to localhost only.
     Ui {
         /// Postgres connection string.
         #[arg(long, env = "DATABASE_URL")]
@@ -171,6 +171,9 @@ enum Command {
         /// Public base URL of the Composer endpoint (for install snippets).
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         public_base_url: String,
+        /// Require HTTP basic auth with this password (any username).
+        #[arg(long, env = "SCONCE_ADMIN_PASSWORD")]
+        admin_password: Option<String>,
     },
 
     /// Manage read tokens (the repo is private; clients authenticate with one).
@@ -283,7 +286,8 @@ fn main() -> Result<()> {
             database_url,
             listen,
             public_base_url,
-        } => ui(&database_url, listen, public_base_url),
+            admin_password,
+        } => ui(&database_url, listen, public_base_url, admin_password),
         Command::OrgCreate {
             slug,
             name,
@@ -398,15 +402,12 @@ fn license_create(
 ) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
-        let (key, license_id) = catalog
-            .create_license_key(repo_id, buyer)
+        let pkgs: Vec<&str> = packages.iter().map(String::as_str).collect();
+        let key = catalog
+            .issue_license(repo_id, buyer, &pkgs)
             .await
-            .context("creating license")?;
-        for pkg in packages {
-            if !catalog.entitle_package(license_id, repo_id, pkg).await? {
-                anyhow::bail!("no package '{pkg}' in {repo} (entitlements not saved)");
-            }
-        }
+            .context("creating license")?
+            .with_context(|| format!("a package was not found in {repo} (no license created)"))?;
         // The key goes to stdout (scriptable); the notice to stderr.
         println!("{key}");
         eprintln!(
@@ -526,7 +527,12 @@ fn serve(
     })
 }
 
-fn ui(database_url: &str, listen: std::net::SocketAddr, public_base_url: String) -> Result<()> {
+fn ui(
+    database_url: &str,
+    listen: std::net::SocketAddr,
+    public_base_url: String,
+    admin_password: Option<String>,
+) -> Result<()> {
     use sconce_catalog::Catalog;
 
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
@@ -535,8 +541,13 @@ fn ui(database_url: &str, listen: std::net::SocketAddr, public_base_url: String)
             .await
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
+        if admin_password.is_none() {
+            eprintln!(
+                "warning: no --admin-password set; the admin UI is unauthenticated (bind to localhost)."
+            );
+        }
         println!("sconce admin UI on http://{listen}");
-        sconce_server::ui::serve(catalog, public_base_url, listen)
+        sconce_server::ui::serve(catalog, public_base_url, admin_password, listen)
             .await
             .context("serving UI")?;
         Ok::<_, anyhow::Error>(())

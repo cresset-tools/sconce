@@ -80,6 +80,23 @@ pub struct AdminVersion {
     pub released_at: Option<String>,
 }
 
+/// A license key in the admin listing (the key itself is never recoverable).
+#[derive(Debug, Clone)]
+pub struct LicenseSummary {
+    pub id: Uuid,
+    pub buyer: Option<String>,
+    pub status: String,
+    pub packages: Vec<String>,
+}
+
+/// A grant shown in the admin UI: a package owned elsewhere, exposed here.
+#[derive(Debug, Clone)]
+pub struct GrantSummary {
+    pub package: String,
+    pub source_org: String,
+    pub source_repo: String,
+}
+
 /// A package version as stored in the catalog.
 #[derive(Debug, Clone)]
 pub struct PackageVersion {
@@ -215,6 +232,57 @@ impl Catalog {
             .bind(repo_id)
             .fetch_one(&self.pool)
             .await
+    }
+
+    /// License keys for a repository, each with its entitled package names.
+    pub async fn list_licenses(&self, repo_id: Uuid) -> Result<Vec<LicenseSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select l.id as id, l.buyer_ref as buyer, l.status as status, \
+                    coalesce(array_agg(p.name) filter (where p.name is not null), '{}') as packages \
+             from license_keys l \
+             left join entitlements e on e.license_key_id = l.id \
+             left join packages p on p.id = e.package_id \
+             where l.repo_id = $1 \
+             group by l.id, l.buyer_ref, l.status, l.created_at \
+             order by l.created_at",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(LicenseSummary {
+                    id: row.try_get("id")?,
+                    buyer: row.try_get("buyer")?,
+                    status: row.try_get("status")?,
+                    packages: row.try_get("packages")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Packages granted into a repository (with where they're owned).
+    pub async fn list_grants(&self, repo_id: Uuid) -> Result<Vec<GrantSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select p.name as package, o.slug as source_org, r.slug as source_repo \
+             from repository_grants g \
+             join packages p on p.id = g.package_id \
+             join repositories r on r.id = p.repo_id \
+             join organizations o on o.id = r.org_id \
+             where g.repo_id = $1 order by p.name",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(GrantSummary {
+                    package: row.try_get("package")?,
+                    source_org: row.try_get("source_org")?,
+                    source_repo: row.try_get("source_repo")?,
+                })
+            })
+            .collect()
     }
 
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
@@ -367,6 +435,54 @@ impl Catalog {
         .fetch_one(&self.pool)
         .await?;
         Ok((key, id))
+    }
+
+    /// Issue a license entitled to `packages` (all owned by `repo_id`) in one
+    /// transaction. Returns `Ok(None)` — and changes nothing — if any package is
+    /// not found in the repo, so there are never orphan keys with missing
+    /// entitlements. On success returns the plaintext key (shown once).
+    pub async fn issue_license(
+        &self,
+        repo_id: Uuid,
+        buyer: Option<&str>,
+        packages: &[&str],
+    ) -> Result<Option<String>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut ids = Vec::with_capacity(packages.len());
+        for &pkg in packages {
+            let id: Option<Uuid> =
+                sqlx::query_scalar("select id from packages where repo_id = $1 and name = $2")
+                    .bind(repo_id)
+                    .bind(pkg)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(id) = id else {
+                tx.rollback().await?;
+                return Ok(None);
+            };
+            ids.push(id);
+        }
+        let key = generate_secret("sclk_");
+        let license_id: Uuid = sqlx::query_scalar(
+            "insert into license_keys (repo_id, key_hash, buyer_ref) values ($1, $2, $3) returning id",
+        )
+        .bind(repo_id)
+        .bind(token_hash(&key))
+        .bind(buyer)
+        .fetch_one(&mut *tx)
+        .await?;
+        for id in ids {
+            sqlx::query(
+                "insert into entitlements (license_key_id, package_id) values ($1, $2) \
+                 on conflict do nothing",
+            )
+            .bind(license_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(key))
     }
 
     /// Entitle a license to a package owned by its repository. Returns `false`
