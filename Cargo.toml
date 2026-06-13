@@ -9,10 +9,14 @@ members = [
 version = "0.1.0" # x-release-please-version
 edition = "2024"
 rust-version = "1.96"
-# Proprietary, all rights reserved (see LICENSE). Diverges from the rest of the
-# cresset-tools family (EUPL-1.2) — sconce is closed-source. SPDX custom ref;
-# crates are `publish = false` so this never reaches a registry.
-license = "LicenseRef-Proprietary"
+# EUPL-1.2, like the rest of the cresset-tools family. Chosen deliberately over
+# AGPL: its definition of "Communication" covers "providing access to [the
+# Work's] essential functionalities" over a network, so it carries an AGPL-style
+# SaaS/network copyleft trigger — a competitor running this as a hosted service
+# owes their modifications back. Open-core: this engine is EUPL; the hosted
+# Bougie Repo control plane + agency/seller/SSO features are the commercial layer.
+# Crates stay `publish = false` for now (not publishing to crates.io yet).
+license = "EUPL-1.2"
 authors = ["Jelle Besseling <jelle@pingiun.com>"]
 repository = "https://github.com/cresset-tools/sconce"
 
