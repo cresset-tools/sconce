@@ -1,0 +1,21 @@
+[package]
+name = "sconce-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Reads a git tree at a ref into a deterministic canonical archive — the real package source for sconce (canonical modes straight from the tree, no working-copy/umask drift)."
+
+[dependencies]
+sconce-archive = { workspace = true }
+gix = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

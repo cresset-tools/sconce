@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 sconce-archive = { workspace = true }
+sconce-git = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 

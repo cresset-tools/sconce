@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sconce",
     "crates/sconce-archive",
+    "crates/sconce-git",
 ]
 
 [workspace.package]
@@ -27,11 +28,18 @@ repository = "https://github.com/cresset-tools/sconce"
 # all of them in lockstep with `[workspace.package].version` above.
 [workspace.dependencies]
 sconce-archive = { path = "crates/sconce-archive", version = "0.1.0" } # x-release-please-version
+sconce-git = { path = "crates/sconce-git", version = "0.1.0" } # x-release-please-version
 
 # Shared external deps.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
+thiserror = "2"
+# Local git access only (read trees at a ref). gix's default features give a
+# working hash backend + rev-parse without pulling a network client (networking
+# is opt-in, not default). `.gitattributes export-ignore` support comes later —
+# it'll add the `attributes` feature then.
+gix = "0.70"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

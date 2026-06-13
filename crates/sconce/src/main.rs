@@ -26,11 +26,25 @@ enum Command {
     /// Walks `src`, normalizing each file into the canonical form (regular vs
     /// executable vs symlink), and writes a byte-reproducible archive to `out`.
     /// Re-running on the same tree yields identical bytes — the basis for CAS
-    /// dedup. (Git-tree sourcing + `.gitattributes export-ignore` arrive with
-    /// the mirror pipeline; this command archives a plain directory.)
+    /// dedup. For the real package source, prefer `archive-ref`.
     Archive {
         /// Directory to archive.
         src: PathBuf,
+        /// Output `.zip` path.
+        out: PathBuf,
+    },
+
+    /// Produce a deterministic ZIP archive of a git ref (the real source path).
+    ///
+    /// Reads the tree at `ref` straight from the repository's object database —
+    /// canonical modes, verbatim blob content, no working-copy/umask drift — so
+    /// the same `(repo, ref)` always yields byte-identical output. Tags and
+    /// commits both work (`ref` is peeled to a tree).
+    ArchiveRef {
+        /// Path to the git repository.
+        repo: PathBuf,
+        /// Ref to archive (e.g. `HEAD`, `v1.2.0`, a commit sha).
+        r#ref: String,
         /// Output `.zip` path.
         out: PathBuf,
     },
@@ -40,7 +54,23 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Archive { src, out } => archive(&src, &out),
+        Command::ArchiveRef { repo, r#ref, out } => archive_ref(&repo, &r#ref, &out),
     }
+}
+
+fn archive_ref(repo: &Path, refspec: &str, out: &Path) -> Result<()> {
+    let archive = sconce_git::archive_ref(repo, refspec)
+        .with_context(|| format!("archiving {} at {refspec}", repo.display()))?;
+    let count = archive.len();
+    let bytes = archive.into_zip();
+    std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    println!(
+        "archived {count} entries from {}@{refspec} → {} ({} bytes)",
+        repo.display(),
+        out.display(),
+        bytes.len(),
+    );
+    Ok(())
 }
 
 fn archive(src: &Path, out: &Path) -> Result<()> {
