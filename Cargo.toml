@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sconce",
     "crates/sconce-archive",
+    "crates/sconce-cas",
     "crates/sconce-git",
 ]
 
@@ -28,6 +29,7 @@ repository = "https://github.com/cresset-tools/sconce"
 # all of them in lockstep with `[workspace.package].version` above.
 [workspace.dependencies]
 sconce-archive = { path = "crates/sconce-archive", version = "0.1.0" } # x-release-please-version
+sconce-cas = { path = "crates/sconce-cas", version = "0.1.0" } # x-release-please-version
 sconce-git = { path = "crates/sconce-git", version = "0.1.0" } # x-release-please-version
 
 # Shared external deps.

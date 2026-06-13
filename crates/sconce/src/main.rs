@@ -48,6 +48,22 @@ enum Command {
         /// Output `.zip` path.
         out: PathBuf,
     },
+
+    /// Archive a git ref and store it in a content-addressed store (CAS).
+    ///
+    /// Reads the tree at `ref`, builds the deterministic archive, and stores it
+    /// under `--cas` keyed by its sha256. Re-ingesting the same content is a
+    /// no-op that returns the same blob id — this is the dedup the whole catalog
+    /// is built on. Prints the blob id.
+    Ingest {
+        /// Path to the git repository.
+        repo: PathBuf,
+        /// Ref to archive (e.g. `HEAD`, `v1.2.0`, a commit sha).
+        r#ref: String,
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -55,7 +71,35 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Archive { src, out } => archive(&src, &out),
         Command::ArchiveRef { repo, r#ref, out } => archive_ref(&repo, &r#ref, &out),
+        Command::Ingest { repo, r#ref, cas } => ingest(&repo, &r#ref, &cas),
     }
+}
+
+fn ingest(repo: &Path, refspec: &str, cas: &Path) -> Result<()> {
+    use sconce_cas::{BlobStore, FsBlobStore};
+
+    let archive = sconce_git::archive_ref(repo, refspec)
+        .with_context(|| format!("archiving {} at {refspec}", repo.display()))?;
+    let count = archive.len();
+    let bytes = archive.into_zip();
+
+    let store =
+        FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+    let existed = store.exists(&sconce_cas::BlobId::of(&bytes))?;
+    let id = store.put(&bytes).context("storing blob")?;
+
+    println!(
+        "ingested {} entries from {}@{refspec} → blob {id} ({} bytes){}",
+        count,
+        repo.display(),
+        bytes.len(),
+        if existed {
+            " [already present — deduped]"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 fn archive_ref(repo: &Path, refspec: &str, out: &Path) -> Result<()> {

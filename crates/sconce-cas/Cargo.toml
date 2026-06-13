@@ -1,0 +1,16 @@
+[package]
+name = "sconce-cas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Content-addressed blob store for sconce. Blobs keyed by sha256; put-if-absent gives free dedup, atomic temp+rename publish, immutable once written."
+
+[dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

@@ -1827,11 +1827,19 @@ dependencies = [
  "anyhow",
  "clap",
  "sconce-archive",
+ "sconce-cas",
  "sconce-git",
 ]
 
 [[package]]
 name = "sconce-archive"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "sconce-cas"
 version = "0.1.0"
 dependencies = [
  "sha2",
