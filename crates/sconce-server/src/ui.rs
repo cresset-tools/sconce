@@ -1,40 +1,77 @@
 //! Admin web UI — a server-rendered management console over the catalog.
 //!
-//! This is the **operator** surface (manage orgs/repos, supply-chain controls,
-//! tokens, licenses, grants), deliberately separate from the public Composer
-//! wire API in [`crate`]. Protect it with `--admin-password` (HTTP basic); when
-//! no password is set it runs open and should be bound to localhost only.
+//! Two modes (see [`router`]):
+//! - **multi-tenant** (default): user accounts with login sessions; each user
+//!   sees only the tenants (organizations) they belong to, and a superadmin
+//!   sees all. Bootstrap the first user with `sconce user-create --superadmin`.
+//! - **single-tenant** (`--single-tenant`): no accounts; an optional
+//!   `--admin-password` (HTTP basic) gates the whole UI, which acts as one
+//!   all-access tenant. Bind to localhost when no password is set.
+//!
+//! This is the operator surface; the public Composer wire API in [`crate`] is
+//! separately token/license-gated and unaffected.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use axum::Router;
-use axum::extract::{Form, Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{Extension, Form, Path, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use sconce_catalog::Catalog;
 use serde::Deserialize;
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct Ui {
     catalog: Catalog,
-    /// Public base URL of the Composer-serving endpoint (for install snippets).
     public_base_url: String,
-    /// If set, every page requires HTTP basic auth with this as the password.
+    /// Single-tenant mode: no accounts, gated by `admin_password` (or open).
+    single_tenant: bool,
     admin_password: Option<String>,
 }
 
+/// The viewer's access, resolved per request.
+#[derive(Clone)]
+struct CurrentUser {
+    is_superadmin: bool,
+    tenants: HashSet<Uuid>,
+}
+
+impl CurrentUser {
+    fn all_access() -> Self {
+        Self {
+            is_superadmin: true,
+            tenants: HashSet::new(),
+        }
+    }
+    fn can(&self, org_id: Uuid) -> bool {
+        self.is_superadmin || self.tenants.contains(&org_id)
+    }
+}
+
 /// Build the admin UI router.
-pub fn router(catalog: Catalog, public_base_url: String, admin_password: Option<String>) -> Router {
+pub fn router(
+    catalog: Catalog,
+    public_base_url: String,
+    single_tenant: bool,
+    admin_password: Option<String>,
+) -> Router {
     let state = Ui {
         catalog,
         public_base_url,
+        single_tenant,
         admin_password,
     };
     Router::new()
         .route("/", get(index))
+        .route("/login", get(login_form).post(login))
+        .route("/logout", post(logout))
+        .route("/users", get(users_page).post(create_user))
+        .route("/users/grant", post(grant_tenant))
         .route("/orgs", post(create_org))
         .route("/repos", post(create_repo))
         .route("/r/{org}/{repo}", get(repo_page))
@@ -43,7 +80,7 @@ pub fn router(catalog: Catalog, public_base_url: String, admin_password: Option<
         .route("/r/{org}/{repo}/token", post(create_token))
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
-        .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }
 
@@ -51,28 +88,48 @@ pub fn router(catalog: Catalog, public_base_url: String, admin_password: Option<
 pub async fn serve(
     catalog: Catalog,
     public_base_url: String,
+    single_tenant: bool,
     admin_password: Option<String>,
     listen: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    let app = router(catalog, public_base_url, admin_password);
+    let app = router(catalog, public_base_url, single_tenant, admin_password);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await
 }
 
-/// HTTP-basic gate when an admin password is configured; otherwise open.
-async fn admin_auth(State(s): State<Ui>, req: Request, next: Next) -> Response {
-    let Some(expected) = s.admin_password.as_deref() else {
+/// Auth gate. Single-tenant: optional HTTP basic, then all-access. Multi-tenant:
+/// require a login session (except for `/login`), resolving the user's tenants.
+async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
+    if s.single_tenant {
+        if let Some(expected) = &s.admin_password
+            && basic_password(req.headers()).as_deref() != Some(expected.as_str())
+        {
+            return basic_challenge();
+        }
+        req.extensions_mut().insert(CurrentUser::all_access());
         return next.run(req).await;
+    }
+
+    if req.uri().path() == "/login" {
+        return next.run(req).await;
+    }
+    let user = match session_cookie(req.headers()) {
+        Some(token) => s.catalog.resolve_session(&token).await.ok().flatten(),
+        None => None,
     };
-    match basic_password(req.headers()) {
-        Some(pw) if pw == expected => next.run(req).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"sconce admin\"")],
-        )
-            .into_response(),
+    match user {
+        Some(u) => {
+            req.extensions_mut().insert(CurrentUser {
+                is_superadmin: u.is_superadmin,
+                tenants: u.tenant_org_ids.into_iter().collect(),
+            });
+            next.run(req).await
+        }
+        None => Redirect::to("/login").into_response(),
     }
 }
+
+// ----- credential plumbing -----
 
 fn basic_password(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -84,11 +141,34 @@ fn basic_password(headers: &HeaderMap) -> Option<String> {
     creds.split_once(':').map(|(_, p)| p.to_owned())
 }
 
+fn basic_challenge() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"sconce admin\"")],
+    )
+        .into_response()
+}
+
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .map(str::trim)
+        .find_map(|c| c.strip_prefix("sconce_session="))
+        .map(str::to_owned)
+}
+
+fn redirect_with_cookie(to: &str, cookie: &str) -> Response {
+    let mut resp = Redirect::to(to).into_response();
+    if let Ok(v) = HeaderValue::from_str(cookie) {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp
+}
+
 fn e500<E>(_: E) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-/// Minimal HTML-escape for interpolated text.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -107,42 +187,207 @@ fn page(title: &str, body: &str) -> Html<String> {
          .held{{background:#fde2e2;color:#a12}} .ok{{background:#e2f5e6;color:#161}} .muted{{color:#888}}\
          form.inline{{display:inline}} form.row{{margin:.4rem 0}} button{{font:inherit;cursor:pointer}}\
          code,pre{{background:#f6f7f9;border-radius:.3rem}} pre{{padding:.8rem;overflow:auto}} input,select{{font:inherit;padding:.2rem}}\
-         </style></head><body><p class=muted><a href=/>sconce admin</a></p>{body}</body></html>"
+         nav{{float:right}}\
+         </style></head><body><nav class=muted>{nav}</nav><p class=muted><a href=/>sconce admin</a></p>{body}</body></html>",
+        nav = "",
     ))
 }
 
-async fn lookup(s: &Ui, org: &str, repo: &str) -> Result<sconce_catalog::RepoSummary, StatusCode> {
-    s.catalog
+// Header nav: a logout + users link (only meaningful in multi-tenant).
+fn nav(s: &Ui, user: &CurrentUser) -> String {
+    if s.single_tenant {
+        return String::new();
+    }
+    let users = if user.is_superadmin {
+        " · <a href=/users>users</a>"
+    } else {
+        ""
+    };
+    format!("<form class=inline method=post action=/logout><button>log out</button></form>{users}")
+}
+
+fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
+    let mut html = page(title, body).0;
+    // Inject the nav (page() leaves it empty so we can build it per-request).
+    html = html.replacen(
+        "<nav class=muted></nav>",
+        &format!("<nav class=muted>{}</nav>", nav(s, user)),
+        1,
+    );
+    Html(html)
+}
+
+async fn lookup(
+    s: &Ui,
+    user: &CurrentUser,
+    org: &str,
+    repo: &str,
+) -> Result<sconce_catalog::RepoSummary, StatusCode> {
+    let summary = s
+        .catalog
         .list_repositories()
         .await
         .map_err(e500)?
         .into_iter()
         .find(|r| r.org == org && r.repo == repo)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if user.can(summary.org_id) {
+        Ok(summary)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
-// ----- index + creation -----
+// ----- login -----
 
-async fn index(State(s): State<Ui>) -> Result<Html<String>, StatusCode> {
+async fn login_form() -> Html<String> {
+    page(
+        "Sign in",
+        "<h1>Sign in</h1><form method=post action=/login>\
+         <p>email <input name=email type=email required></p>\
+         <p>password <input name=password type=password required></p>\
+         <button>Sign in</button></form>",
+    )
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    email: String,
+    password: String,
+}
+
+async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response, StatusCode> {
+    let Some(user_id) = s
+        .catalog
+        .verify_credentials(&f.email, &f.password)
+        .await
+        .map_err(e500)?
+    else {
+        return Ok(page(
+            "Sign in",
+            "<h1>Sign in</h1><p class=held>Invalid email or password.</p>\
+             <p><a href=/login>try again</a></p>",
+        )
+        .into_response());
+    };
+    let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
+    let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
+    Ok(redirect_with_cookie("/", &cookie))
+}
+
+async fn logout(State(s): State<Ui>, headers: HeaderMap) -> Response {
+    if let Some(token) = session_cookie(&headers) {
+        let _ = s.catalog.delete_session(&token).await;
+    }
+    redirect_with_cookie(
+        "/login",
+        "sconce_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
+    )
+}
+
+// ----- superadmin: users -----
+
+async fn users_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Html<String>, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let users = s.catalog.list_users().await.map_err(e500)?;
+    let mut rows = String::new();
+    for u in &users {
+        let _ = write!(
+            rows,
+            "<tr><td>{email}</td><td>{sa}</td><td>{tenants}</td></tr>",
+            email = esc(&u.email),
+            sa = if u.is_superadmin { "yes" } else { "" },
+            tenants = esc(&u.tenants.join(", ")),
+        );
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "Users",
+        &format!(
+            "<h1>Users</h1><table><tr><th>Email</th><th>Superadmin</th><th>Tenants</th></tr>{rows}</table>\
+             <h2>Create user</h2>\
+             <form class=row method=post action=/users>email <input name=email type=email required> \
+             password <input name=password type=password required> \
+             <label><input type=checkbox name=superadmin value=1> superadmin</label> <button>Create</button></form>\
+             <h2>Grant tenant access</h2>\
+             <form class=row method=post action=/users/grant>email <input name=email type=email required> \
+             tenant <input name=tenant placeholder=org-slug required> <button>Grant</button></form>"
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateUserForm {
+    email: String,
+    password: String,
+    superadmin: Option<String>,
+}
+
+async fn create_user(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<CreateUserForm>,
+) -> Result<Redirect, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    s.catalog
+        .create_user(&f.email, &f.password, f.superadmin.is_some())
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to("/users"))
+}
+
+#[derive(Deserialize)]
+struct GrantTenantForm {
+    email: String,
+    tenant: String,
+}
+
+async fn grant_tenant(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<GrantTenantForm>,
+) -> Result<Redirect, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    s.catalog
+        .add_user_to_tenant(&f.email, &f.tenant)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to("/users"))
+}
+
+// ----- index + org/repo creation -----
+
+async fn index(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Html<String>, StatusCode> {
     let orgs = s.catalog.list_organizations().await.map_err(e500)?;
     let repos = s.catalog.list_repositories().await.map_err(e500)?;
 
     let mut body = String::from("<h1>Organizations &amp; repositories</h1>");
-    if orgs.is_empty() {
-        body.push_str("<p class=muted>No organizations yet — create one below.</p>");
+    let visible: Vec<_> = orgs.iter().filter(|o| user.can(o.id)).collect();
+    if visible.is_empty() {
+        body.push_str("<p class=muted>No tenants you can access yet.</p>");
     }
-    // Group repos under their org, so a freshly created (repo-less) org still
-    // shows up — earlier the index only listed repos, so a new org looked like
-    // nothing happened.
-    for (slug, name) in &orgs {
-        let label = name
+    for o in &visible {
+        let label = o
+            .name
             .as_deref()
             .filter(|n| !n.is_empty())
             .map(|n| format!(" <span class=muted>({})</span>", esc(n)))
             .unwrap_or_default();
-        let _ = write!(body, "<h2>{}{label}</h2>", esc(slug));
-
-        let org_repos: Vec<_> = repos.iter().filter(|r| &r.org == slug).collect();
+        let _ = write!(body, "<h2>{}{label}</h2>", esc(&o.slug));
+        let org_repos: Vec<_> = repos.iter().filter(|r| r.org_id == o.id).collect();
         if org_repos.is_empty() {
             body.push_str("<p class=muted>No repositories yet — add one below.</p>");
             continue;
@@ -163,14 +408,19 @@ async fn index(State(s): State<Ui>) -> Result<Html<String>, StatusCode> {
         body.push_str("</table>");
     }
 
+    // Only superadmins (incl. single-tenant all-access) create orgs.
+    if user.is_superadmin {
+        body.push_str(
+            "<h2>Create</h2>\
+            <form class=row method=post action=/orgs>org slug <input name=slug required> \
+            name <input name=name> <button>Create org</button></form>",
+        );
+    }
     body.push_str(
-        "<h2>Create</h2>\
-        <form class=row method=post action=/orgs>org slug <input name=slug required> \
-        name <input name=name> <button>Create org</button></form>\
-        <form class=row method=post action=/repos>org <input name=org required> \
-        repo <input name=repo required> <button>Create repo</button></form>",
+        "<form class=row method=post action=/repos>org <input name=org required> \
+         repo <input name=repo required> <button>Create repo</button></form>",
     );
-    Ok(page("Repositories", &body))
+    Ok(shell(&s, &user, "Repositories", &body))
 }
 
 #[derive(Deserialize)]
@@ -179,7 +429,14 @@ struct OrgForm {
     name: Option<String>,
 }
 
-async fn create_org(State(s): State<Ui>, Form(f): Form<OrgForm>) -> Result<Redirect, StatusCode> {
+async fn create_org(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<OrgForm>,
+) -> Result<Redirect, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let name = f.name.as_deref().filter(|n| !n.is_empty());
     s.catalog.create_org(&f.slug, name).await.map_err(e500)?;
     Ok(Redirect::to("/"))
@@ -191,8 +448,23 @@ struct RepoForm {
     repo: String,
 }
 
-async fn create_repo(State(s): State<Ui>, Form(f): Form<RepoForm>) -> Result<Redirect, StatusCode> {
-    // create_repo errors if the org is unknown.
+async fn create_repo(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<RepoForm>,
+) -> Result<Redirect, StatusCode> {
+    // Must have access to the target org.
+    let org = s
+        .catalog
+        .list_organizations()
+        .await
+        .map_err(e500)?
+        .into_iter()
+        .find(|o| o.slug == f.org)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if !user.can(org.id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     s.catalog
         .create_repo(&f.org, &f.repo)
         .await
@@ -202,13 +474,13 @@ async fn create_repo(State(s): State<Ui>, Form(f): Form<RepoForm>) -> Result<Red
 
 // ----- repository detail -----
 
-// A view function that assembles several HTML sections; length is inherent.
 #[allow(clippy::too_many_lines)]
 async fn repo_page(
     State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
 ) -> Result<Html<String>, StatusCode> {
-    let summary = lookup(&s, &org, &repo).await?;
+    let summary = lookup(&s, &user, &org, &repo).await?;
     let versions = s
         .catalog
         .admin_package_versions(summary.id)
@@ -271,7 +543,6 @@ async fn repo_page(
         rows = "<tr><td colspan=5 class=muted>No packages yet. Mirror one with <code>sconce mirror</code>.</td></tr>".into();
     }
 
-    // Grants (agency curation).
     let mut grant_rows = String::new();
     for g in &grants {
         let _ = write!(
@@ -293,7 +564,6 @@ async fn repo_page(
         },
     );
 
-    // Licenses (seller mode).
     let mut lic_rows = String::new();
     for l in &licenses {
         let _ = write!(
@@ -322,7 +592,9 @@ async fn repo_page(
         n = token_count,
     );
 
-    Ok(page(
+    Ok(shell(
+        &s,
+        &user,
         &slug,
         &format!(
             "<h1>{slug}</h1>{policy}\
@@ -333,7 +605,7 @@ async fn repo_page(
     ))
 }
 
-// ----- repo actions -----
+// ----- repo actions (access already enforced by `lookup`) -----
 
 #[derive(Deserialize)]
 struct PolicyForm {
@@ -343,12 +615,13 @@ struct PolicyForm {
 
 async fn set_policy(
     State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
     Form(f): Form<PolicyForm>,
 ) -> Result<Redirect, StatusCode> {
-    let summary = lookup(&s, &org, &repo).await?;
+    let id = lookup(&s, &user, &org, &repo).await?.id;
     s.catalog
-        .set_update_policy(summary.id, &f.mode, f.cooldown_days)
+        .set_update_policy(id, &f.mode, f.cooldown_days)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
@@ -363,10 +636,11 @@ struct VersionForm {
 
 async fn version_action(
     State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
     Form(f): Form<VersionForm>,
 ) -> Result<Redirect, StatusCode> {
-    let id = lookup(&s, &org, &repo).await?.id;
+    let id = lookup(&s, &user, &org, &repo).await?.id;
     match f.action.as_str() {
         "hold" => s.catalog.hold_version(id, &f.package, &f.normalized).await,
         "unhold" => {
@@ -393,12 +667,13 @@ struct GrantForm {
 
 async fn create_grant(
     State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
     Form(f): Form<GrantForm>,
 ) -> Result<Redirect, StatusCode> {
-    let target = lookup(&s, &org, &repo).await?.id;
+    let target = lookup(&s, &user, &org, &repo).await?.id;
     let (src_org, src_repo) = f.from.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
-    let source = lookup(&s, src_org, src_repo).await?.id;
+    let source = lookup(&s, &user, src_org, src_repo).await?.id;
     s.catalog
         .grant_package(target, source, &f.package)
         .await
@@ -414,10 +689,11 @@ struct LicenseForm {
 
 async fn create_license(
     State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
     Form(f): Form<LicenseForm>,
 ) -> Result<Html<String>, StatusCode> {
-    let repo_id = lookup(&s, &org, &repo).await?.id;
+    let repo_id = lookup(&s, &user, &org, &repo).await?.id;
     let buyer = f.buyer.as_deref().filter(|b| !b.is_empty());
     let packages: Vec<&str> = f
         .packages
@@ -429,9 +705,11 @@ async fn create_license(
         .issue_license(repo_id, buyer, &packages)
         .await
         .map_err(e500)?
-        .ok_or(StatusCode::BAD_REQUEST)?; // a package wasn't found in this repo
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let slug = format!("{}/{}", esc(&org), esc(&repo));
-    Ok(page(
+    Ok(shell(
+        &s,
+        &user,
         "License created",
         &format!(
             "<h1>License created</h1><p>Entitled to: {pkgs}. Give this key to the buyer — \
@@ -444,12 +722,15 @@ async fn create_license(
 
 async fn create_token(
     State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
 ) -> Result<Html<String>, StatusCode> {
-    let repo_id = lookup(&s, &org, &repo).await?.id;
+    let repo_id = lookup(&s, &user, &org, &repo).await?.id;
     let token = s.catalog.create_token(repo_id, None).await.map_err(e500)?;
     let slug = format!("{}/{}", esc(&org), esc(&repo));
-    Ok(page(
+    Ok(shell(
+        &s,
+        &user,
         "Token created",
         &format!(
             "<h1>Token created</h1><p>Store it now — it won't be shown again.</p>\

@@ -45,6 +45,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0007_licenses",
         include_str!("../migrations/0007_licenses.sql"),
     ),
+    (
+        "0008_accounts",
+        include_str!("../migrations/0008_accounts.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -57,14 +61,41 @@ pub struct Catalog {
     pool: PgPool,
 }
 
+/// An organization (tenant) in the admin listing.
+#[derive(Debug, Clone)]
+pub struct OrgSummary {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: Option<String>,
+}
+
 /// A repository in the admin listing.
 #[derive(Debug, Clone)]
 pub struct RepoSummary {
     pub org: String,
+    pub org_id: Uuid,
     pub repo: String,
     pub id: Uuid,
     pub update_mode: String,
     pub cooldown_days: i32,
+}
+
+/// An authenticated admin user (from a session or login).
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    pub id: Uuid,
+    pub is_superadmin: bool,
+    /// Org (tenant) ids this user may administer (empty for a superadmin, who
+    /// sees all).
+    pub tenant_org_ids: Vec<Uuid>,
+}
+
+/// A user in the superadmin listing.
+#[derive(Debug, Clone)]
+pub struct UserSummary {
+    pub email: String,
+    pub is_superadmin: bool,
+    pub tenants: Vec<String>,
 }
 
 /// A version row for the admin UI, with its control state.
@@ -170,21 +201,27 @@ impl Catalog {
         .await
     }
 
-    /// All organizations `(slug, name)`, sorted — so a freshly created org is
-    /// visible in the dashboard even before it has any repositories.
-    pub async fn list_organizations(&self) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
-        let rows = sqlx::query("select slug, name from organizations order by slug")
+    /// All organizations (tenants), sorted — so a freshly created org is visible
+    /// in the dashboard even before it has any repositories.
+    pub async fn list_organizations(&self) -> Result<Vec<OrgSummary>, sqlx::Error> {
+        let rows = sqlx::query("select id, slug, name from organizations order by slug")
             .fetch_all(&self.pool)
             .await?;
         rows.iter()
-            .map(|r| Ok((r.try_get("slug")?, r.try_get("name")?)))
+            .map(|r| {
+                Ok(OrgSummary {
+                    id: r.try_get("id")?,
+                    slug: r.try_get("slug")?,
+                    name: r.try_get("name")?,
+                })
+            })
             .collect()
     }
 
     /// All repositories, for the admin dashboard.
     pub async fn list_repositories(&self) -> Result<Vec<RepoSummary>, sqlx::Error> {
         let rows = sqlx::query(
-            "select o.slug as org, r.slug as repo, r.id as id, \
+            "select o.slug as org, o.id as org_id, r.slug as repo, r.id as id, \
                     r.update_mode as update_mode, r.cooldown_days as cooldown_days \
              from repositories r join organizations o on o.id = r.org_id \
              order by o.slug, r.slug",
@@ -195,6 +232,7 @@ impl Catalog {
             .map(|row| {
                 Ok(RepoSummary {
                     org: row.try_get("org")?,
+                    org_id: row.try_get("org_id")?,
                     repo: row.try_get("repo")?,
                     id: row.try_get("id")?,
                     update_mode: row.try_get("update_mode")?,
@@ -294,6 +332,149 @@ impl Catalog {
                 })
             })
             .collect()
+    }
+
+    // ----- accounts (admin UI) -----
+
+    /// Create a user with an argon2-hashed password (idempotent on email:
+    /// updates the password + superadmin flag). Returns the user id.
+    pub async fn create_user(
+        &self,
+        email: &str,
+        password: &str,
+        is_superadmin: bool,
+    ) -> Result<Uuid, sqlx::Error> {
+        let hash = hash_password(password);
+        sqlx::query_scalar(
+            "insert into users (email, password_hash, is_superadmin) values ($1, $2, $3) \
+             on conflict (email) do update set password_hash = excluded.password_hash, \
+                 is_superadmin = excluded.is_superadmin \
+             returning id",
+        )
+        .bind(email)
+        .bind(hash)
+        .bind(is_superadmin)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Give a user access to a tenant (organization, by slug). Returns `false`
+    /// if the org is unknown.
+    pub async fn add_user_to_tenant(
+        &self,
+        email: &str,
+        org_slug: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "insert into user_tenants (user_id, org_id) \
+             select u.id, o.id from users u, organizations o \
+             where u.email = $1 and o.slug = $2 \
+             on conflict do nothing",
+        )
+        .bind(email)
+        .bind(org_slug)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Verify an email/password and, on success, return the user's id.
+    pub async fn verify_credentials(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let row: Option<(Uuid, String)> =
+            sqlx::query_as("select id, password_hash from users where email = $1")
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row
+            .filter(|(_, hash)| verify_password(password, hash))
+            .map(|(id, _)| id))
+    }
+
+    /// Open a login session for a user, returning the (plaintext) session token.
+    pub async fn create_session(
+        &self,
+        user_id: Uuid,
+        ttl_days: i64,
+    ) -> Result<String, sqlx::Error> {
+        let token = generate_secret("scses_");
+        sqlx::query(
+            "insert into sessions (token_hash, user_id, expires_at) \
+             values ($1, $2, now() + make_interval(days => $3))",
+        )
+        .bind(token_hash(&token))
+        .bind(user_id)
+        .bind(i32::try_from(ttl_days).unwrap_or(i32::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(token)
+    }
+
+    /// Resolve a session token to the authenticated user (with tenant access),
+    /// or `None` if missing/expired.
+    pub async fn resolve_session(&self, token: &str) -> Result<Option<AuthUser>, sqlx::Error> {
+        let row: Option<(Uuid, bool)> = sqlx::query_as(
+            "select u.id, u.is_superadmin from sessions s join users u on u.id = s.user_id \
+             where s.token_hash = $1 and s.expires_at > now()",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, is_superadmin)) = row else {
+            return Ok(None);
+        };
+        let tenant_org_ids: Vec<Uuid> =
+            sqlx::query_scalar("select org_id from user_tenants where user_id = $1")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(Some(AuthUser {
+            id,
+            is_superadmin,
+            tenant_org_ids,
+        }))
+    }
+
+    /// Delete a session (logout).
+    pub async fn delete_session(&self, token: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from sessions where token_hash = $1")
+            .bind(token_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// All users with their tenant slugs — for the superadmin user list.
+    pub async fn list_users(&self) -> Result<Vec<UserSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select u.email as email, u.is_superadmin as is_superadmin, \
+                    coalesce(array_agg(o.slug) filter (where o.slug is not null), '{}') as tenants \
+             from users u \
+             left join user_tenants ut on ut.user_id = u.id \
+             left join organizations o on o.id = ut.org_id \
+             group by u.id, u.email, u.is_superadmin order by u.email",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(UserSummary {
+                    email: row.try_get("email")?,
+                    is_superadmin: row.try_get("is_superadmin")?,
+                    tenants: row.try_get("tenants")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Number of users (a fresh install has none → bootstrap a superadmin).
+    pub async fn user_count(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("select count(*) from users")
+            .fetch_one(&self.pool)
+            .await
     }
 
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
@@ -778,6 +959,28 @@ fn generate_secret(prefix: &str) -> String {
 fn token_hash(token: &str) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// Hash a (low-entropy) user password with argon2 → a PHC string for storage.
+fn hash_password(password: &str) -> String {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hashing")
+        .to_string()
+}
+
+/// Verify a password against a stored argon2 PHC string.
+fn verify_password(password: &str, phc: &str) -> bool {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    PasswordHash::new(phc).is_ok_and(|parsed| {
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    })
 }
 
 /// Apply pending migrations on a connection already holding the advisory lock.

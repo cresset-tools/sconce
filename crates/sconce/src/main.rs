@@ -108,6 +108,30 @@ enum Command {
         database_url: String,
     },
 
+    /// Create (or update) an admin-UI user. Use `--superadmin` for the first,
+    /// all-tenant account.
+    UserCreate {
+        /// Login email.
+        email: String,
+        /// Password.
+        password: String,
+        /// Grant access to all tenants.
+        #[arg(long)]
+        superadmin: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Give a user access to a tenant (organization).
+    UserGrant {
+        /// User email.
+        email: String,
+        /// Tenant (organization) slug.
+        tenant: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Issue a license key for a repository, entitled to specific packages
     /// (seller mode). The buyer authenticates with the key (http-basic password)
     /// and may install only the listed packages.
@@ -171,7 +195,10 @@ enum Command {
         /// Public base URL of the Composer endpoint (for install snippets).
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         public_base_url: String,
-        /// Require HTTP basic auth with this password (any username).
+        /// Single-tenant mode: no user accounts; gate with `--admin-password`.
+        #[arg(long)]
+        single_tenant: bool,
+        /// Single-tenant only: require HTTP basic auth with this password.
         #[arg(long, env = "SCONCE_ADMIN_PASSWORD")]
         admin_password: Option<String>,
     },
@@ -286,8 +313,15 @@ fn main() -> Result<()> {
             database_url,
             listen,
             public_base_url,
+            single_tenant,
             admin_password,
-        } => ui(&database_url, listen, public_base_url, admin_password),
+        } => ui(
+            &database_url,
+            listen,
+            public_base_url,
+            single_tenant,
+            admin_password,
+        ),
         Command::OrgCreate {
             slug,
             name,
@@ -298,6 +332,17 @@ fn main() -> Result<()> {
             repo,
             database_url,
         } => repo_create(&org, &repo, &database_url),
+        Command::UserCreate {
+            email,
+            password,
+            superadmin,
+            database_url,
+        } => user_create(&email, &password, superadmin, &database_url),
+        Command::UserGrant {
+            email,
+            tenant,
+            database_url,
+        } => user_grant(&email, &tenant, &database_url),
         Command::LicenseCreate {
             repo,
             buyer,
@@ -391,6 +436,31 @@ fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
             .with_context(|| format!("creating repo (does org '{org}' exist?)"))?;
         println!("repo created: {org}/{repo}");
         Ok(())
+    })
+}
+
+fn user_create(email: &str, password: &str, superadmin: bool, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        catalog
+            .create_user(email, password, superadmin)
+            .await
+            .context("creating user")?;
+        println!(
+            "user {email} created{}",
+            if superadmin { " (superadmin)" } else { "" }
+        );
+        Ok(())
+    })
+}
+
+fn user_grant(email: &str, tenant: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        if catalog.add_user_to_tenant(email, tenant).await? {
+            println!("granted {email} access to tenant {tenant}");
+            Ok(())
+        } else {
+            anyhow::bail!("unknown user or tenant ({email} / {tenant})")
+        }
     })
 }
 
@@ -531,6 +601,7 @@ fn ui(
     database_url: &str,
     listen: std::net::SocketAddr,
     public_base_url: String,
+    single_tenant: bool,
     admin_password: Option<String>,
 ) -> Result<()> {
     use sconce_catalog::Catalog;
@@ -541,13 +612,19 @@ fn ui(
             .await
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
-        if admin_password.is_none() {
+        if single_tenant {
+            if admin_password.is_none() {
+                eprintln!(
+                    "warning: single-tenant with no --admin-password; the admin UI is open (bind to localhost)."
+                );
+            }
+        } else if catalog.user_count().await? == 0 {
             eprintln!(
-                "warning: no --admin-password set; the admin UI is unauthenticated (bind to localhost)."
+                "warning: no users exist; create the first one with `sconce user-create --superadmin <email> <password>`."
             );
         }
         println!("sconce admin UI on http://{listen}");
-        sconce_server::ui::serve(catalog, public_base_url, admin_password, listen)
+        sconce_server::ui::serve(catalog, public_base_url, single_tenant, admin_password, listen)
             .await
             .context("serving UI")?;
         Ok::<_, anyhow::Error>(())
