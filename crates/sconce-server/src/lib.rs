@@ -9,16 +9,20 @@
 //! - `GET /dist/{vendor}/{name}/{sha256}.zip` — the content-addressed download;
 //!   the sha256 in the path resolves the blob in the CAS.
 //!
-//! No authentication yet — that arrives with the multi-tenant phase. This is the
-//! self-hosted, single-repo serving path.
+//! Every route requires a valid read token (`Authorization: Bearer <token>` or
+//! HTTP basic with the token as the password). A fresh, tokenless install is
+//! fully closed — secure by default; create a token with `sconce token create`.
+//! Per-token scoping / multi-tenant access control arrives with that phase.
 
 #![forbid(unsafe_code)]
 
 use axum::Router;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
+use base64::Engine as _;
 use sconce_cas::{BlobId, BlobStore, FsBlobStore};
 use sconce_catalog::Catalog;
 use serde_json::json;
@@ -35,15 +39,58 @@ struct AppState {
 /// Build the router for a repository served from `catalog` + `store` at
 /// `base_url`.
 pub fn router(catalog: Catalog, store: FsBlobStore, base_url: String) -> Router {
+    let state = AppState {
+        catalog,
+        store,
+        base_url,
+    };
     Router::new()
         .route("/packages.json", get(packages_json))
         .route("/p2/{*rest}", get(p2))
         .route("/dist/{*rest}", get(dist))
-        .with_state(AppState {
-            catalog,
-            store,
-            base_url,
-        })
+        // Every route requires a valid token — the repo is private. A fresh,
+        // tokenless install is fully closed; create one with `sconce token create`.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .with_state(state)
+}
+
+/// Auth gate: accept a valid token via `Authorization: Bearer <token>` or
+/// HTTP basic (token as the password), else 401.
+async fn require_token(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    match extract_token(req.headers()) {
+        Some(token) => match s.catalog.token_valid(&token).await {
+            Ok(true) => next.run(req).await,
+            Ok(false) => unauthorized(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        None => unauthorized(),
+    }
+}
+
+/// Pull a token from the `Authorization` header (Bearer, or basic-auth password).
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    if let Some(bearer) = value.strip_prefix("Bearer ") {
+        return Some(bearer.trim().to_owned());
+    }
+    if let Some(basic) = value.strip_prefix("Basic ") {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(basic.trim())
+            .ok()?;
+        let creds = String::from_utf8(decoded).ok()?;
+        // "username:password" — the token is the password (username ignored),
+        // matching the Magento/GitLab convention.
+        return creds.split_once(':').map(|(_, pass)| pass.to_owned());
+    }
+    None
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"sconce\"")],
+    )
+        .into_response()
 }
 
 /// Bind `listen` and serve until the process is stopped.
@@ -144,5 +191,27 @@ mod tests {
         assert_eq!(parse_hex32(&hex), Some(bytes));
         assert_eq!(parse_hex32("nothex"), None);
         assert_eq!(parse_hex32(&"a".repeat(63)), None);
+    }
+
+    fn headers_with(auth: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, auth.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn extracts_bearer_and_basic_tokens() {
+        assert_eq!(
+            extract_token(&headers_with("Bearer sconce_abc")).as_deref(),
+            Some("sconce_abc")
+        );
+        // basic: base64("anyuser:sconce_xyz") → token is the password.
+        let basic = base64::engine::general_purpose::STANDARD.encode("anyuser:sconce_xyz");
+        assert_eq!(
+            extract_token(&headers_with(&format!("Basic {basic}"))).as_deref(),
+            Some("sconce_xyz")
+        );
+        assert_eq!(extract_token(&HeaderMap::new()), None);
+        assert_eq!(extract_token(&headers_with("Weird foo")), None);
     }
 }

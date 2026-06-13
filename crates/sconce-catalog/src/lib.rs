@@ -31,6 +31,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_dist_shasum",
         include_str!("../migrations/0002_dist_shasum.sql"),
     ),
+    ("0003_tokens", include_str!("../migrations/0003_tokens.sql")),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -164,6 +165,34 @@ impl Catalog {
         .await
     }
 
+    /// Create a new read token: generate a high-entropy secret, store only its
+    /// sha256, and return the plaintext **once** (it is never recoverable after).
+    pub async fn create_token(&self, label: Option<&str>) -> Result<String, sqlx::Error> {
+        let token = generate_token();
+        sqlx::query("insert into tokens (token_hash, label) values ($1, $2)")
+            .bind(token_hash(&token))
+            .bind(label)
+            .execute(&self.pool)
+            .await?;
+        Ok(token)
+    }
+
+    /// Whether `token` matches a stored token. Bumps `last_used_at` on a hit.
+    pub async fn token_valid(&self, token: &str) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query("update tokens set last_used_at = now() where token_hash = $1")
+            .bind(token_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    /// Number of tokens that exist (a fresh, tokenless repo is fully closed).
+    pub async fn token_count(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("select count(*) from tokens")
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// All package names, sorted — used to build the root `available-packages`.
     pub async fn all_package_names(&self) -> Result<Vec<String>, sqlx::Error> {
         let rows = sqlx::query("select name from packages order by name")
@@ -189,6 +218,25 @@ impl Catalog {
 
         rows.iter().map(row_to_version).collect()
     }
+}
+
+/// A fresh, high-entropy read token, prefixed for recognizability. Randomness
+/// comes from two v4 UUIDs (CSPRNG-backed) — 32 bytes, hex-encoded.
+fn generate_token() -> String {
+    use std::fmt::Write as _;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut token = String::with_capacity(7 + 64);
+    token.push_str("sconce_");
+    for byte in a.as_bytes().iter().chain(b.as_bytes()) {
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
+/// sha256 of a token — what we store and compare against.
+fn token_hash(token: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).to_vec()
 }
 
 /// Apply pending migrations on a connection already holding the advisory lock.

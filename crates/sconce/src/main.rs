@@ -99,6 +99,25 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         base_url: String,
     },
+
+    /// Manage read tokens (the repo is private; clients authenticate with one).
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TokenAction {
+    /// Create a new token and print it once (it is not recoverable afterward).
+    Create {
+        /// Optional human label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -119,7 +138,33 @@ fn main() -> Result<()> {
             listen,
             base_url,
         } => serve(&cas, &database_url, listen, base_url),
+        Command::Token { action } => match action {
+            TokenAction::Create {
+                label,
+                database_url,
+            } => token_create(label.as_deref(), &database_url),
+        },
     }
+}
+
+fn token_create(label: Option<&str>, database_url: &str) -> Result<()> {
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+        let token = catalog
+            .create_token(label)
+            .await
+            .context("creating token")?;
+        // The token itself goes to stdout (scriptable); the notice to stderr.
+        println!("{token}");
+        eprintln!("Token created — store it now; it will not be shown again.");
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn serve(

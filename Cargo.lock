@@ -2515,6 +2515,7 @@ name = "sconce-catalog"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
@@ -2557,6 +2558,7 @@ name = "sconce-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "sconce-cas",
  "sconce-catalog",
  "sconce-metadata",
