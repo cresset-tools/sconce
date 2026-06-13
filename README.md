@@ -10,10 +10,18 @@ Composer v1 (`provider-includes`) and v2 (`metadata-url`) clients, and re-archiv
 every version into a **deterministic, content-addressed** artifact, so identical
 packages dedupe and download URLs stay stable.
 
-sconce is open-core (EUPL-1.2): the engine here is the open-source core, and
-**Bougie Repo** is the hosted product + commercial agency/seller features built
-on it. It's a member of the [cresset-tools](https://github.com/cresset-tools)
-family alongside [bougie](https://github.com/cresset-tools/bougie) and
+Its headline feature is **preventive supply-chain control**: per-repo version
+**cooldown** (only expose releases older than N days), **manual approval queues**,
+**allowlists**, and **security holds** — so a compromised upstream release can't
+reach your builds before a human vets it. (Notably *not* a speed play — Private
+Packagist already mirrors dist; sconce competes on self-hosting, ownership, and
+control.)
+
+sconce is fully open source (EUPL-1.2) — all features, including agency and
+seller modes, are in the open tree. A hosted deployment ("**Bougie Repo**") and
+support are possible later, but nothing is gated today. It's a member of the
+[cresset-tools](https://github.com/cresset-tools) family alongside
+[bougie](https://github.com/cresset-tools/bougie) and
 [wick](https://github.com/cresset-tools/wick).
 
 ## Status
