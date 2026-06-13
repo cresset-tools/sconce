@@ -8,6 +8,7 @@ members = [
     "crates/sconce-git",
     "crates/sconce-metadata",
     "crates/sconce-mirror",
+    "crates/sconce-server",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ sconce-catalog = { path = "crates/sconce-catalog", version = "0.1.0" } # x-relea
 sconce-git = { path = "crates/sconce-git", version = "0.1.0" } # x-release-please-version
 sconce-metadata = { path = "crates/sconce-metadata", version = "0.1.0" } # x-release-please-version
 sconce-mirror = { path = "crates/sconce-mirror", version = "0.1.0" } # x-release-please-version
+sconce-server = { path = "crates/sconce-server", version = "0.1.0" } # x-release-please-version
 
 # Shared external deps.
 anyhow = "1"
@@ -55,6 +57,7 @@ gix = { version = "0.70", features = ["attributes"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
+axum = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

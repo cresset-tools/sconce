@@ -23,6 +23,7 @@ sconce-cas = { workspace = true }
 sconce-catalog = { workspace = true }
 sconce-git = { workspace = true }
 sconce-mirror = { workspace = true }
+sconce-server = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true }

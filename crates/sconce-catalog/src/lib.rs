@@ -18,6 +18,10 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// The error type returned by catalog operations (re-exported so consumers can
+/// handle it without depending on `sqlx` directly).
+pub use sqlx::Error as SqlxError;
+
 /// Migrations, embedded as plain SQL and applied in order at runtime. Adding a
 /// migration = append a `(name, include_str!(...))` entry; names are recorded in
 /// `_sconce_migrations` so each runs once.
@@ -158,6 +162,14 @@ impl Catalog {
         .bind(source_reference)
         .fetch_one(&self.pool)
         .await
+    }
+
+    /// All package names, sorted — used to build the root `available-packages`.
+    pub async fn all_package_names(&self) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query("select name from packages order by name")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|r| r.try_get("name")).collect()
     }
 
     /// All non-yanked versions of a package, by name, ordered by normalized

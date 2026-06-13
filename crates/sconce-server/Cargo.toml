@@ -1,0 +1,22 @@
+[package]
+name = "sconce-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "HTTP server exposing the Composer v2 wire API (packages.json, p2 metadata, dist downloads) backed by the catalog + CAS."
+
+[dependencies]
+sconce-catalog = { workspace = true }
+sconce-cas = { workspace = true }
+sconce-metadata = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

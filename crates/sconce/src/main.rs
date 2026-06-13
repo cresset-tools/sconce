@@ -83,6 +83,22 @@ enum Command {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+
+    /// Serve the Composer v2 wire API (packages.json, p2 metadata, dist) over HTTP.
+    Serve {
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: std::net::SocketAddr,
+        /// Public base URL emitted in metadata/dist URLs.
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        base_url: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -97,7 +113,39 @@ fn main() -> Result<()> {
             cas,
             database_url,
         } => mirror(&repo, &git_url, &cas, &database_url),
+        Command::Serve {
+            cas,
+            database_url,
+            listen,
+            base_url,
+        } => serve(&cas, &database_url, listen, base_url),
     }
+}
+
+fn serve(
+    cas: &Path,
+    database_url: &str,
+    listen: std::net::SocketAddr,
+    base_url: String,
+) -> Result<()> {
+    use sconce_cas::FsBlobStore;
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store =
+            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        println!("sconce serving on http://{listen} (base url: {base_url})");
+        sconce_server::serve(catalog, store, base_url, listen)
+            .await
+            .context("serving")?;
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn mirror(repo: &Path, git_url: &str, cas: &Path, database_url: &str) -> Result<()> {
