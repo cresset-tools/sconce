@@ -32,6 +32,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0002_dist_shasum.sql"),
     ),
     ("0003_tokens", include_str!("../migrations/0003_tokens.sql")),
+    (
+        "0004_update_policy",
+        include_str!("../migrations/0004_update_policy.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -137,20 +141,26 @@ impl Catalog {
         dist_blob_sha256: Option<&[u8; 32]>,
         dist_shasum: Option<&str>,
         source_reference: Option<&str>,
+        released_at_unix: Option<i64>,
     ) -> Result<Uuid, sqlx::Error> {
         let dist = dist_blob_sha256.map(|b| &b[..]);
+        // released_at is the upstream release time that drives cooldown; the
+        // cast-to-double + to_timestamp happen in SQL (null stays null).
+        // held_at/approved_at are deliberately NOT touched here, so re-mirroring
+        // preserves operator decisions.
         sqlx::query_scalar(
             "insert into package_versions \
                  (package_id, version, normalized_version, stability, composer_json, \
-                  dist_blob_sha256, dist_shasum, source_reference) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+                  dist_blob_sha256, dist_shasum, source_reference, released_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::double precision)) \
              on conflict (package_id, normalized_version) do update set \
                  version = excluded.version, \
                  stability = excluded.stability, \
                  composer_json = excluded.composer_json, \
                  dist_blob_sha256 = excluded.dist_blob_sha256, \
                  dist_shasum = excluded.dist_shasum, \
-                 source_reference = excluded.source_reference \
+                 source_reference = excluded.source_reference, \
+                 released_at = excluded.released_at \
              returning id",
         )
         .bind(package_id)
@@ -161,6 +171,7 @@ impl Catalog {
         .bind(dist)
         .bind(dist_shasum)
         .bind(source_reference)
+        .bind(released_at_unix)
         .fetch_one(&self.pool)
         .await
     }
@@ -201,8 +212,9 @@ impl Catalog {
         rows.iter().map(|r| r.try_get("name")).collect()
     }
 
-    /// All non-yanked versions of a package, by name, ordered by normalized
-    /// version. This is the read path the Composer metadata serving builds on.
+    /// All non-yanked versions of a package — the raw catalog view (ignores
+    /// holds and update policy). Use [`Self::visible_versions`] for the serving
+    /// read path.
     pub async fn package_versions(&self, name: &str) -> Result<Vec<PackageVersion>, sqlx::Error> {
         let rows = sqlx::query(
             "select pv.version, pv.normalized_version, pv.stability, pv.composer_json, \
@@ -215,8 +227,125 @@ impl Catalog {
         .bind(name)
         .fetch_all(&self.pool)
         .await?;
-
         rows.iter().map(row_to_version).collect()
+    }
+
+    /// The versions of a package **visible** under an explicit update policy —
+    /// the read path Composer serving builds on (the server passes its global
+    /// policy in). A version is hidden if yanked or held; otherwise: `auto` →
+    /// all visible; `manual` → only approved; `delayed` → visible once
+    /// `released_at + cooldown_days` has passed (or it was approved early).
+    ///
+    /// Taking the policy as parameters (rather than reading the singleton here)
+    /// keeps this pure and testable without mutating shared global state.
+    pub async fn visible_versions(
+        &self,
+        name: &str,
+        mode: &str,
+        cooldown_days: i32,
+    ) -> Result<Vec<PackageVersion>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select pv.version, pv.normalized_version, pv.stability, pv.composer_json, \
+                    pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
+             from package_versions pv \
+             join packages p on p.id = pv.package_id \
+             where p.name = $1 \
+               and pv.yanked_at is null \
+               and pv.held_at is null \
+               and ( $2 = 'auto' \
+                     or pv.approved_at is not null \
+                     or ( $2 = 'delayed' \
+                          and pv.released_at is not null \
+                          and pv.released_at + make_interval(days => $3) <= now() ) ) \
+             order by pv.normalized_version",
+        )
+        .bind(name)
+        .bind(mode)
+        .bind(cooldown_days)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_version).collect()
+    }
+
+    /// The global update policy: `(update_mode, cooldown_days)`.
+    pub async fn update_policy(&self) -> Result<(String, i32), sqlx::Error> {
+        let row =
+            sqlx::query("select update_mode, cooldown_days from repo_settings where id = true")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok((row.try_get("update_mode")?, row.try_get("cooldown_days")?))
+    }
+
+    /// Set the global update policy. `mode` must be `auto`/`manual`/`delayed`
+    /// (enforced by a check constraint).
+    pub async fn set_update_policy(
+        &self,
+        mode: &str,
+        cooldown_days: i32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update repo_settings set update_mode = $1, cooldown_days = $2 where id = true",
+        )
+        .bind(mode)
+        .bind(cooldown_days)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Place a security hold on a version (hides it immediately, even if it was
+    /// already visible). Returns whether a matching version was found.
+    pub async fn hold_version(
+        &self,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        self.set_version_timestamp("held_at", "now()", package, normalized_version)
+            .await
+    }
+
+    /// Release a hold.
+    pub async fn unhold_version(
+        &self,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        self.set_version_timestamp("held_at", "null", package, normalized_version)
+            .await
+    }
+
+    /// Approve a version (makes it visible under `manual`, or early under
+    /// `delayed`).
+    pub async fn approve_version(
+        &self,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        self.set_version_timestamp("approved_at", "now()", package, normalized_version)
+            .await
+    }
+
+    /// Set `held_at`/`approved_at` to `now()`/`null` for one version. `column`
+    /// and `value` are fixed literals chosen by the callers above — never user
+    /// input — so interpolating them is safe.
+    async fn set_version_timestamp(
+        &self,
+        column: &str,
+        value: &str,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = format!(
+            "update package_versions pv set {column} = {value} \
+             from packages p \
+             where p.id = pv.package_id and p.name = $1 and pv.normalized_version = $2"
+        );
+        let done = sqlx::query(&sql)
+            .bind(package)
+            .bind(normalized_version)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
     }
 }
 
@@ -354,6 +483,7 @@ mod tests {
             Some(&sha),
             Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
             Some("abc123"),
+            None,
         )
         .await
         .unwrap();
@@ -380,7 +510,9 @@ mod tests {
         let cj = serde_json::json!({"name": name});
 
         let a = cat
-            .upsert_package_version(pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, None, None)
+            .upsert_package_version(
+                pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None,
+            )
             .await
             .unwrap();
         // Same normalized version → update, not a second row.
@@ -394,6 +526,7 @@ mod tests {
                 None,
                 None,
                 Some("ref2"),
+                None,
             )
             .await
             .unwrap();
@@ -410,5 +543,106 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The supply-chain controls: cooldown hides fresh releases, holds hide any
+    /// version, approval reveals early. Uses explicit policy params + unique
+    /// package names, so it never touches the global singleton (no test races).
+    #[tokio::test]
+    async fn cooldown_hold_and_approval_gate_visibility() {
+        let Some(cat) = catalog().await else { return };
+        let name = unique_name("pkg");
+        let pkg = cat.upsert_package(&name, "git", None).await.unwrap();
+        let cj = serde_json::json!({"name": name});
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let day = 86_400;
+
+        // An old release (30 days ago) and a fresh one (just now).
+        cat.upsert_package_version(
+            pkg,
+            "v1.0.0",
+            "1.0.0.0",
+            "stable",
+            &cj,
+            None,
+            None,
+            None,
+            Some(now - 30 * day),
+        )
+        .await
+        .unwrap();
+        cat.upsert_package_version(
+            pkg,
+            "v1.1.0",
+            "1.1.0.0",
+            "stable",
+            &cj,
+            None,
+            None,
+            None,
+            Some(now),
+        )
+        .await
+        .unwrap();
+
+        let norm = |vs: Vec<PackageVersion>| -> Vec<String> {
+            vs.into_iter().map(|v| v.normalized_version).collect()
+        };
+
+        // auto: both visible.
+        assert_eq!(
+            norm(cat.visible_versions(&name, "auto", 0).await.unwrap()),
+            ["1.0.0.0", "1.1.0.0"]
+        );
+
+        // delayed, 7-day cooldown: only the old release is past cooldown.
+        assert_eq!(
+            norm(cat.visible_versions(&name, "delayed", 7).await.unwrap()),
+            ["1.0.0.0"]
+        );
+
+        // approve the fresh one → visible early even under delayed.
+        assert!(cat.approve_version(&name, "1.1.0.0").await.unwrap());
+        assert_eq!(
+            norm(cat.visible_versions(&name, "delayed", 7).await.unwrap()),
+            ["1.0.0.0", "1.1.0.0"]
+        );
+
+        // manual: nothing visible unless approved → only the approved fresh one.
+        assert_eq!(
+            norm(cat.visible_versions(&name, "manual", 0).await.unwrap()),
+            ["1.1.0.0"]
+        );
+
+        // hold the old one → hidden under any mode.
+        assert!(cat.hold_version(&name, "1.0.0.0").await.unwrap());
+        assert_eq!(
+            norm(cat.visible_versions(&name, "auto", 0).await.unwrap()),
+            ["1.1.0.0"]
+        );
+        // ...and unhold restores it.
+        assert!(cat.unhold_version(&name, "1.0.0.0").await.unwrap());
+        assert_eq!(
+            norm(cat.visible_versions(&name, "auto", 0).await.unwrap()),
+            ["1.0.0.0", "1.1.0.0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_policy_roundtrips() {
+        let Some(cat) = catalog().await else { return };
+        cat.set_update_policy("delayed", 5).await.unwrap();
+        assert_eq!(
+            cat.update_policy().await.unwrap(),
+            ("delayed".to_owned(), 5)
+        );
+        // restore the default so this global singleton doesn't disturb a re-run.
+        cat.set_update_policy("auto", 0).await.unwrap();
     }
 }

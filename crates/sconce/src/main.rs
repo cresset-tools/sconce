@@ -105,6 +105,59 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+
+    /// View or set the update policy (supply-chain controls).
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+
+    /// Place a security hold on a version (hides it from clients immediately).
+    Hold {
+        /// Package name, e.g. `acme/widget`.
+        package: String,
+        /// Version/tag, e.g. `v1.2.0`.
+        version: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Release a hold on a version.
+    Unhold {
+        package: String,
+        version: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Approve a version (reveal it under `manual`, or early under `delayed`).
+    Approve {
+        package: String,
+        version: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyAction {
+    /// Show the current update policy.
+    Show {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Set the update policy.
+    Set {
+        /// `auto` (everything visible), `manual` (only approved), or `delayed`
+        /// (visible after the cooldown).
+        #[arg(long)]
+        mode: String,
+        /// Days a release must age before becoming visible under `delayed`.
+        #[arg(long, default_value_t = 0)]
+        cooldown_days: i32,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -144,7 +197,85 @@ fn main() -> Result<()> {
                 database_url,
             } => token_create(label.as_deref(), &database_url),
         },
+        Command::Policy { action } => match action {
+            PolicyAction::Show { database_url } => policy_show(&database_url),
+            PolicyAction::Set {
+                mode,
+                cooldown_days,
+                database_url,
+            } => policy_set(&mode, cooldown_days, &database_url),
+        },
+        Command::Hold {
+            package,
+            version,
+            database_url,
+        } => version_action("hold", &package, &version, &database_url),
+        Command::Unhold {
+            package,
+            version,
+            database_url,
+        } => version_action("unhold", &package, &version, &database_url),
+        Command::Approve {
+            package,
+            version,
+            database_url,
+        } => version_action("approve", &package, &version, &database_url),
     }
+}
+
+fn with_catalog<F>(database_url: &str, f: F) -> Result<()>
+where
+    F: AsyncFnOnce(sconce_catalog::Catalog) -> Result<()>,
+{
+    use sconce_catalog::Catalog;
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+        f(catalog).await
+    })
+}
+
+fn policy_show(database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let (mode, cooldown_days) = catalog.update_policy().await?;
+        println!("mode: {mode}");
+        println!("cooldown_days: {cooldown_days}");
+        Ok(())
+    })
+}
+
+fn policy_set(mode: &str, cooldown_days: i32, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        catalog
+            .set_update_policy(mode, cooldown_days)
+            .await
+            .context("setting policy")?;
+        println!("policy set: mode={mode}, cooldown_days={cooldown_days}");
+        Ok(())
+    })
+}
+
+fn version_action(action: &str, package: &str, version: &str, database_url: &str) -> Result<()> {
+    let normalized = sconce_mirror::normalize_tag(version)
+        .map(|p| p.normalized)
+        .with_context(|| format!("'{version}' is not a recognizable version"))?;
+    with_catalog(database_url, async |catalog| {
+        let changed = match action {
+            "hold" => catalog.hold_version(package, &normalized).await?,
+            "unhold" => catalog.unhold_version(package, &normalized).await?,
+            "approve" => catalog.approve_version(package, &normalized).await?,
+            _ => unreachable!(),
+        };
+        if changed {
+            println!("{action}: {package} {version} ({normalized})");
+            Ok(())
+        } else {
+            anyhow::bail!("no such version: {package} {version} ({normalized})")
+        }
+    })
 }
 
 fn token_create(label: Option<&str>, database_url: &str) -> Result<()> {

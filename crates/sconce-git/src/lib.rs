@@ -65,6 +65,12 @@ pub enum Error {
         #[source]
         source: Box<gix::object::find::existing::Error>,
     },
+    #[error("reading commit time of {refspec:?}")]
+    CommitTime {
+        refspec: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("a tree path was not valid UTF-8: {path:?}")]
     NonUtf8Path { path: String },
 }
@@ -186,6 +192,28 @@ pub fn tags(repo_path: impl AsRef<std::path::Path>) -> Result<Vec<String>, Error
         out.push(name.to_owned());
     }
     Ok(out)
+}
+
+/// The committer time (unix seconds) of the commit `refspec` resolves to — used
+/// as a version's upstream release time, which drives cooldown policy.
+pub fn commit_time(repo_path: impl AsRef<std::path::Path>, refspec: &str) -> Result<i64, Error> {
+    let repo = gix::open(repo_path.as_ref()).map_err(|e| Error::Open(Box::new(e)))?;
+    let err = |source: Box<dyn std::error::Error + Send + Sync>| Error::CommitTime {
+        refspec: refspec.to_owned(),
+        source,
+    };
+    let id = repo
+        .rev_parse_single(refspec)
+        .map_err(|source| Error::RevParse {
+            refspec: refspec.to_owned(),
+            source: Box::new(source),
+        })?;
+    let commit = id
+        .object()
+        .map_err(|e| err(Box::new(e)))?
+        .peel_to_commit()
+        .map_err(|e| err(Box::new(e)))?;
+    Ok(commit.time().map_err(|e| err(Box::new(e)))?.seconds)
 }
 
 /// Read a file's bytes at `refspec`, or `None` if no such file exists there.

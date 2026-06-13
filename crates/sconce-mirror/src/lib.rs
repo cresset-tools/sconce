@@ -89,6 +89,10 @@ pub async fn mirror_git_source(
         // Composer verifies a dist by its sha1 (`dist.shasum`); compute it now
         // so serving never re-reads the blob.
         let dist_shasum = sha1_hex(&zip);
+        // The tag's commit time is the version's release time — it drives
+        // cooldown, so old tags are instantly past cooldown and only genuinely
+        // new releases wait.
+        let released_at = sconce_git::commit_time(repo_path, &tag).ok();
         // A blob can never exceed i64::MAX bytes; saturate rather than wrap.
         let size = i64::try_from(zip.len()).unwrap_or(i64::MAX);
 
@@ -111,6 +115,7 @@ pub async fn mirror_git_source(
                 Some(blob.as_bytes()),
                 Some(&dist_shasum),
                 None, // source_reference (commit sha) — added later
+                released_at,
             )
             .await
             .map_err(|e| Error::Catalog(Box::new(e)))?;

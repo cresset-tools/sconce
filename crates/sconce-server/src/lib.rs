@@ -126,7 +126,13 @@ async fn p2(
         return Ok(Json(json!({ "packages": { package: [] } })));
     }
 
-    let versions = s.catalog.package_versions(package).await?;
+    // Apply the repo's update policy (cooldown / manual approval / holds) so
+    // clients only ever see versions that have cleared the supply-chain gate.
+    let (mode, cooldown_days) = s.catalog.update_policy().await?;
+    let versions = s
+        .catalog
+        .visible_versions(package, &mode, cooldown_days)
+        .await?;
     Ok(Json(sconce_metadata::render_package(
         package,
         &versions,
