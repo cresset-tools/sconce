@@ -107,6 +107,24 @@ enum Command {
         database_url: String,
     },
 
+    /// Grant a package from one repository into another (agency curation).
+    ///
+    /// The target repo then exposes the package without owning it — mirror a
+    /// public/purchased package once into a shared repo, grant the curated
+    /// subset into each client repo.
+    Grant {
+        /// Target repository (gains the package), as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Source repository that owns the package, as `<org>/<repo>`.
+        #[arg(long)]
+        from: String,
+        /// Package name, e.g. `monolog/monolog`.
+        package: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Serve the Composer v2 wire API (packages.json, p2 metadata, dist) over HTTP.
     Serve {
         /// Directory of the content-addressed store.
@@ -239,6 +257,12 @@ fn main() -> Result<()> {
             repo,
             database_url,
         } => repo_create(&org, &repo, &database_url),
+        Command::Grant {
+            repo,
+            from,
+            package,
+            database_url,
+        } => grant(&repo, &from, &package, &database_url),
         Command::Token { action } => match action {
             TokenAction::Create {
                 repo,
@@ -320,6 +344,19 @@ fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
             .with_context(|| format!("creating repo (does org '{org}' exist?)"))?;
         println!("repo created: {org}/{repo}");
         Ok(())
+    })
+}
+
+fn grant(target: &str, from: &str, package: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let target_id = resolve_repo(&catalog, target).await?;
+        let source_id = resolve_repo(&catalog, from).await?;
+        if catalog.grant_package(target_id, source_id, package).await? {
+            println!("granted {package} from {from} into {target}");
+            Ok(())
+        } else {
+            anyhow::bail!("no package '{package}' in {from}")
+        }
     })
 }
 

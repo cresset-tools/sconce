@@ -40,6 +40,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_multitenancy",
         include_str!("../migrations/0005_multitenancy.sql"),
     ),
+    ("0006_grants", include_str!("../migrations/0006_grants.sql")),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -257,12 +258,48 @@ impl Catalog {
         Ok(updated.rows_affected() > 0)
     }
 
-    /// All package names in a repository, sorted — for `available-packages`.
+    /// Grant `package` (owned by `source_repo`) into `target_repo`, so the target
+    /// exposes it without owning it. Returns `false` if no such package exists in
+    /// the source.
+    pub async fn grant_package(
+        &self,
+        target_repo: Uuid,
+        source_repo: Uuid,
+        package: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let Some(package_id): Option<Uuid> =
+            sqlx::query_scalar("select id from packages where repo_id = $1 and name = $2")
+                .bind(source_repo)
+                .bind(package)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(false);
+        };
+        sqlx::query(
+            "insert into repository_grants (repo_id, package_id) values ($1, $2) \
+             on conflict do nothing",
+        )
+        .bind(target_repo)
+        .bind(package_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// All package names visible in a repository (owned ∪ granted), sorted — for
+    /// `available-packages`.
     pub async fn all_package_names(&self, repo_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
-        let rows = sqlx::query("select name from packages where repo_id = $1 order by name")
-            .bind(repo_id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "select name from packages where repo_id = $1 \
+             union \
+             select p.name from packages p \
+             join repository_grants g on g.package_id = p.id where g.repo_id = $1 \
+             order by name",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(|r| r.try_get("name")).collect()
     }
 
@@ -309,7 +346,10 @@ impl Catalog {
                     pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             where p.repo_id = $1 and p.name = $2 \
+             where p.name = $2 \
+               and ( p.repo_id = $1 \
+                     or exists (select 1 from repository_grants g \
+                                where g.repo_id = $1 and g.package_id = p.id) ) \
                and pv.yanked_at is null \
                and pv.held_at is null \
                and ( $3 = 'auto' \
@@ -737,6 +777,56 @@ mod tests {
         assert!(
             !cat.token_valid(repo_b, &token).await.unwrap(),
             "not valid for another repo"
+        );
+    }
+
+    /// Agency curation: a package mirrored once into a shared repo becomes
+    /// visible in a client repo after being granted (no re-mirror).
+    #[tokio::test]
+    async fn granted_packages_are_visible_in_the_target_repo() {
+        let Some((cat, shared)) = repo().await else {
+            return;
+        };
+        let (_, client) = repo().await.unwrap();
+        let cj = serde_json::json!({"name": "vendor/pub"});
+        let pkg = cat
+            .upsert_package(shared, "vendor/pub", "git", None)
+            .await
+            .unwrap();
+        cat.upsert_package_version(
+            pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        // Invisible in the client before the grant.
+        assert!(
+            cat.visible_versions(client, "vendor/pub", "auto", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(cat.all_package_names(client).await.unwrap().is_empty());
+
+        assert!(
+            cat.grant_package(client, shared, "vendor/pub")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cat.visible_versions(client, "vendor/pub", "auto", 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(cat.all_package_names(client).await.unwrap(), ["vendor/pub"]);
+
+        // Granting a non-existent package reports not-found.
+        assert!(
+            !cat.grant_package(client, shared, "nope/nope")
+                .await
+                .unwrap()
         );
     }
 }
