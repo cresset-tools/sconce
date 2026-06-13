@@ -124,34 +124,53 @@ async fn lookup(s: &Ui, org: &str, repo: &str) -> Result<sconce_catalog::RepoSum
 // ----- index + creation -----
 
 async fn index(State(s): State<Ui>) -> Result<Html<String>, StatusCode> {
+    let orgs = s.catalog.list_organizations().await.map_err(e500)?;
     let repos = s.catalog.list_repositories().await.map_err(e500)?;
-    let mut rows = String::new();
-    for r in &repos {
-        let _ = write!(
-            rows,
-            "<tr><td><a href=\"/r/{o}/{rp}\">{o}/{rp}</a></td><td>{mode}</td><td>{cd}</td></tr>",
-            o = esc(&r.org),
-            rp = esc(&r.repo),
-            mode = esc(&r.update_mode),
-            cd = r.cooldown_days,
+
+    let mut body = String::from("<h1>Organizations &amp; repositories</h1>");
+    if orgs.is_empty() {
+        body.push_str("<p class=muted>No organizations yet — create one below.</p>");
+    }
+    // Group repos under their org, so a freshly created (repo-less) org still
+    // shows up — earlier the index only listed repos, so a new org looked like
+    // nothing happened.
+    for (slug, name) in &orgs {
+        let label = name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| format!(" <span class=muted>({})</span>", esc(n)))
+            .unwrap_or_default();
+        let _ = write!(body, "<h2>{}{label}</h2>", esc(slug));
+
+        let org_repos: Vec<_> = repos.iter().filter(|r| &r.org == slug).collect();
+        if org_repos.is_empty() {
+            body.push_str("<p class=muted>No repositories yet — add one below.</p>");
+            continue;
+        }
+        body.push_str(
+            "<table><tr><th>Repository</th><th>Update mode</th><th>Cooldown (days)</th></tr>",
         );
+        for r in org_repos {
+            let _ = write!(
+                body,
+                "<tr><td><a href=\"/r/{o}/{rp}\">{rp}</a></td><td>{mode}</td><td>{cd}</td></tr>",
+                o = esc(&r.org),
+                rp = esc(&r.repo),
+                mode = esc(&r.update_mode),
+                cd = r.cooldown_days,
+            );
+        }
+        body.push_str("</table>");
     }
-    if repos.is_empty() {
-        rows = "<tr><td colspan=3 class=muted>No repositories yet — create one below.</td></tr>"
-            .into();
-    }
-    let create = "<h2>Create</h2>\
+
+    body.push_str(
+        "<h2>Create</h2>\
         <form class=row method=post action=/orgs>org slug <input name=slug required> \
         name <input name=name> <button>Create org</button></form>\
         <form class=row method=post action=/repos>org <input name=org required> \
-        repo <input name=repo required> <button>Create repo</button></form>";
-    Ok(page(
-        "Repositories",
-        &format!(
-            "<h1>Repositories</h1><table>\
-             <tr><th>Repository</th><th>Update mode</th><th>Cooldown (days)</th></tr>{rows}</table>{create}"
-        ),
-    ))
+        repo <input name=repo required> <button>Create repo</button></form>",
+    );
+    Ok(page("Repositories", &body))
 }
 
 #[derive(Deserialize)]

@@ -170,6 +170,17 @@ impl Catalog {
         .await
     }
 
+    /// All organizations `(slug, name)`, sorted — so a freshly created org is
+    /// visible in the dashboard even before it has any repositories.
+    pub async fn list_organizations(&self) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+        let rows = sqlx::query("select slug, name from organizations order by slug")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("slug")?, r.try_get("name")?)))
+            .collect()
+    }
+
     /// All repositories, for the admin dashboard.
     pub async fn list_repositories(&self) -> Result<Vec<RepoSummary>, sqlx::Error> {
         let rows = sqlx::query(
