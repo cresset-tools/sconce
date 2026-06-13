@@ -2339,7 +2339,10 @@ dependencies = [
  "clap",
  "sconce-archive",
  "sconce-cas",
+ "sconce-catalog",
  "sconce-git",
+ "sconce-mirror",
+ "tokio",
 ]
 
 [[package]]
@@ -2375,6 +2378,18 @@ dependencies = [
  "sconce-archive",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "sconce-mirror"
+version = "0.1.0"
+dependencies = [
+ "sconce-cas",
+ "sconce-catalog",
+ "sconce-git",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

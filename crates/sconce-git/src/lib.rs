@@ -50,6 +50,15 @@ pub enum Error {
     Traverse(Box<gix::traverse::tree::breadthfirst::Error>),
     #[error("evaluating .gitattributes export-ignore")]
     Attributes(Box<dyn std::error::Error + Send + Sync>),
+    #[error("listing tags")]
+    Refs(Box<dyn std::error::Error + Send + Sync>),
+    #[error("reading {path:?} at {refspec:?}")]
+    ReadFile {
+        refspec: String,
+        path: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("reading object {oid}")]
     FindObject {
         oid: gix::ObjectId,
@@ -160,6 +169,66 @@ pub fn archive_ref(
     }
 
     Ok(archive)
+}
+
+/// List the short names of all tags in the repository (e.g. `"v1.2.0"`), the
+/// versions a mirror enumerates. Order is unspecified.
+pub fn tags(repo_path: impl AsRef<std::path::Path>) -> Result<Vec<String>, Error> {
+    let repo = gix::open(repo_path.as_ref()).map_err(|e| Error::Open(Box::new(e)))?;
+    let platform = repo.references().map_err(|e| Error::Refs(Box::new(e)))?;
+    let mut out = Vec::new();
+    for reference in platform.tags().map_err(|e| Error::Refs(Box::new(e)))? {
+        let reference = reference.map_err(Error::Refs)?;
+        let short = reference.name().shorten();
+        let name = short.to_str().map_err(|_| Error::NonUtf8Path {
+            path: short.to_string(),
+        })?;
+        out.push(name.to_owned());
+    }
+    Ok(out)
+}
+
+/// Read a file's bytes at `refspec`, or `None` if no such file exists there.
+/// Used to pull `composer.json` from each tag during mirroring.
+pub fn read_file(
+    repo_path: impl AsRef<std::path::Path>,
+    refspec: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>, Error> {
+    let repo = gix::open(repo_path.as_ref()).map_err(|e| Error::Open(Box::new(e)))?;
+    let id = repo
+        .rev_parse_single(refspec)
+        .map_err(|source| Error::RevParse {
+            refspec: refspec.to_owned(),
+            source: Box::new(source),
+        })?;
+    let tree = id
+        .object()
+        .map_err(|source| Error::PeelToTree {
+            refspec: refspec.to_owned(),
+            source: Box::new(source),
+        })?
+        .peel_to_tree()
+        .map_err(|source| Error::PeelToTree {
+            refspec: refspec.to_owned(),
+            source: Box::new(source),
+        })?;
+
+    let read_err = |source: Box<dyn std::error::Error + Send + Sync>| Error::ReadFile {
+        refspec: refspec.to_owned(),
+        path: path.to_owned(),
+        source,
+    };
+    match tree
+        .lookup_entry_by_path(path)
+        .map_err(|e| read_err(Box::new(e)))?
+    {
+        Some(entry) => {
+            let object = entry.object().map_err(|e| read_err(Box::new(e)))?;
+            Ok(Some(object.data.clone()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Whether `path` (with tree `mode`) has `export-ignore` set in `.gitattributes`.

@@ -63,6 +63,26 @@ enum Command {
         #[arg(long)]
         cas: PathBuf,
     },
+
+    /// Mirror every tagged version of a git repository into the CAS + catalog.
+    ///
+    /// Enumerates tags, derives a Composer version from each, reads its
+    /// `composer.json`, archives the tree, stores it content-addressed, and
+    /// upserts the catalog. Idempotent — re-running dedupes blobs and upserts
+    /// the same rows.
+    Mirror {
+        /// Path to the git repository.
+        repo: PathBuf,
+        /// Public source URL recorded for the package (e.g. the git remote).
+        #[arg(long)]
+        git_url: String,
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -71,7 +91,50 @@ fn main() -> Result<()> {
         Command::Archive { src, out } => archive(&src, &out),
         Command::ArchiveRef { repo, r#ref, out } => archive_ref(&repo, &r#ref, &out),
         Command::Ingest { repo, r#ref, cas } => ingest(&repo, &r#ref, &cas),
+        Command::Mirror {
+            repo,
+            git_url,
+            cas,
+            database_url,
+        } => mirror(&repo, &git_url, &cas, &database_url),
     }
+}
+
+fn mirror(repo: &Path, git_url: &str, cas: &Path, database_url: &str) -> Result<()> {
+    use sconce_cas::FsBlobStore;
+    use sconce_catalog::Catalog;
+
+    // The mirror path is async (Postgres); spin a runtime just for it rather
+    // than making the whole CLI async.
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store =
+            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        let report = sconce_mirror::mirror_git_source(repo, git_url, &store, &catalog)
+            .await
+            .with_context(|| format!("mirroring {}", repo.display()))?;
+
+        for m in &report.mirrored {
+            println!(
+                "  + {} {} ({}, {})",
+                m.package, m.tag, m.normalized, m.stability
+            );
+        }
+        for (tag, reason) in &report.skipped {
+            println!("  - {tag}: {reason}");
+        }
+        println!(
+            "mirrored {} version(s), skipped {}",
+            report.mirrored.len(),
+            report.skipped.len()
+        );
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn ingest(repo: &Path, refspec: &str, cas: &Path) -> Result<()> {

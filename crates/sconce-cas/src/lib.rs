@@ -39,6 +39,13 @@ impl BlobId {
         Self(h.finalize().into())
     }
 
+    /// Reconstruct an id from its raw 32 sha256 bytes (e.g. one stored in the
+    /// catalog), without rehashing any content.
+    #[must_use]
+    pub fn from_bytes(sha256: [u8; 32]) -> Self {
+        Self(sha256)
+    }
+
     /// The 64-character lowercase hex form (the on-disk name).
     #[must_use]
     pub fn to_hex(self) -> String {

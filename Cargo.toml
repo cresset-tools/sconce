@@ -6,6 +6,7 @@ members = [
     "crates/sconce-cas",
     "crates/sconce-catalog",
     "crates/sconce-git",
+    "crates/sconce-mirror",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ sconce-archive = { path = "crates/sconce-archive", version = "0.1.0" } # x-relea
 sconce-cas = { path = "crates/sconce-cas", version = "0.1.0" } # x-release-please-version
 sconce-catalog = { path = "crates/sconce-catalog", version = "0.1.0" } # x-release-please-version
 sconce-git = { path = "crates/sconce-git", version = "0.1.0" } # x-release-please-version
+sconce-mirror = { path = "crates/sconce-mirror", version = "0.1.0" } # x-release-please-version
 
 # Shared external deps.
 anyhow = "1"

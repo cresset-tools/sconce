@@ -20,9 +20,12 @@ path = "src/main.rs"
 [dependencies]
 sconce-archive = { workspace = true }
 sconce-cas = { workspace = true }
+sconce-catalog = { workspace = true }
 sconce-git = { workspace = true }
+sconce-mirror = { workspace = true }
 anyhow = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
