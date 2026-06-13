@@ -13,14 +13,20 @@
 //! Combined with the deterministic [`CanonicalArchive`], the same `(repo, ref)`
 //! always yields byte-identical archive output.
 //!
-//! Submodules (`commit` entries) carry no content at the ref and are skipped,
-//! matching `git archive`.
+//! **`.gitattributes export-ignore`** is honored, matching `git archive` (and
+//! therefore what a real Composer dist contains): paths — and whole directories
+//! — marked `export-ignore` are dropped. The attributes are read from the tree
+//! being archived (not the worktree's `HEAD`), so archiving an old tag uses that
+//! tag's `.gitattributes`. Submodules (`commit` entries) carry no content and
+//! are skipped, also matching `git archive`.
 //!
-//! **Not yet handled:** `.gitattributes export-ignore` / `export-subst` (the
-//! next step — gives full `git archive` content parity).
+//! **Not yet handled:** `export-subst` keyword substitution (rare; a later step).
 
-use gix::bstr::ByteSlice;
+use std::collections::HashSet;
+
+use gix::bstr::{BStr, ByteSlice};
 use gix::objs::tree::EntryKind;
+use gix::worktree::stack::state::attributes::Source;
 use sconce_archive::{CanonicalArchive, Entry, Mode};
 
 /// Errors reading a git tree.
@@ -42,6 +48,8 @@ pub enum Error {
     },
     #[error("traversing the tree")]
     Traverse(Box<gix::traverse::tree::breadthfirst::Error>),
+    #[error("evaluating .gitattributes export-ignore")]
+    Attributes(Box<dyn std::error::Error + Send + Sync>),
     #[error("reading object {oid}")]
     FindObject {
         oid: gix::ObjectId,
@@ -55,7 +63,8 @@ pub enum Error {
 /// Build a [`CanonicalArchive`] from the tree that `refspec` resolves to in the
 /// repository at `repo_path` (e.g. `"HEAD"`, `"v1.2.0"`, a commit sha).
 ///
-/// `refspec` is peeled to a tree, so tags and commits both work.
+/// `refspec` is peeled to a tree, so tags and commits both work. Paths marked
+/// `export-ignore` in the tree's `.gitattributes` are excluded.
 pub fn archive_ref(
     repo_path: impl AsRef<std::path::Path>,
     refspec: &str,
@@ -79,23 +88,56 @@ pub fn archive_ref(
             refspec: refspec.to_owned(),
             source: Box::new(source),
         })?;
+    let tree_id = tree.id;
 
-    // `Recorder` walks the whole tree and yields every entry with its full path,
-    // mode, and oid — exactly what we need to materialize the file set.
+    // Attribute stack that reads `.gitattributes` from the tree itself (via an
+    // index synthesized from it), so we honor export-ignore against the exact
+    // ref being archived rather than the worktree.
+    let index = repo
+        .index_from_tree(&tree_id)
+        .map_err(|e| Error::Attributes(Box::new(e)))?;
+    let mut stack = repo
+        .attributes_only(&index, Source::IdMapping)
+        .map_err(|e| Error::Attributes(Box::new(e)))?;
+    let mut outcome = stack.selected_attribute_matches(["export-ignore"]);
+
+    // `Recorder` walks the whole tree breadth-first and yields every entry with
+    // its full path, mode, and oid. Breadth-first means a directory is visited
+    // before its contents, so we can collect export-ignored directories and skip
+    // anything beneath them.
     let mut recorder = gix::traverse::tree::Recorder::default();
     tree.traverse()
         .breadthfirst(&mut recorder)
         .map_err(|e| Error::Traverse(Box::new(e)))?;
 
+    let mut ignored_dirs: HashSet<Vec<u8>> = HashSet::new();
     let mut archive = CanonicalArchive::new();
-    for record in recorder.records {
+
+    for record in &recorder.records {
+        let ignored = export_ignored(
+            &mut stack,
+            &mut outcome,
+            record.filepath.as_bstr(),
+            record.mode,
+        )?;
+
         let mode = match record.mode.kind() {
             EntryKind::Blob => Mode::File,
             EntryKind::BlobExecutable => Mode::Executable,
             EntryKind::Link => Mode::Symlink,
-            // Directories are implied by paths; submodules carry no content here.
-            EntryKind::Tree | EntryKind::Commit => continue,
+            EntryKind::Tree => {
+                if ignored {
+                    ignored_dirs.insert(record.filepath.to_vec());
+                }
+                continue;
+            }
+            // Submodules carry no content at the ref.
+            EntryKind::Commit => continue,
         };
+
+        if ignored || has_ignored_ancestor(record.filepath.as_bstr(), &ignored_dirs) {
+            continue;
+        }
 
         let path = record
             .filepath
@@ -105,8 +147,8 @@ pub fn archive_ref(
             })?
             .to_owned();
 
-        // Content: for blobs it's the file bytes; for symlinks it's the link
-        // target (git stores the target as the blob's content).
+        // Content: blob bytes, or — for symlinks — the link target (git stores
+        // the target as the blob's content).
         let object = repo
             .find_object(record.oid)
             .map_err(|source| Error::FindObject {
@@ -120,16 +162,47 @@ pub fn archive_ref(
     Ok(archive)
 }
 
+/// Whether `path` (with tree `mode`) has `export-ignore` set in `.gitattributes`.
+fn export_ignored(
+    stack: &mut gix::AttributeStack<'_>,
+    outcome: &mut gix::attrs::search::Outcome,
+    path: &BStr,
+    mode: gix::objs::tree::EntryMode,
+) -> Result<bool, Error> {
+    outcome.reset();
+    let platform = stack
+        .at_entry(path, Some(mode.into()))
+        .map_err(|e| Error::Attributes(Box::new(e)))?;
+    platform.matching_attributes(outcome);
+    // We selected only `export-ignore`, so any selected match in the `Set` state
+    // means it applies. (`-export-ignore` would be `Unset` and not match here.)
+    Ok(outcome
+        .iter_selected()
+        .any(|m| matches!(m.assignment.state, gix::attrs::StateRef::Set)))
+}
+
+/// Whether any ancestor directory of `path` is in the export-ignored set.
+fn has_ignored_ancestor(path: &BStr, ignored: &HashSet<Vec<u8>>) -> bool {
+    if ignored.is_empty() {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' && ignored.contains(&bytes[..i]) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
 
-    /// Build a throwaway git repo in `dir` with a known tree and return nothing;
-    /// commits are made with pinned identity so the test is hermetic. (The
-    /// archive output is independent of commit metadata anyway — content comes
-    /// from the tree — but pinning avoids depending on the host git config.)
-    fn init_fixture_repo(dir: &std::path::Path) {
+    /// Build a throwaway git repo in `dir`, committing whatever files already
+    /// exist there, with pinned identity so the test is hermetic.
+    fn commit_repo(dir: &std::path::Path) {
         let git = |args: &[&str]| {
             let status = Command::new("git")
                 .args(args)
@@ -142,26 +215,18 @@ mod tests {
                 .expect("run git");
             assert!(status.success(), "git {args:?} failed");
         };
-
         git(&["init", "-q", "-b", "main"]);
-        std::fs::create_dir(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/Foo.php"), b"<?php\nclass Foo {}\n").unwrap();
-        std::fs::write(dir.join("README.md"), b"# demo\n").unwrap();
-        std::fs::write(dir.join("run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-            std::os::unix::fs::symlink("src/Foo.php", dir.join("link")).unwrap();
-        }
         git(&["add", "-A"]);
         git(&["commit", "-qm", "fixture"]);
     }
 
+    fn write(dir: &std::path::Path, rel: &str, bytes: &[u8]) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
     fn tempdir() -> std::path::PathBuf {
-        // A unique dir without pulling in a tempfile dep: process id + a
-        // per-call counter, so parallel tests never share a path.
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -172,33 +237,112 @@ mod tests {
         p
     }
 
+    /// Sorted list of paths in an archive, by re-reading its central directory
+    /// names is overkill; instead archive into entries and inspect via a second
+    /// helper. We expose the set through a tiny re-archive + unzip-free check:
+    /// compare against `git archive` below by file count + names is enough.
+    fn archived_paths(dir: &std::path::Path) -> Vec<String> {
+        // Reuse the public API and pull names back out of the produced zip by
+        // listing what `git archive` would include is done in the parity test;
+        // here we just need names, so read them from the archive's zip via a
+        // minimal scan of local-file-header filenames.
+        let zip = archive_ref(dir, "HEAD").unwrap().into_zip();
+        local_header_names(&zip)
+    }
+
+    /// Extract entry names from a stored-method zip by scanning local file
+    /// headers (signature `PK\x03\x04`). Sufficient for tests.
+    fn local_header_names(zip: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut i = 0;
+        while i + 30 <= zip.len() {
+            if &zip[i..i + 4] != b"PK\x03\x04" {
+                break;
+            }
+            let name_len = u16::from_le_bytes([zip[i + 26], zip[i + 27]]) as usize;
+            let extra_len = u16::from_le_bytes([zip[i + 28], zip[i + 29]]) as usize;
+            let comp_size =
+                u32::from_le_bytes([zip[i + 18], zip[i + 19], zip[i + 20], zip[i + 21]]) as usize;
+            let name_start = i + 30;
+            let name =
+                String::from_utf8_lossy(&zip[name_start..name_start + name_len]).into_owned();
+            names.push(name);
+            i = name_start + name_len + extra_len + comp_size;
+        }
+        names.sort();
+        names
+    }
+
+    /// `git archive` to a zip, returning its sorted entry names — the source of
+    /// truth we match against.
+    fn git_archive_names(dir: &std::path::Path) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["archive", "--format=zip", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git archive");
+        assert!(out.status.success(), "git archive failed");
+        let mut names = local_header_names(&out.stdout);
+        // git archive omits directory entries too (stored method varies, but we
+        // only compare file names); drop any trailing-slash dir entries if present.
+        names.retain(|n| !n.ends_with('/'));
+        names.sort();
+        names
+    }
+
     #[test]
-    fn archives_a_ref_with_canonical_modes() {
+    fn honors_export_ignore_matching_git_archive() {
         let dir = tempdir();
-        init_fixture_repo(&dir);
+        write(&dir, "src/Foo.php", b"<?php\n");
+        write(&dir, "README.md", b"# demo\n");
+        write(&dir, "tests/FooTest.php", b"<?php\n");
+        write(&dir, "tests/unit/BarTest.php", b"<?php\n");
+        write(&dir, "phpunit.xml.dist", b"<phpunit/>\n");
+        write(
+            &dir,
+            ".gitattributes",
+            b"/tests export-ignore\nphpunit.xml.dist export-ignore\n",
+        );
+        commit_repo(&dir);
 
-        let zip = archive_ref(&dir, "HEAD").expect("archive HEAD").into_zip();
-
-        // Valid zip, deterministic, and content-bearing.
-        assert_eq!(&zip[0..4], &[b'P', b'K', 0x03, 0x04], "is a zip");
-        let again = archive_ref(&dir, "HEAD").expect("archive again").into_zip();
-        assert_eq!(zip, again, "same (repo, ref) → identical bytes");
+        let ours = archived_paths(&dir);
+        let git = git_archive_names(&dir);
+        assert_eq!(ours, git, "export-ignore selection must match git archive");
+        // Sanity: the excluded paths are gone, the kept ones remain.
+        assert!(ours.contains(&"src/Foo.php".to_string()));
+        assert!(ours.contains(&".gitattributes".to_string()));
+        assert!(
+            !ours.iter().any(|p| p.starts_with("tests/")),
+            "whole tests/ dir dropped"
+        );
+        assert!(!ours.contains(&"phpunit.xml.dist".to_string()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn skips_dot_git_and_keeps_committed_files_only() {
+    fn deterministic_and_skips_dot_git() {
         let dir = tempdir();
-        init_fixture_repo(&dir);
+        write(&dir, "src/Foo.php", b"<?php\nclass Foo {}\n");
+        write(&dir, "README.md", b"# demo\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            write(&dir, "run.sh", b"#!/bin/sh\necho hi\n");
+            std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::os::unix::fs::symlink("src/Foo.php", dir.join("link")).unwrap();
+        }
+        commit_repo(&dir);
 
-        let archive = archive_ref(&dir, "HEAD").expect("archive HEAD");
-        // README, src/Foo.php, run.sh, and (on unix) the symlink — never .git.
-        let expected = if cfg!(unix) { 4 } else { 3 };
-        assert_eq!(
-            archive.len(),
-            expected,
-            "only committed tree entries, no .git"
+        let zip = archive_ref(&dir, "HEAD").unwrap().into_zip();
+        assert_eq!(&zip[0..4], &[b'P', b'K', 0x03, 0x04]);
+        let again = archive_ref(&dir, "HEAD").unwrap().into_zip();
+        assert_eq!(zip, again, "same (repo, ref) → identical bytes");
+        assert!(
+            !local_header_names(&zip)
+                .iter()
+                .any(|n| n.starts_with(".git/"))
         );
 
         std::fs::remove_dir_all(&dir).ok();

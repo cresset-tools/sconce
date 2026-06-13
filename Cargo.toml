@@ -39,9 +39,9 @@ sha2 = "0.10"
 thiserror = "2"
 # Local git access only (read trees at a ref). gix's default features give a
 # working hash backend + rev-parse without pulling a network client (networking
-# is opt-in, not default). `.gitattributes export-ignore` support comes later —
-# it'll add the `attributes` feature then.
-gix = "0.70"
+# is opt-in, not default). `attributes` adds `.gitattributes` evaluation for
+# honoring `export-ignore` when archiving a ref.
+gix = { version = "0.70", features = ["attributes"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

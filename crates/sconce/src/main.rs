@@ -1,10 +1,9 @@
-//! `sconce` — a fast, Composer-compatible static repository generator.
+//! `sconce` — a self-hostable, Composer-compatible private repository.
 //!
 //! This binary is in its earliest form: it exposes the deterministic archiver
-//! ([`sconce_archive`]) over a directory tree, which is the primitive the
-//! content-addressed store and the whole repository builder are built on. The
-//! repository-generation commands (`build`, `serve`, mirroring) land on top of
-//! this foundation.
+//! ([`sconce_archive`]), the git-tree reader ([`sconce_git`]), and the
+//! content-addressed store ([`sconce_cas`]) over the command line. The catalog,
+//! mirror workers, and dynamic Composer serving land on top of this foundation.
 
 use std::path::{Path, PathBuf};
 
