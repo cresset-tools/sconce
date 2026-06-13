@@ -21,7 +21,13 @@ use uuid::Uuid;
 /// Migrations, embedded as plain SQL and applied in order at runtime. Adding a
 /// migration = append a `(name, include_str!(...))` entry; names are recorded in
 /// `_sconce_migrations` so each runs once.
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("../migrations/0001_init.sql")),
+    (
+        "0002_dist_shasum",
+        include_str!("../migrations/0002_dist_shasum.sql"),
+    ),
+];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
 /// agree on the same lock).
@@ -42,6 +48,8 @@ pub struct PackageVersion {
     pub composer_json: Value,
     /// sha256 of the dist archive in the CAS, if one is attached.
     pub dist_blob_sha256: Option<[u8; 32]>,
+    /// sha1 hex of the dist archive — Composer's `dist.shasum`.
+    pub dist_shasum: Option<String>,
     pub source_reference: Option<String>,
 }
 
@@ -122,19 +130,21 @@ impl Catalog {
         stability: &str,
         composer_json: &Value,
         dist_blob_sha256: Option<&[u8; 32]>,
+        dist_shasum: Option<&str>,
         source_reference: Option<&str>,
     ) -> Result<Uuid, sqlx::Error> {
         let dist = dist_blob_sha256.map(|b| &b[..]);
         sqlx::query_scalar(
             "insert into package_versions \
                  (package_id, version, normalized_version, stability, composer_json, \
-                  dist_blob_sha256, source_reference) \
-             values ($1, $2, $3, $4, $5, $6, $7) \
+                  dist_blob_sha256, dist_shasum, source_reference) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) \
              on conflict (package_id, normalized_version) do update set \
                  version = excluded.version, \
                  stability = excluded.stability, \
                  composer_json = excluded.composer_json, \
                  dist_blob_sha256 = excluded.dist_blob_sha256, \
+                 dist_shasum = excluded.dist_shasum, \
                  source_reference = excluded.source_reference \
              returning id",
         )
@@ -144,6 +154,7 @@ impl Catalog {
         .bind(stability)
         .bind(composer_json)
         .bind(dist)
+        .bind(dist_shasum)
         .bind(source_reference)
         .fetch_one(&self.pool)
         .await
@@ -154,7 +165,7 @@ impl Catalog {
     pub async fn package_versions(&self, name: &str) -> Result<Vec<PackageVersion>, sqlx::Error> {
         let rows = sqlx::query(
             "select pv.version, pv.normalized_version, pv.stability, pv.composer_json, \
-                    pv.dist_blob_sha256, pv.source_reference \
+                    pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
              where p.name = $1 and pv.yanked_at is null \
@@ -219,6 +230,7 @@ fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<PackageVersion, sqlx::E
         stability: row.try_get("stability")?,
         composer_json: row.try_get("composer_json")?,
         dist_blob_sha256,
+        dist_shasum: row.try_get("dist_shasum")?,
         source_reference: row.try_get("source_reference")?,
     })
 }
@@ -280,6 +292,7 @@ mod tests {
             "stable",
             &cj,
             Some(&sha),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
             Some("abc123"),
         )
         .await
@@ -291,6 +304,10 @@ mod tests {
         assert_eq!(v.version, "v1.2.0");
         assert_eq!(v.stability, "stable");
         assert_eq!(v.dist_blob_sha256, Some(sha));
+        assert_eq!(
+            v.dist_shasum.as_deref(),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        );
         assert_eq!(v.source_reference.as_deref(), Some("abc123"));
         assert_eq!(v.composer_json, cj);
     }
@@ -303,12 +320,21 @@ mod tests {
         let cj = serde_json::json!({"name": name});
 
         let a = cat
-            .upsert_package_version(pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, None)
+            .upsert_package_version(pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, None, None)
             .await
             .unwrap();
         // Same normalized version → update, not a second row.
         let b = cat
-            .upsert_package_version(pkg, "v1.0.0", "1.0.0.0", "stable", &cj, None, Some("ref2"))
+            .upsert_package_version(
+                pkg,
+                "v1.0.0",
+                "1.0.0.0",
+                "stable",
+                &cj,
+                None,
+                None,
+                Some("ref2"),
+            )
             .await
             .unwrap();
         assert_eq!(a, b, "same (package, normalized_version) → same row id");

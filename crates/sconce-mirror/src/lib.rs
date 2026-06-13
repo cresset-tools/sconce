@@ -86,6 +86,9 @@ pub async fn mirror_git_source(
         // Archive the tree and store it; the blob id is content-addressed.
         let zip = sconce_git::archive_ref(repo_path, &tag)?.into_zip();
         let blob = store.put(&zip)?;
+        // Composer verifies a dist by its sha1 (`dist.shasum`); compute it now
+        // so serving never re-reads the blob.
+        let dist_shasum = sha1_hex(&zip);
         // A blob can never exceed i64::MAX bytes; saturate rather than wrap.
         let size = i64::try_from(zip.len()).unwrap_or(i64::MAX);
 
@@ -106,6 +109,7 @@ pub async fn mirror_git_source(
                 &parsed.stability,
                 &composer_json,
                 Some(blob.as_bytes()),
+                Some(&dist_shasum),
                 None, // source_reference (commit sha) — added later
             )
             .await
@@ -120,6 +124,17 @@ pub async fn mirror_git_source(
     }
 
     Ok(report)
+}
+
+/// Lowercase sha1 hex of `bytes` — Composer's `dist.shasum` format.
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    use std::fmt::Write as _;
+    let digest = Sha1::digest(bytes);
+    digest.iter().fold(String::with_capacity(40), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]

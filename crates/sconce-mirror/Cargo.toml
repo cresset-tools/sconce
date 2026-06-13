@@ -14,6 +14,7 @@ sconce-git = { workspace = true }
 sconce-cas = { workspace = true }
 sconce-catalog = { workspace = true }
 serde_json = { workspace = true }
+sha1 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

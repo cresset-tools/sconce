@@ -2381,6 +2381,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sconce-metadata"
+version = "0.1.0"
+dependencies = [
+ "sconce-catalog",
+ "serde_json",
+]
+
+[[package]]
 name = "sconce-mirror"
 version = "0.1.0"
 dependencies = [
@@ -2388,6 +2396,7 @@ dependencies = [
  "sconce-catalog",
  "sconce-git",
  "serde_json",
+ "sha1",
  "thiserror",
  "tokio",
 ]
