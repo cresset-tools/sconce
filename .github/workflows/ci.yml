@@ -41,3 +41,29 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+
+  db-test:
+    # The catalog tests need Postgres; the cross-platform matrix above skips
+    # them (they early-return without DATABASE_URL). This job runs them for real
+    # against a postgres service.
+    name: catalog tests (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: sconce
+          POSTGRES_DB: sconce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test -p sconce-catalog
+        env:
+          DATABASE_URL: postgres://postgres:sconce@localhost:5432/sconce

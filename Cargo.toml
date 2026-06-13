@@ -4,6 +4,7 @@ members = [
     "crates/sconce",
     "crates/sconce-archive",
     "crates/sconce-cas",
+    "crates/sconce-catalog",
     "crates/sconce-git",
 ]
 
@@ -30,6 +31,7 @@ repository = "https://github.com/cresset-tools/sconce"
 [workspace.dependencies]
 sconce-archive = { path = "crates/sconce-archive", version = "0.1.0" } # x-release-please-version
 sconce-cas = { path = "crates/sconce-cas", version = "0.1.0" } # x-release-please-version
+sconce-catalog = { path = "crates/sconce-catalog", version = "0.1.0" } # x-release-please-version
 sconce-git = { path = "crates/sconce-git", version = "0.1.0" } # x-release-please-version
 
 # Shared external deps.
@@ -37,11 +39,17 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
+serde_json = "1"
 # Local git access only (read trees at a ref). gix's default features give a
 # working hash backend + rev-parse without pulling a network client (networking
 # is opt-in, not default). `attributes` adds `.gitattributes` evaluation for
 # honoring `export-ignore` when archiving a ref.
 gix = { version = "0.70", features = ["attributes"] }
+# Postgres only, runtime queries only — NO `macros` feature (no compile-time DB
+# checks / query!/migrate! macros). Rows are mapped by hand.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

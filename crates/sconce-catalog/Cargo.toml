@@ -1,0 +1,26 @@
+[package]
+name = "sconce-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Postgres-backed catalog for sconce: packages, versions, and the blob index. Runtime queries only (no compile-time DB checks), Postgres only."
+
+[dependencies]
+# Runtime queries only — deliberately NO `macros` feature, so there is no
+# compile-time database dependency and no query!/migrate! macros. Rows are
+# mapped by hand. Postgres is the only supported backend.
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
