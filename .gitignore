@@ -1,4 +1,8 @@
 /target
 
+# Local environment (secrets) — loaded automatically by the CLI. Commit
+# `.env.example` instead.
+.env
+
 # Visual Studio workspace state (per-user; not project config).
 .vs/

@@ -290,7 +290,17 @@ enum TokenAction {
     },
 }
 
+// A flat command dispatcher; its length is just the number of subcommands.
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
+    // Load a local `.env` (e.g. DATABASE_URL) if present — searched from the
+    // working directory upward — before clap reads env-backed args. A missing
+    // file is not an error; an existing-but-unreadable one is surfaced.
+    match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(e) if e.not_found() => {} // no .env file is fine
+        Err(e) => return Err(e).context("loading .env"),
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Archive { src, out } => archive(&src, &out),
