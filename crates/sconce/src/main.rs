@@ -107,6 +107,23 @@ enum Command {
         database_url: String,
     },
 
+    /// Issue a license key for a repository, entitled to specific packages
+    /// (seller mode). The buyer authenticates with the key (http-basic password)
+    /// and may install only the listed packages.
+    LicenseCreate {
+        /// Seller repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Buyer reference (email / order id).
+        #[arg(long)]
+        buyer: Option<String>,
+        /// Packages the buyer purchased (entitled).
+        #[arg(required = true)]
+        packages: Vec<String>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Grant a package from one repository into another (agency curation).
     ///
     /// The target repo then exposes the package without owning it — mirror a
@@ -257,6 +274,12 @@ fn main() -> Result<()> {
             repo,
             database_url,
         } => repo_create(&org, &repo, &database_url),
+        Command::LicenseCreate {
+            repo,
+            buyer,
+            packages,
+            database_url,
+        } => license_create(&repo, buyer.as_deref(), &packages, &database_url),
         Command::Grant {
             repo,
             from,
@@ -343,6 +366,33 @@ fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
             .await
             .with_context(|| format!("creating repo (does org '{org}' exist?)"))?;
         println!("repo created: {org}/{repo}");
+        Ok(())
+    })
+}
+
+fn license_create(
+    repo: &str,
+    buyer: Option<&str>,
+    packages: &[String],
+    database_url: &str,
+) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let (key, license_id) = catalog
+            .create_license_key(repo_id, buyer)
+            .await
+            .context("creating license")?;
+        for pkg in packages {
+            if !catalog.entitle_package(license_id, repo_id, pkg).await? {
+                anyhow::bail!("no package '{pkg}' in {repo} (entitlements not saved)");
+            }
+        }
+        // The key goes to stdout (scriptable); the notice to stderr.
+        println!("{key}");
+        eprintln!(
+            "License created for {repo}, entitled to: {}. Store the key — shown once.",
+            packages.join(", ")
+        );
         Ok(())
     })
 }

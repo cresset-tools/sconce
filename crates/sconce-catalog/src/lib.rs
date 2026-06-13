@@ -41,6 +41,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0005_multitenancy.sql"),
     ),
     ("0006_grants", include_str!("../migrations/0006_grants.sql")),
+    (
+        "0007_licenses",
+        include_str!("../migrations/0007_licenses.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -258,6 +262,88 @@ impl Catalog {
         Ok(updated.rows_affected() > 0)
     }
 
+    /// Issue a license key for a repository (seller mode). Stores only the
+    /// sha256; returns `(plaintext key, license id)` — the key is shown once.
+    pub async fn create_license_key(
+        &self,
+        repo_id: Uuid,
+        buyer_ref: Option<&str>,
+    ) -> Result<(String, Uuid), sqlx::Error> {
+        let key = generate_secret("sclk_");
+        let id: Uuid = sqlx::query_scalar(
+            "insert into license_keys (repo_id, key_hash, buyer_ref) values ($1, $2, $3) \
+             returning id",
+        )
+        .bind(repo_id)
+        .bind(token_hash(&key))
+        .bind(buyer_ref)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((key, id))
+    }
+
+    /// Entitle a license to a package owned by its repository. Returns `false`
+    /// if no such package exists in the repo.
+    pub async fn entitle_package(
+        &self,
+        license_id: Uuid,
+        repo_id: Uuid,
+        package: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let Some(package_id): Option<Uuid> =
+            sqlx::query_scalar("select id from packages where repo_id = $1 and name = $2")
+                .bind(repo_id)
+                .bind(package)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(false);
+        };
+        sqlx::query(
+            "insert into entitlements (license_key_id, package_id) values ($1, $2) \
+             on conflict do nothing",
+        )
+        .bind(license_id)
+        .bind(package_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// Validate a license key for a repository: active and unexpired. Returns the
+    /// license id on success.
+    pub async fn resolve_license(
+        &self,
+        repo_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "select id from license_keys \
+             where repo_id = $1 and key_hash = $2 and status = 'active' \
+               and (expires_at is null or expires_at > now())",
+        )
+        .bind(repo_id)
+        .bind(token_hash(key))
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The package names a license is entitled to, sorted.
+    pub async fn entitled_package_names(
+        &self,
+        license_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select p.name from entitlements e \
+             join packages p on p.id = e.package_id \
+             where e.license_key_id = $1 order by p.name",
+        )
+        .bind(license_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| r.try_get("name")).collect()
+    }
+
     /// Grant `package` (owned by `source_repo`) into `target_repo`, so the target
     /// exposes it without owning it. Returns `false` if no such package exists in
     /// the source.
@@ -456,17 +542,22 @@ impl Catalog {
     }
 }
 
-/// A fresh, high-entropy read token, prefixed for recognizability. Randomness
-/// comes from two v4 UUIDs (CSPRNG-backed) — 32 bytes, hex-encoded.
+/// A fresh, high-entropy read token (`sconce_` prefix).
 fn generate_token() -> String {
+    generate_secret("sconce_")
+}
+
+/// A fresh, high-entropy secret with the given prefix for recognizability.
+/// Randomness comes from two v4 UUIDs (CSPRNG-backed) — 32 bytes, hex-encoded.
+fn generate_secret(prefix: &str) -> String {
     use std::fmt::Write as _;
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    let mut token = String::with_capacity(7 + 64);
-    token.push_str("sconce_");
+    let mut s = String::with_capacity(prefix.len() + 64);
+    s.push_str(prefix);
     for byte in a.as_bytes().iter().chain(b.as_bytes()) {
-        let _ = write!(token, "{byte:02x}");
+        let _ = write!(s, "{byte:02x}");
     }
-    token
+    s
 }
 
 /// sha256 of a token — what we store and compare against.
@@ -828,5 +919,45 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// Seller mode: a license key resolves only for its repo and unlocks only
+    /// the purchased packages.
+    #[tokio::test]
+    async fn license_keys_entitle_only_purchased_packages() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        cat.upsert_package(repo_id, "seller/a", "commercial", None)
+            .await
+            .unwrap();
+        cat.upsert_package(repo_id, "seller/b", "commercial", None)
+            .await
+            .unwrap();
+
+        let (key, lic) = cat
+            .create_license_key(repo_id, Some("alice"))
+            .await
+            .unwrap();
+        assert!(cat.entitle_package(lic, repo_id, "seller/a").await.unwrap());
+        assert!(
+            !cat.entitle_package(lic, repo_id, "nope/nope")
+                .await
+                .unwrap(),
+            "unknown pkg"
+        );
+
+        assert_eq!(cat.resolve_license(repo_id, &key).await.unwrap(), Some(lic));
+        assert!(
+            cat.resolve_license(repo_id, "sclk_bogus")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cat.entitled_package_names(lic).await.unwrap(), ["seller/a"]);
+
+        // A license from one repo does not resolve in another.
+        let (_, other) = repo().await.unwrap();
+        assert!(cat.resolve_license(other, &key).await.unwrap().is_none());
     }
 }

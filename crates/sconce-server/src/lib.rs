@@ -10,11 +10,12 @@
 //! - `GET /{org}/{repo}/dist/{vendor}/{name}/{sha256}.zip` — content-addressed
 //!   download; the sha256 resolves the blob in the CAS.
 //!
-//! Every route requires a token **valid for that repository** (`Authorization:
-//! Bearer <token>` or HTTP basic with the token as the password) — a token from
-//! one repo can't read another. An unknown repo is 404; a missing/invalid token
-//! is 401. Repos are fully closed until a token is minted (`sconce token create
-//! --repo <org>/<repo>`).
+//! Every route requires a credential **valid for that repository**
+//! (`Authorization: Bearer <…>` or HTTP basic with the secret as the password).
+//! Two credential kinds: a repo **token** unlocks the whole repo; a seller
+//! **license key** unlocks only its entitled (purchased) packages — unentitled
+//! packages serve an empty document. A credential from one repo can't read
+//! another. Unknown repo → 404; missing/invalid credential → 401.
 
 #![forbid(unsafe_code)]
 
@@ -52,25 +53,55 @@ pub fn router(catalog: Catalog, store: FsBlobStore, base_url: String) -> Router 
         })
 }
 
-/// Resolve `(org, repo)` to a repository id and require a token valid for it.
-/// 404 if the repository is unknown, 401 if the token is missing/invalid.
+/// What a credential is allowed to see in a repository.
+enum Access {
+    /// A repo read token: every package in the repo.
+    Full,
+    /// A seller license key: only the entitled (purchased) package names.
+    Licensed(std::collections::HashSet<String>),
+}
+
+impl Access {
+    /// Whether `package` is readable under this access.
+    fn allows(&self, package: &str) -> bool {
+        match self {
+            Access::Full => true,
+            Access::Licensed(entitled) => entitled.contains(package),
+        }
+    }
+}
+
+/// Resolve `(org, repo)` to a repository id and the access a credential grants.
+/// 404 if the repository is unknown, 401 if the credential is missing/invalid.
+///
+/// A repo **token** grants [`Access::Full`]; a seller **license key** grants
+/// [`Access::Licensed`] to its entitled packages only.
 async fn authorize(
     s: &AppState,
     org: &str,
     repo: &str,
     headers: &HeaderMap,
-) -> Result<Uuid, AppError> {
+) -> Result<(Uuid, Access), AppError> {
     let repo_id = s
         .catalog
         .resolve_repo(org, repo)
         .await?
         .ok_or(AppError::NotFound)?;
-    let token = extract_token(headers).ok_or(AppError::Unauthorized)?;
-    if s.catalog.token_valid(repo_id, &token).await? {
-        Ok(repo_id)
-    } else {
-        Err(AppError::Unauthorized)
+    let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
+
+    if s.catalog.token_valid(repo_id, &cred).await? {
+        return Ok((repo_id, Access::Full));
     }
+    if let Some(license_id) = s.catalog.resolve_license(repo_id, &cred).await? {
+        let entitled = s
+            .catalog
+            .entitled_package_names(license_id)
+            .await?
+            .into_iter()
+            .collect();
+        return Ok((repo_id, Access::Licensed(entitled)));
+    }
+    Err(AppError::Unauthorized)
 }
 
 /// The absolute base URL for one repository, e.g. `https://host/acme/client-a`.
@@ -121,8 +152,15 @@ async fn packages_json(
     Path((org, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let repo_id = authorize(&s, &org, &repo, &headers).await?;
-    let names = s.catalog.all_package_names(repo_id).await?;
+    let (repo_id, access) = authorize(&s, &org, &repo, &headers).await?;
+    let names = match access {
+        Access::Full => s.catalog.all_package_names(repo_id).await?,
+        Access::Licensed(entitled) => {
+            let mut v: Vec<String> = entitled.into_iter().collect();
+            v.sort();
+            v
+        }
+    };
     Ok(Json(sconce_metadata::render_root(
         &names,
         &repo_base(&s.base_url, &org, &repo),
@@ -134,7 +172,7 @@ async fn p2(
     Path((org, repo, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let repo_id = authorize(&s, &org, &repo, &headers).await?;
+    let (repo_id, access) = authorize(&s, &org, &repo, &headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -143,8 +181,9 @@ async fn p2(
         None => (stem, false),
     };
 
-    if is_dev {
-        // No dev (branch) versions yet — return an empty, valid document.
+    // A license key only unlocks its entitled packages; everything else (and the
+    // dev variant) is an empty document.
+    if is_dev || !access.allows(package) {
         return Ok(Json(json!({ "packages": { package: [] } })));
     }
 
