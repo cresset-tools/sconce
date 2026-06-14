@@ -49,6 +49,19 @@ thiserror = "2"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 argon2 = "0.5"
+# Authenticated encryption for upstream credentials at rest. XChaCha20Poly1305's
+# 192-bit nonce is safe with random nonces (no nonce-reuse bookkeeping needed).
+chacha20poly1305 = "0.10"
+# Blocking HTTP client (rustls) for mirroring Composer-repo upstreams.
+ureq = "2"
+# Pattern filter for whole-registry composer mirroring.
+regex = "1"
+# Dashboard SSO (OIDC Auth Code + PKCE). Default features = reqwest + rustls-tls
+# (no OpenSSL), matching the rest of the stack.
+openidconnect = "4"
+# CI OIDC token exchange: validate platform JWTs against their JWKS.
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 dotenvy = "0.15"
 # Local git access only (read trees at a ref). gix's default features give a
 # working hash backend + rev-parse without pulling a network client (networking

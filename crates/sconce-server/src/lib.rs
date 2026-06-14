@@ -19,13 +19,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ci;
+pub mod oidc;
 pub mod ui;
 
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use base64::Engine as _;
 use sconce_cas::{BlobId, BlobStore, FsBlobStore};
 use sconce_catalog::Catalog;
@@ -48,6 +50,7 @@ pub fn router(catalog: Catalog, store: FsBlobStore, base_url: String) -> Router 
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
         .route("/{org}/{repo}/dist/{*rest}", get(dist))
+        .route("/oauth/ci", post(oauth_ci))
         .with_state(AppState {
             catalog,
             store,
@@ -234,6 +237,57 @@ fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
 }
 
 /// Handler error → HTTP status.
+/// CI OIDC exchange request: a repository + the workflow's platform OIDC JWT.
+#[derive(serde::Deserialize)]
+struct CiExchange {
+    repository: String,
+    jwt: String,
+}
+
+/// Trade a CI OIDC JWT for a short-lived repo token (zero stored secret). The
+/// JWT is validated against each of the repo's CI policies (signature via the
+/// issuer's JWKS, `iss`/`aud`/`exp`, then the claim matchers); the first match
+/// mints a token. 401 if nothing matches.
+async fn oauth_ci(
+    State(s): State<AppState>,
+    Json(req): Json<CiExchange>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (org, repo) = req.repository.split_once('/').ok_or(AppError::NotFound)?;
+    let repo_id = s
+        .catalog
+        .resolve_repo(org, repo)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    for policy in s.catalog.ci_policies(repo_id).await? {
+        // A JWKS fetch failure for one issuer shouldn't doom other policies.
+        let Ok(jwks) = ci::fetch_jwks(&policy.issuer).await else {
+            continue;
+        };
+        let Ok(claims) = ci::validate_jwt(&req.jwt, &jwks, &policy.issuer, &policy.audience) else {
+            continue;
+        };
+        if !ci::claims_match(&claims, &policy.claims) {
+            continue;
+        }
+        // Matched → mint a short-lived CI token labelled with the workload `sub`.
+        let label = claims
+            .get("sub")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ci");
+        let token = s
+            .catalog
+            .create_ci_token(repo_id, label, policy.token_ttl_secs)
+            .await?;
+        return Ok(Json(json!({
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": policy.token_ttl_secs,
+        })));
+    }
+    Err(AppError::Unauthorized)
+}
+
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("not found")]

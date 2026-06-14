@@ -36,12 +36,38 @@ possible.
 cargo run -p sconce -- archive ./my-package out.zip
 ```
 
+## Run it (Docker)
+
+A single `sconce serve` process runs the Composer wire API, the admin UI, **and**
+the in-process mirror worker; Postgres is the only dependency. With Docker:
+
+```bash
+SCONCE_ADMIN_PASSWORD=change-me docker compose up --build
+# wire API → http://localhost:8080      (composer repositories.<x> composer …)
+# admin UI → http://localhost:8081      (single-tenant; password above)
+```
+
+Then in the UI: create an org + repo, add an upstream (a git URL or a Composer
+registry like `https://repo.mage-os.org` with a `^vendor/` match), hit **Sync**,
+and add a read token — the install snippet is shown on the token page.
+
+Config is environment-based (12-factor): `DATABASE_URL`, `SCONCE_ADMIN_PASSWORD`,
+and `SCONCE_SECRET_KEY` (base64 of 32 bytes; needed only to store *private*
+upstream credentials). Run a dedicated worker instead of the in-process one with
+`sconce serve --no-worker` + `sconce worker --cas …`.
+
 ## Workspace
 
 | Crate | Role |
 | --- | --- |
-| `sconce` | CLI binary |
+| `sconce` | CLI + `serve`/`worker`/`ui` binary |
 | `sconce-archive` | deterministic, content-addressable archive writer |
+| `sconce-cas` | content-addressed blob store (sha256, fanout) |
+| `sconce-catalog` | Postgres catalog: packages, versions, upstreams, jobs, deps |
+| `sconce-git` | git-tree reader (canonical modes, `export-ignore`) |
+| `sconce-metadata` | Composer v1/v2 metadata rendering |
+| `sconce-mirror` | mirror worker: git clone + composer-registry, dependency closure |
+| `sconce-server` | Composer wire API + admin UI |
 
 ## License
 

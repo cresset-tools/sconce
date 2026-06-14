@@ -20,6 +20,11 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Dashboard SSO.
+openidconnect = { workspace = true }
+# CI OIDC token exchange (validate platform JWTs + fetch JWKS).
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,7 +9,65 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Parse a `key=value` CLI argument.
+fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .ok_or_else(|| format!("expected key=value, got '{s}'"))
+}
+
+/// Tri-state repo override for raw tokens.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RawTokenOverride {
+    /// Inherit the org's setting (clear the override).
+    Inherit,
+    /// Allow raw tokens (still capped by the org if the org forbids them).
+    Allow,
+    /// Disable raw tokens for this repo.
+    Deny,
+}
+
+/// Upstream visibility (drives package visibility + dependency classification).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Visib {
+    Public,
+    Private,
+}
+
+impl From<Visib> for sconce_catalog::Visibility {
+    fn from(v: Visib) -> Self {
+        match v {
+            Visib::Public => sconce_catalog::Visibility::Public,
+            Visib::Private => sconce_catalog::Visibility::Private,
+        }
+    }
+}
+
+/// How a private upstream's credential is presented when cloning.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CredType {
+    /// The secret is full userinfo (`user:token` / `oauth2:token`).
+    Basic,
+    /// The secret is a token → `x-access-token:<token>`.
+    Github,
+    /// The secret is a token → `oauth2:<token>`.
+    Gitlab,
+    /// The secret is a token → `Authorization: Bearer <token>` header.
+    Bearer,
+}
+
+impl CredType {
+    fn as_str(self) -> &'static str {
+        match self {
+            CredType::Basic => "basic",
+            CredType::Github => "github",
+            CredType::Gitlab => "gitlab",
+            CredType::Bearer => "bearer",
+        }
+    }
+}
 use sconce_archive::{CanonicalArchive, Entry, Mode};
 
 #[derive(Parser, Debug)]
@@ -98,12 +156,114 @@ enum Command {
         database_url: String,
     },
 
+    /// Show or change org-wide settings (raw-token toggle, max token TTL).
+    OrgSettings {
+        /// Organization slug.
+        org: String,
+        /// Allow raw repo tokens to be created (`true`/`false`). Omit to leave
+        /// unchanged.
+        #[arg(long)]
+        allow_raw_tokens: Option<bool>,
+        /// Max token expiry in days; `0` clears the limit. Omit to leave
+        /// unchanged.
+        #[arg(long)]
+        max_token_ttl_days: Option<i64>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Create a repository in an organization.
     RepoCreate {
         /// Organization slug.
         org: String,
         /// Repository slug.
         repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Manage a repo's upstreams (where packages are mirrored from).
+    Upstream {
+        #[command(subcommand)]
+        action: UpstreamAction,
+    },
+
+    /// Mirror a registered git upstream by id (clone + enumerate tags).
+    MirrorUpstream {
+        /// Upstream id (see `upstream list`).
+        id: uuid::Uuid,
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Mirror one package from a registered composer upstream (Packagist /
+    /// Mage-OS style): fetch its p2 metadata + download dists verbatim.
+    MirrorPackage {
+        /// Composer upstream id (see `upstream list`).
+        #[arg(long)]
+        upstream: uuid::Uuid,
+        /// Package name, e.g. `mage-os/composer`.
+        #[arg(long)]
+        package: String,
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Mirror a whole composer registry: every package in `available-packages`,
+    /// optionally filtered by a regex (e.g. `^mage-os/` or `^magento/module-`).
+    MirrorRegistry {
+        /// Composer upstream id (see `upstream list`).
+        #[arg(long)]
+        upstream: uuid::Uuid,
+        /// Regex package names must match (required — an unfiltered registry
+        /// mirror is refused).
+        #[arg(long = "match")]
+        pattern: String,
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Dependency closure: resolve (background), review the plan, and add picks.
+    Deps {
+        #[command(subcommand)]
+        action: DepsAction,
+    },
+
+    /// Run the background mirror worker: drain the job queue, then wait for
+    /// NOTIFY (with a poll backstop) and repeat. Runs until killed.
+    Worker {
+        /// Directory of the content-addressed store.
+        #[arg(long)]
+        cas: PathBuf,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Show or change a repo's token-policy overrides (tighten-only vs the org).
+    RepoSettings {
+        /// Repository, as `<org>/<repo>`.
+        repo: String,
+        /// Raw-token override: `inherit`, `allow`, or `deny`. Omit to leave
+        /// unchanged.
+        #[arg(long)]
+        allow_raw_tokens: Option<RawTokenOverride>,
+        /// Max token expiry in days; `0` clears the override (inherit). Omit to
+        /// leave unchanged.
+        #[arg(long)]
+        max_token_ttl_days: Option<i64>,
+        /// Whether the repo may contain private packages (`true`/`false`). When
+        /// false the repo is public-only. Omit to leave unchanged.
+        #[arg(long)]
+        allow_private_packages: Option<bool>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -128,6 +288,56 @@ enum Command {
         email: String,
         /// Tenant (organization) slug.
         tenant: String,
+        /// Role in the tenant: `member` (read-only) or `admin` (manage).
+        #[arg(long, default_value = "member")]
+        role: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Manage CI OIDC exchange policies (zero-secret CI installs).
+    CiPolicy {
+        #[command(subcommand)]
+        action: CiPolicyAction,
+    },
+
+    /// Create (or replace) an org's SCIM bearer token for identity-provider
+    /// provisioning / deprovisioning. Printed once — set it in the provider's
+    /// SCIM settings.
+    ScimToken {
+        /// Organization slug.
+        org: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Configure dashboard SSO. Without --org sets the instance default; with
+    /// --org <slug> sets that org's connection (users from it land in that org).
+    OidcConfig {
+        /// Scope to an org slug (omit for the instance-default connection).
+        #[arg(long)]
+        org: Option<String>,
+        /// Identity-provider issuer URL (its openid-configuration base).
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        client_id: String,
+        /// Client secret (stored encrypted; needs `SCONCE_SECRET_KEY`). Omit for
+        /// a public PKCE-only client.
+        #[arg(long)]
+        client_secret: Option<String>,
+        /// The callback URL — must be `<ui-base>/auth/callback`.
+        #[arg(long)]
+        redirect_url: String,
+        /// Space-separated scopes.
+        #[arg(long, default_value = "openid email profile")]
+        scopes: String,
+        /// Comma-separated email domains allowed to sign in (default: any).
+        #[arg(long)]
+        allowed_domains: Option<String>,
+        /// Comma-separated email domains provisioned as superadmins.
+        #[arg(long)]
+        admin_domains: Option<String>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -175,12 +385,25 @@ enum Command {
         /// Postgres connection string.
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
-        /// Address to listen on.
+        /// Address to listen on (the Composer wire API).
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: std::net::SocketAddr,
         /// Public base URL emitted in metadata/dist URLs.
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         base_url: String,
+        /// Don't run the in-process mirror worker (run a separate `sconce
+        /// worker` instead).
+        #[arg(long)]
+        no_worker: bool,
+        /// Also serve the admin UI on this address (single-binary deploy).
+        #[arg(long)]
+        ui_listen: Option<std::net::SocketAddr>,
+        /// Admin UI: single-tenant mode (no accounts; gated by --admin-password).
+        #[arg(long)]
+        single_tenant: bool,
+        /// Admin UI password for single-tenant mode.
+        #[arg(long, env = "SCONCE_ADMIN_PASSWORD")]
+        admin_password: Option<String>,
     },
 
     /// Serve the admin web UI (operator dashboard). Set `--admin-password` to
@@ -275,15 +498,160 @@ enum PolicyAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum UpstreamAction {
+    /// Register an upstream for a repository.
+    Add {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// `git` (clone URL) or `composer` (registry URL; mirroring TBD).
+        #[arg(long, default_value = "git")]
+        kind: String,
+        /// Clone/registry URL.
+        #[arg(long)]
+        base: String,
+        /// `public` or `private` — drives mirrored package visibility.
+        #[arg(long)]
+        visibility: Visib,
+        /// Optional human label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Credential secret to use when cloning (a token, or `user:pass` for
+        /// `--credential-type basic`). Ignored for public upstreams. Stored
+        /// encrypted; needs `SCONCE_SECRET_KEY`.
+        #[arg(long)]
+        credential: Option<String>,
+        /// How to present the credential: basic | github | gitlab | bearer.
+        #[arg(long, default_value = "basic")]
+        credential_type: CredType,
+        /// composer-only: regex scoping which packages a sync mirrors (e.g.
+        /// `^mage-os/`). Omit to mirror everything the registry lists.
+        #[arg(long = "match")]
+        pattern: Option<String>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// List a repository's upstreams (never the secret).
+    List {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Remove an upstream by id.
+    Remove {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Upstream id to remove.
+        id: uuid::Uuid,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CiPolicyAction {
+    /// Add a CI OIDC policy: a workflow whose JWT validates and matches the
+    /// given claims gets a short-lived token for the repo.
+    Add {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Provider label (`github`, `gitlab`, …).
+        #[arg(long)]
+        provider: String,
+        /// OIDC issuer URL (e.g. `https://token.actions.githubusercontent.com`).
+        #[arg(long)]
+        issuer: String,
+        /// Expected `aud` claim (what the workflow sets as the audience).
+        #[arg(long)]
+        audience: String,
+        /// Required claim, `key=value` (repeatable; e.g. `repository=acme/app`).
+        #[arg(long = "claim", value_parser = parse_kv)]
+        claims: Vec<(String, String)>,
+        /// Minted token lifetime in seconds.
+        #[arg(long, default_value_t = 900)]
+        ttl_secs: i64,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// List a repo's CI OIDC policies.
+    List {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DepsAction {
+    /// Enqueue a job to resolve the repo's full dependency closure (the worker
+    /// computes it). Review with `deps plan`.
+    Resolve {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Show the computed dependency plan (the proposal to review).
+    Plan {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Add a resolvable dependency: enqueue mirroring it from its resolver.
+    Add {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Package name from the plan, e.g. `mage-os/framework`.
+        package: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum TokenAction {
     /// Create a new token for a repository and print it once.
     Create {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        /// Optional human label.
+        /// Optional human label (so the token can be identified and revoked).
         #[arg(long)]
         label: Option<String>,
+        /// Optional expiry, in days from now. Omit for a token that never
+        /// expires.
+        #[arg(long)]
+        expires_days: Option<i64>,
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// List a repository's tokens (id, label, expiry) — never the secret.
+    List {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Revoke a token by id (see `token list`).
+    Revoke {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Token id to revoke.
+        id: uuid::Uuid,
         /// Postgres connection string.
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
@@ -318,7 +686,20 @@ fn main() -> Result<()> {
             database_url,
             listen,
             base_url,
-        } => serve(&cas, &database_url, listen, base_url),
+            no_worker,
+            ui_listen,
+            single_tenant,
+            admin_password,
+        } => serve(
+            &cas,
+            &database_url,
+            listen,
+            base_url,
+            no_worker,
+            ui_listen,
+            single_tenant,
+            admin_password,
+        ),
         Command::Ui {
             database_url,
             listen,
@@ -337,6 +718,81 @@ fn main() -> Result<()> {
             name,
             database_url,
         } => org_create(&slug, name.as_deref(), &database_url),
+        Command::OrgSettings {
+            org,
+            allow_raw_tokens,
+            max_token_ttl_days,
+            database_url,
+        } => org_settings(&org, allow_raw_tokens, max_token_ttl_days, &database_url),
+        Command::Upstream { action } => match action {
+            UpstreamAction::Add {
+                repo,
+                kind,
+                base,
+                visibility,
+                label,
+                credential,
+                credential_type,
+                pattern,
+                database_url,
+            } => upstream_add(
+                &repo,
+                &kind,
+                &base,
+                visibility.into(),
+                label.as_deref(),
+                credential.as_deref(),
+                credential_type.as_str(),
+                pattern.as_deref(),
+                &database_url,
+            ),
+            UpstreamAction::List { repo, database_url } => upstream_list(&repo, &database_url),
+            UpstreamAction::Remove {
+                repo,
+                id,
+                database_url,
+            } => upstream_remove(&repo, id, &database_url),
+        },
+        Command::MirrorUpstream {
+            id,
+            cas,
+            database_url,
+        } => mirror_upstream(id, &cas, &database_url),
+        Command::MirrorPackage {
+            upstream,
+            package,
+            cas,
+            database_url,
+        } => mirror_package(upstream, &package, &cas, &database_url),
+        Command::MirrorRegistry {
+            upstream,
+            pattern,
+            cas,
+            database_url,
+        } => mirror_registry(upstream, &pattern, &cas, &database_url),
+        Command::Deps { action } => match action {
+            DepsAction::Resolve { repo, database_url } => deps_resolve(&repo, &database_url),
+            DepsAction::Plan { repo, database_url } => deps_plan(&repo, &database_url),
+            DepsAction::Add {
+                repo,
+                package,
+                database_url,
+            } => deps_add(&repo, &package, &database_url),
+        },
+        Command::Worker { cas, database_url } => worker(&cas, &database_url),
+        Command::RepoSettings {
+            repo,
+            allow_raw_tokens,
+            max_token_ttl_days,
+            allow_private_packages,
+            database_url,
+        } => repo_settings(
+            &repo,
+            allow_raw_tokens,
+            max_token_ttl_days,
+            allow_private_packages,
+            &database_url,
+        ),
         Command::RepoCreate {
             org,
             repo,
@@ -351,8 +807,43 @@ fn main() -> Result<()> {
         Command::UserGrant {
             email,
             tenant,
+            role,
             database_url,
-        } => user_grant(&email, &tenant, &database_url),
+        } => user_grant(&email, &tenant, &role, &database_url),
+        Command::CiPolicy { action } => match action {
+            CiPolicyAction::Add {
+                repo,
+                provider,
+                issuer,
+                audience,
+                claims,
+                ttl_secs,
+                database_url,
+            } => ci_policy_add(&repo, &provider, &issuer, &audience, &claims, ttl_secs, &database_url),
+            CiPolicyAction::List { repo, database_url } => ci_policy_list(&repo, &database_url),
+        },
+        Command::ScimToken { org, database_url } => scim_token(&org, &database_url),
+        Command::OidcConfig {
+            org,
+            issuer,
+            client_id,
+            client_secret,
+            redirect_url,
+            scopes,
+            allowed_domains,
+            admin_domains,
+            database_url,
+        } => oidc_config(
+            org.as_deref(),
+            &issuer,
+            &client_id,
+            client_secret.as_deref(),
+            &redirect_url,
+            &scopes,
+            allowed_domains.as_deref(),
+            admin_domains.as_deref(),
+            &database_url,
+        ),
         Command::LicenseCreate {
             repo,
             buyer,
@@ -369,8 +860,15 @@ fn main() -> Result<()> {
             TokenAction::Create {
                 repo,
                 label,
+                expires_days,
                 database_url,
-            } => token_create(&repo, label.as_deref(), &database_url),
+            } => token_create(&repo, label.as_deref(), expires_days, &database_url),
+            TokenAction::List { repo, database_url } => token_list(&repo, &database_url),
+            TokenAction::Revoke {
+                repo,
+                id,
+                database_url,
+            } => token_revoke(&repo, id, &database_url),
         },
         Command::Policy { action } => match action {
             PolicyAction::Show { repo, database_url } => policy_show(&repo, &database_url),
@@ -399,6 +897,407 @@ fn main() -> Result<()> {
             version,
             database_url,
         } => version_action("approve", &repo, &package, &version, &database_url),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upstream_add(
+    repo: &str,
+    kind: &str,
+    base: &str,
+    visibility: sconce_catalog::Visibility,
+    label: Option<&str>,
+    credential: Option<&str>,
+    credential_type: &str,
+    pattern: Option<&str>,
+    database_url: &str,
+) -> Result<()> {
+    // A composer upstream must be scoped — an unfiltered sync would mirror the
+    // whole registry. Require a non-empty match.
+    let pattern = pattern.map(str::trim).filter(|p| !p.is_empty());
+    if kind == "composer" && pattern.is_none() {
+        anyhow::bail!(
+            "composer upstreams require --match <regex> (refusing to mirror an entire registry)"
+        );
+    }
+    // Public upstreams are unauthenticated — drop any credential rather than
+    // encrypting (and needlessly requiring the key) for one.
+    let credential = match visibility {
+        sconce_catalog::Visibility::Public => None,
+        sconce_catalog::Visibility::Private => credential,
+    };
+    // Encrypt the credential (if any) before it touches the catalog.
+    let ciphertext = match credential {
+        None => None,
+        Some(c) => {
+            let key = sconce_catalog::secret::SecretKey::from_env()
+                .context("a credential was given but SCONCE_SECRET_KEY is not set")?;
+            Some(key.encrypt(c.as_bytes()))
+        }
+    };
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let id = catalog
+            .create_upstream(
+                repo_id,
+                kind,
+                base,
+                visibility,
+                label,
+                ciphertext.as_deref(),
+                credential_type,
+            )
+            .await
+            .context("creating upstream")?;
+        if let Some(p) = pattern {
+            catalog
+                .set_upstream_filter(repo_id, id, Some(p))
+                .await
+                .context("setting package filter")?;
+        }
+        println!("upstream added: {id}");
+        Ok(())
+    })
+}
+
+fn upstream_list(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let ups = catalog
+            .list_upstreams(repo_id)
+            .await
+            .context("listing upstreams")?;
+        if ups.is_empty() {
+            eprintln!("No upstreams for {repo}.");
+        }
+        for u in ups {
+            let label = u.label.as_deref().unwrap_or("-");
+            let cred = if u.has_credential { "auth" } else { "no-auth" };
+            let filt = u
+                .package_filter
+                .as_deref()
+                .map_or(String::new(), |p| format!("  match={p}"));
+            println!(
+                "{}  [{}/{}]  {label}  ({cred})  {}{filt}",
+                u.id, u.kind, u.visibility, u.base
+            );
+        }
+        Ok(())
+    })
+}
+
+fn upstream_remove(repo: &str, id: uuid::Uuid, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        if catalog
+            .delete_upstream(repo_id, id)
+            .await
+            .context("removing upstream")?
+        {
+            eprintln!("Removed upstream {id} from {repo}.");
+            Ok(())
+        } else {
+            anyhow::bail!("no such upstream {id} in {repo}")
+        }
+    })
+}
+
+fn mirror_upstream(id: uuid::Uuid, cas: &Path, database_url: &str) -> Result<()> {
+    use sconce_cas::FsBlobStore;
+    use sconce_catalog::Catalog;
+
+    // The key is only needed if the upstream stores a credential; load it
+    // best-effort and let the mirror error clearly if it turns out to be needed.
+    let key = sconce_catalog::secret::SecretKey::from_env().ok();
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store =
+            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        let report = sconce_mirror::mirror_upstream(&catalog, &store, id, key.as_ref())
+            .await
+            .with_context(|| format!("mirroring upstream {id}"))?;
+        for m in &report.mirrored {
+            println!(
+                "  + {} {} ({}, {})",
+                m.package, m.tag, m.normalized, m.stability
+            );
+        }
+        for (tag, reason) in &report.skipped {
+            println!("  - {tag}: {reason}");
+        }
+        println!(
+            "mirrored {} version(s), skipped {}",
+            report.mirrored.len(),
+            report.skipped.len()
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn mirror_package(
+    upstream: uuid::Uuid,
+    package: &str,
+    cas: &Path,
+    database_url: &str,
+) -> Result<()> {
+    use sconce_cas::FsBlobStore;
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store =
+            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        let report = sconce_mirror::mirror_composer_package(&catalog, &store, upstream, package)
+            .await
+            .with_context(|| format!("mirroring {package} from upstream {upstream}"))?;
+        for m in &report.mirrored {
+            println!("  + {} {} ({})", m.package, m.tag, m.stability);
+        }
+        for (ver, reason) in &report.skipped {
+            println!("  - {ver}: {reason}");
+        }
+        println!(
+            "mirrored {} version(s), skipped {}",
+            report.mirrored.len(),
+            report.skipped.len()
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn mirror_registry(
+    upstream: uuid::Uuid,
+    pattern: &str,
+    cas: &Path,
+    database_url: &str,
+) -> Result<()> {
+    use sconce_cas::FsBlobStore;
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store =
+            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        let report =
+            sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream, Some(pattern))
+                .await
+                .with_context(|| format!("mirroring registry upstream {upstream}"))?;
+        // Summarize per package so a big run is readable.
+        let mut by_pkg: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for m in &report.mirrored {
+            *by_pkg.entry(m.package.as_str()).or_default() += 1;
+        }
+        for (pkg, n) in &by_pkg {
+            println!("  + {pkg}: {n} version(s)");
+        }
+        for (item, reason) in &report.skipped {
+            println!("  - {item}: {reason}");
+        }
+        println!(
+            "mirrored {} version(s) across {} package(s); {} skipped",
+            report.mirrored.len(),
+            by_pkg.len(),
+            report.skipped.len()
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn deps_resolve(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        catalog
+            .enqueue_resolve_closure_job(repo_id)
+            .await
+            .context("enqueueing resolve job")?;
+        println!("queued dependency resolution for {repo} — run `sconce worker` to compute it, then `sconce deps plan --repo {repo}`.");
+        Ok(())
+    })
+}
+
+fn deps_plan(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let plan = catalog
+            .list_dependency_plan(repo_id)
+            .await
+            .context("loading plan")?;
+        if plan.is_empty() {
+            eprintln!("No plan yet — run `sconce deps resolve --repo {repo}` first.");
+        }
+        for e in &plan {
+            let by = e.required_by.as_deref().unwrap_or("-");
+            println!("{:<20} {:<28} (required by {by})", e.status, e.name);
+        }
+        Ok(())
+    })
+}
+
+fn deps_add(repo: &str, package: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let entry = catalog
+            .dependency_plan_entry(repo_id, package)
+            .await
+            .context("looking up plan entry")?
+            .with_context(|| format!("'{package}' is not in the plan (run `deps resolve`)"))?;
+        let upstream = entry.resolver_upstream_id.with_context(|| {
+            format!("'{package}' is {} — nothing to add (no resolver)", entry.status)
+        })?;
+        catalog
+            .enqueue_mirror_package_job(upstream, package)
+            .await
+            .context("enqueueing mirror")?;
+        println!("queued mirror of {package} — the worker will fetch it.");
+        Ok(())
+    })
+}
+
+/// Execute one claimed job by kind, returning a one-line summary on success or
+/// a message on failure (the worker handles retry/fail uniformly).
+async fn run_job(
+    catalog: &sconce_catalog::Catalog,
+    store: &sconce_cas::FsBlobStore,
+    key: Option<&sconce_catalog::secret::SecretKey>,
+    job: &sconce_catalog::MirrorJob,
+) -> std::result::Result<String, String> {
+    match job.kind.as_str() {
+        "mirror_upstream" => {
+            let uid = job.upstream_id.ok_or("job missing upstream_id")?;
+            let r = sconce_mirror::mirror_upstream(catalog, store, uid, key)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "{} mirrored, {} skipped",
+                r.mirrored.len(),
+                r.skipped.len()
+            ))
+        }
+        "mirror_package" => {
+            let uid = job.upstream_id.ok_or("job missing upstream_id")?;
+            let pkg = job.package.as_deref().ok_or("job missing package")?;
+            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!("{pkg}: {} version(s)", r.mirrored.len()))
+        }
+        "resolve_closure" => {
+            let rid = job.repo_id.ok_or("job missing repo_id")?;
+            let plan = sconce_mirror::resolve_closure(catalog, rid)
+                .await
+                .map_err(|e| e.to_string())?;
+            catalog
+                .replace_dependency_plan(rid, &plan)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!("resolved {} dependencies", plan.len()))
+        }
+        other => Err(format!("unknown job kind: {other}")),
+    }
+}
+
+fn worker(cas: &Path, database_url: &str) -> Result<()> {
+    use sconce_cas::FsBlobStore;
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store =
+            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+        let key = sconce_catalog::secret::SecretKey::from_env().ok();
+        run_worker_loop(catalog, store, key, database_url.to_owned()).await
+    })
+}
+
+/// The worker loop: claim and run jobs, then wait on NOTIFY (with a poll
+/// backstop). Runs forever; usable standalone (`sconce worker`) or spawned
+/// in-process by `sconce serve`.
+async fn run_worker_loop(
+    catalog: sconce_catalog::Catalog,
+    store: sconce_cas::FsBlobStore,
+    key: Option<sconce_catalog::secret::SecretKey>,
+    database_url: String,
+) -> Result<()> {
+    use std::time::Duration;
+
+    /// Give up after this many attempts; back off exponentially before then.
+    const MAX_ATTEMPTS: i32 = 5;
+    /// Re-scan even without a NOTIFY, to catch retries whose backoff elapsed and
+    /// any missed notifications.
+    const POLL: Duration = Duration::from_secs(30);
+
+    {
+        let mut listener = sqlx::postgres::PgListener::connect(&database_url)
+            .await
+            .context("opening LISTEN connection")?;
+        listener
+            .listen("mirror_jobs")
+            .await
+            .context("LISTEN mirror_jobs")?;
+        println!("worker: ready (LISTEN mirror_jobs, poll {POLL:?})");
+
+        loop {
+            // Drain everything currently claimable before going back to sleep.
+            while let Some(job) = catalog.claim_mirror_job().await.context("claiming job")? {
+                println!("worker: {} (attempt {})", job.kind, job.attempts);
+                let outcome = run_job(&catalog, &store, key.as_ref(), &job).await;
+                match outcome {
+                    Ok(summary) => {
+                        catalog.complete_mirror_job(job.id).await.context("complete")?;
+                        println!("worker: {} ready — {summary}", job.kind);
+                    }
+                    Err(msg) => {
+                        if job.attempts < MAX_ATTEMPTS {
+                            // 10s, 20s, 40s, … capped at 10 min.
+                            let backoff = (10.0 * 2f64.powi(job.attempts - 1)).min(600.0);
+                            catalog
+                                .retry_mirror_job(job.id, backoff, &msg)
+                                .await
+                                .context("reschedule")?;
+                            eprintln!(
+                                "worker: {} failed (attempt {}), retrying in {backoff}s: {msg}",
+                                job.kind, job.attempts
+                            );
+                        } else {
+                            catalog.fail_mirror_job(job.id, &msg).await.context("fail")?;
+                            eprintln!(
+                                "worker: {} failed permanently after {} attempts: {msg}",
+                                job.kind, job.attempts
+                            );
+                        }
+                    }
+                }
+            }
+            // Idle: wake on the next NOTIFY or after the poll interval.
+            tokio::select! {
+                res = listener.recv() => {
+                    if let Err(e) = res {
+                        eprintln!("worker: listen error, backing off: {e}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+                () = tokio::time::sleep(POLL) => {}
+            }
+        }
     }
 }
 
@@ -438,6 +1337,111 @@ fn org_create(slug: &str, name: Option<&str>, database_url: &str) -> Result<()> 
     })
 }
 
+fn org_settings(
+    org: &str,
+    allow_raw_tokens: Option<bool>,
+    max_token_ttl_days: Option<i64>,
+    database_url: &str,
+) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let org_id = catalog
+            .list_organizations()
+            .await
+            .context("listing orgs")?
+            .into_iter()
+            .find(|o| o.slug == org)
+            .with_context(|| format!("no such org: {org}"))?
+            .id;
+        let mut cfg = catalog
+            .org_settings(org_id)
+            .await
+            .context("loading settings")?;
+        // Apply only the flags that were given; otherwise show/leave current.
+        let changed = allow_raw_tokens.is_some() || max_token_ttl_days.is_some();
+        if let Some(v) = allow_raw_tokens {
+            cfg.allow_raw_tokens = v;
+        }
+        if let Some(d) = max_token_ttl_days {
+            // 0 clears the cap; any positive value sets it.
+            cfg.max_token_ttl_days = (d > 0).then_some(d);
+        }
+        if changed {
+            catalog
+                .set_org_settings(org_id, cfg)
+                .await
+                .context("saving settings")?;
+        }
+        let ttl = cfg
+            .max_token_ttl_days
+            .map_or_else(|| "no limit".to_owned(), |d| format!("{d} day(s)"));
+        println!("org {org} settings:");
+        println!("  allow_raw_tokens   = {}", cfg.allow_raw_tokens);
+        println!("  max_token_ttl_days = {ttl}");
+        Ok(())
+    })
+}
+
+fn repo_settings(
+    repo: &str,
+    allow_raw_tokens: Option<RawTokenOverride>,
+    max_token_ttl_days: Option<i64>,
+    allow_private_packages: Option<bool>,
+    database_url: &str,
+) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let mut cfg = catalog
+            .repo_settings(repo_id)
+            .await
+            .context("loading repo settings")?;
+        let changed = allow_raw_tokens.is_some()
+            || max_token_ttl_days.is_some()
+            || allow_private_packages.is_some();
+        if let Some(ov) = allow_raw_tokens {
+            cfg.allow_raw_tokens = match ov {
+                RawTokenOverride::Inherit => None,
+                RawTokenOverride::Allow => Some(true),
+                RawTokenOverride::Deny => Some(false),
+            };
+        }
+        if let Some(d) = max_token_ttl_days {
+            // 0 clears the override (inherit); positive sets it.
+            cfg.max_token_ttl_days = (d > 0).then_some(d);
+        }
+        if let Some(v) = allow_private_packages {
+            cfg.allow_private_packages = v;
+        }
+        if changed {
+            catalog
+                .set_repo_settings(repo_id, cfg)
+                .await
+                .context("saving repo settings")?;
+        }
+        // Show both the override and the effective (combined) policy.
+        let effective = catalog
+            .effective_token_policy(repo_id)
+            .await
+            .context("computing effective policy")?;
+        let show_bool = |b: Option<bool>| match b {
+            None => "inherit".to_owned(),
+            Some(true) => "allow".to_owned(),
+            Some(false) => "deny".to_owned(),
+        };
+        let show_ttl = |d: Option<i64>| d.map_or_else(|| "inherit".to_owned(), |d| format!("{d}"));
+        let eff_ttl = effective
+            .max_token_ttl_days
+            .map_or_else(|| "no limit".to_owned(), |d| format!("{d} day(s)"));
+        println!("repo {repo} overrides:");
+        println!("  allow_raw_tokens       = {}", show_bool(cfg.allow_raw_tokens));
+        println!("  max_token_ttl_days     = {}", show_ttl(cfg.max_token_ttl_days));
+        println!("  allow_private_packages = {}", cfg.allow_private_packages);
+        println!("effective policy:");
+        println!("  allow_raw_tokens   = {}", effective.allow_raw_tokens);
+        println!("  max_token_ttl_days = {eff_ttl}");
+        Ok(())
+    })
+}
+
 fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         catalog
@@ -463,10 +1467,123 @@ fn user_create(email: &str, password: &str, superadmin: bool, database_url: &str
     })
 }
 
-fn user_grant(email: &str, tenant: &str, database_url: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn ci_policy_add(
+    repo: &str,
+    provider: &str,
+    issuer: &str,
+    audience: &str,
+    claims: &[(String, String)],
+    ttl_secs: i64,
+    database_url: &str,
+) -> Result<()> {
+    let claims_json = serde_json::Value::Object(
+        claims
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect(),
+    );
     with_catalog(database_url, async |catalog| {
-        if catalog.add_user_to_tenant(email, tenant).await? {
-            println!("granted {email} access to tenant {tenant}");
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let id = catalog
+            .add_ci_policy(repo_id, provider, issuer, audience, &claims_json, ttl_secs)
+            .await
+            .context("adding CI policy")?;
+        println!("CI policy added: {id}");
+        Ok(())
+    })
+}
+
+fn ci_policy_list(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        for p in catalog.ci_policies(repo_id).await.context("listing CI policies")? {
+            println!(
+                "{}  [{}]  iss={} aud={} ttl={}s  claims={}",
+                p.id, p.provider, p.issuer, p.audience, p.token_ttl_secs, p.claims
+            );
+        }
+        Ok(())
+    })
+}
+
+fn scim_token(org: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        match catalog.create_scim_token(org).await.context("creating SCIM token")? {
+            Some(token) => {
+                println!("{token}");
+                eprintln!(
+                    "SCIM token for org {org} — store it now (shown once). SCIM base URL: \
+                     <ui-base>/scim/v2"
+                );
+                Ok(())
+            }
+            None => anyhow::bail!("no such org: {org}"),
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn oidc_config(
+    org: Option<&str>,
+    issuer: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    redirect_url: &str,
+    scopes: &str,
+    allowed_domains: Option<&str>,
+    admin_domains: Option<&str>,
+    database_url: &str,
+) -> Result<()> {
+    // Encrypt the client secret (if any) before storing.
+    let ciphertext = match client_secret {
+        None => None,
+        Some(s) => {
+            let key = sconce_catalog::secret::SecretKey::from_env()
+                .context("a client secret was given but SCONCE_SECRET_KEY is not set")?;
+            Some(key.encrypt(s.as_bytes()))
+        }
+    };
+    let split = |s: Option<&str>| {
+        s.map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+    };
+    let conn = sconce_catalog::OidcConnection {
+        id: uuid::Uuid::nil(),
+        org_slug: org.map(ToOwned::to_owned),
+        issuer_url: issuer.to_owned(),
+        client_id: client_id.to_owned(),
+        client_secret: ciphertext,
+        redirect_url: redirect_url.to_owned(),
+        scopes: scopes.to_owned(),
+        allowed_domains: split(allowed_domains),
+        admin_domains: split(admin_domains),
+    };
+    with_catalog(database_url, async |catalog| {
+        catalog
+            .set_oidc_connection(org, &conn)
+            .await
+            .context("saving OIDC connection")?;
+        let scope = org.map_or_else(|| "instance default".to_owned(), |o| format!("org {o}"));
+        println!("OIDC connection configured ({scope}, issuer {issuer}). Redirect: {redirect_url}");
+        Ok(())
+    })
+}
+
+fn user_grant(email: &str, tenant: &str, role: &str, database_url: &str) -> Result<()> {
+    let role = match role {
+        "admin" => "admin",
+        "member" => "member",
+        other => anyhow::bail!("role must be 'member' or 'admin', got '{other}'"),
+    };
+    with_catalog(database_url, async |catalog| {
+        if catalog.add_user_to_tenant(email, tenant, role).await? {
+            println!("granted {email} {role} of tenant {tenant}");
             Ok(())
         } else {
             anyhow::bail!("unknown user or tenant ({email} / {tenant})")
@@ -567,11 +1684,16 @@ fn version_action(
     })
 }
 
-fn token_create(repo: &str, label: Option<&str>, database_url: &str) -> Result<()> {
+fn token_create(
+    repo: &str,
+    label: Option<&str>,
+    expires_days: Option<i64>,
+    database_url: &str,
+) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
         let token = catalog
-            .create_token(repo_id, label)
+            .create_token(repo_id, label, expires_days)
             .await
             .context("creating token")?;
         // The token itself goes to stdout (scriptable); the notice to stderr.
@@ -581,11 +1703,53 @@ fn token_create(repo: &str, label: Option<&str>, database_url: &str) -> Result<(
     })
 }
 
+fn token_list(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let tokens = catalog.list_tokens(repo_id).await.context("listing tokens")?;
+        if tokens.is_empty() {
+            eprintln!("No tokens for {repo}.");
+        }
+        for t in tokens {
+            let label = t.label.as_deref().unwrap_or("-");
+            let expires = match (t.expires.as_deref(), t.expired) {
+                (Some(d), true) => format!("expired {d}"),
+                (Some(d), false) => format!("expires {d}"),
+                (None, _) => "never expires".to_owned(),
+            };
+            let last = t.last_used.as_deref().unwrap_or("never used");
+            println!("{}  {label}  [{}]  ({expires}; {last})", t.id, t.origin);
+        }
+        Ok(())
+    })
+}
+
+fn token_revoke(repo: &str, id: uuid::Uuid, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        if catalog
+            .revoke_token(repo_id, id)
+            .await
+            .context("revoking token")?
+        {
+            eprintln!("Revoked token {id} from {repo}.");
+            Ok(())
+        } else {
+            anyhow::bail!("no such token {id} in {repo}")
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn serve(
     cas: &Path,
     database_url: &str,
     listen: std::net::SocketAddr,
     base_url: String,
+    no_worker: bool,
+    ui_listen: Option<std::net::SocketAddr>,
+    single_tenant: bool,
+    admin_password: Option<String>,
 ) -> Result<()> {
     use sconce_cas::FsBlobStore;
     use sconce_catalog::Catalog;
@@ -598,6 +1762,37 @@ fn serve(
             .await
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
+
+        // In-process worker (the single-binary story); disable with --no-worker
+        // when running a dedicated `sconce worker` instead.
+        if no_worker {
+            println!("worker: disabled (--no-worker)");
+        } else {
+            let wcat = catalog.clone();
+            let wstore = store.clone();
+            let durl = database_url.to_owned();
+            let key = sconce_catalog::secret::SecretKey::from_env().ok();
+            tokio::spawn(async move {
+                if let Err(e) = run_worker_loop(wcat, wstore, key, durl).await {
+                    eprintln!("worker loop exited: {e:#}");
+                }
+            });
+        }
+
+        // Optional in-process admin UI on its own port.
+        if let Some(ui_addr) = ui_listen {
+            let ucat = catalog.clone();
+            let ubase = base_url.clone();
+            let apw = admin_password;
+            tokio::spawn(async move {
+                println!("sconce admin UI on http://{ui_addr}");
+                if let Err(e) =
+                    sconce_server::ui::serve(ucat, ubase, single_tenant, apw, ui_addr).await
+                {
+                    eprintln!("ui server exited: {e}");
+                }
+            });
+        }
 
         println!("sconce serving on http://{listen} (base url: {base_url})");
         sconce_server::serve(catalog, store, base_url, listen)

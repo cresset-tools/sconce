@@ -17,9 +17,15 @@ serde_json = { workspace = true }
 sha1 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+# Fetching Composer-repo metadata + dist zips (composer-kind upstreams).
+ureq = { workspace = true }
+# Filtering available-packages for whole-registry mirroring.
+regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Test-only: an advisory-lock guard to serialize the global job-queue tests.
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

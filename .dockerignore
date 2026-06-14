@@ -1,0 +1,6 @@
+/target
+/.git
+.env
+.vs/
+ROADMAP.md
+SSO_PLAN.md

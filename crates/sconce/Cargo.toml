@@ -26,9 +26,13 @@ sconce-mirror = { workspace = true }
 sconce-server = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-tokio = { workspace = true }
+# `macros` for tokio::select! and `time` for the worker's poll backstop.
+tokio = { workspace = true, features = ["macros", "time"] }
 uuid = { workspace = true }
+serde_json = { workspace = true }
 dotenvy = { workspace = true }
+# Direct use of PgListener for the worker's LISTEN/NOTIFY wait.
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

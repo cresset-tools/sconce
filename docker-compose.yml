@@ -1,0 +1,46 @@
+# `docker compose up` → a working single-tenant sconce:
+#   wire API  http://localhost:8080
+#   admin UI  http://localhost:8081  (password = SCONCE_ADMIN_PASSWORD)
+# Configure via the environment (12-factor); see `.env.example`.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: sconce
+      POSTGRES_DB: sconce
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  sconce:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:sconce@db:5432/sconce
+      # Gates the admin UI in single-tenant mode. Change this.
+      SCONCE_ADMIN_PASSWORD: ${SCONCE_ADMIN_PASSWORD:-change-me}
+      # base64 of 32 bytes; required only to store *private* upstream credentials
+      # (e.g. `openssl rand -base64 32`). Public mirroring needs no key.
+      SCONCE_SECRET_KEY: ${SCONCE_SECRET_KEY:-}
+    command:
+      - serve
+      - --cas=/var/lib/sconce/cas
+      - --listen=0.0.0.0:8080
+      - --ui-listen=0.0.0.0:8081
+      - --single-tenant
+      - --base-url=http://localhost:8080
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - cas:/var/lib/sconce/cas
+
+volumes:
+  pgdata:
+  cas:
