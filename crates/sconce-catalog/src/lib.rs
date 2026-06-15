@@ -553,6 +553,14 @@ pub struct PackageVersion {
     pub source_reference: Option<String>,
 }
 
+/// Shared WHERE fragment for the admin package-version list/count: `$2` = name
+/// (`ilike`, null = any), `$3` = state (`held`|`yanked`|`approved`, null = any).
+const VERSION_FILTER: &str = " and ($2::text is null or p.name ilike '%' || $2 || '%') \
+     and ($3::text is null \
+          or ($3 = 'held' and pv.held_at is not null) \
+          or ($3 = 'yanked' and pv.yanked_at is not null) \
+          or ($3 = 'approved' and pv.approved_at is not null))";
+
 impl Catalog {
     /// Connect to Postgres at `database_url` (e.g.
     /// `postgres://user:pass@host:5432/db`).
@@ -940,13 +948,21 @@ impl Catalog {
     /// Every version of every package **owned** by a repo, with control state —
     /// the admin view (unlike `visible_versions`, it ignores policy/holds so the
     /// operator can see and act on everything).
-    /// Total package-versions in a repo (for the Packages & versions paginator).
-    pub async fn count_package_versions(&self, repo_id: Uuid) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(
+    /// Total package-versions in a repo matching the optional name (`ilike`) and
+    /// state (`held`|`yanked`|`approved`) filters — for the paginator.
+    pub async fn count_package_versions(
+        &self,
+        repo_id: Uuid,
+        name: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(&format!(
             "select count(*) from package_versions pv \
-             join packages p on p.id = pv.package_id where p.repo_id = $1",
-        )
+             join packages p on p.id = pv.package_id where p.repo_id = $1 {VERSION_FILTER}"
+        ))
         .bind(repo_id)
+        .bind(name)
+        .bind(state)
         .fetch_one(&self.pool)
         .await
     }
@@ -956,8 +972,10 @@ impl Catalog {
         repo_id: Uuid,
         limit: i64,
         offset: i64,
+        name: Option<&str>,
+        state: Option<&str>,
     ) -> Result<Vec<AdminVersion>, sqlx::Error> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "select p.name as package, pv.version, pv.normalized_version, pv.stability, \
                     (pv.held_at is not null) as held, (pv.approved_at is not null) as approved, \
                     (pv.yanked_at is not null) as yanked, \
@@ -969,11 +987,13 @@ impl Catalog {
              from package_versions pv \
              join packages p on p.id = pv.package_id \
              join repositories r on r.id = $1 \
-             where p.repo_id = $1 \
+             where p.repo_id = $1 {VERSION_FILTER} \
              order by p.name, pv.normalized_version \
-             limit $2 offset $3",
-        )
+             limit $4 offset $5"
+        ))
         .bind(repo_id)
+        .bind(name)
+        .bind(state)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -3425,7 +3445,7 @@ mod tests {
         // ~7 days to go. (We set this repo's policy so admin_package_versions
         // computes against the real cooldown_days.)
         cat.set_update_policy(repo_id, "delayed", 7).await.unwrap();
-        let av = cat.admin_package_versions(repo_id, 1000, 0).await.unwrap();
+        let av = cat.admin_package_versions(repo_id, 1000, 0, None, None).await.unwrap();
         let old = av.iter().find(|v| v.normalized_version == "1.0.0.0").unwrap();
         let fresh = av.iter().find(|v| v.normalized_version == "1.1.0.0").unwrap();
         assert_eq!(old.cooldown_days_left, Some(0), "30-day-old is past cooldown");

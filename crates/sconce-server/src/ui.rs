@@ -390,20 +390,28 @@ fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
 }
 
 /// "Showing X–Y of N {noun}" with prev/next links (hidden when it fits on one
-/// page, per the design). `base` is the page URL; pagination uses `?page=`.
-fn paginator(noun: &str, total: i64, page: i64, per_page: i64, base: &str) -> String {
+/// page). `base` is the page URL; `extra` is a pre-encoded query string (e.g.
+/// `q=foo&state=held`) preserved across pages, or empty.
+fn paginator(noun: &str, total: i64, page: i64, per_page: i64, base: &str, extra: &str) -> String {
     let last_page = ((total + per_page - 1) / per_page).max(1);
     let page = page.clamp(1, last_page);
     let from = if total == 0 { 0 } else { (page - 1) * per_page + 1 };
     let to = (page * per_page).min(total);
+    let link = |pg: i64| {
+        if extra.is_empty() {
+            format!("{base}?page={pg}")
+        } else {
+            format!("{base}?{extra}&page={pg}")
+        }
+    };
     let mut controls = String::new();
     if last_page > 1 {
         if page > 1 {
-            let _ = write!(controls, "<a href=\"{base}?page={}\">&lsaquo; Prev</a>", page - 1);
+            let _ = write!(controls, "<a href=\"{}\">&lsaquo; Prev</a>", link(page - 1));
         }
         let _ = write!(controls, "<span class=muted>Page {page} of {last_page}</span>");
         if page < last_page {
-            let _ = write!(controls, "<a href=\"{base}?page={}\">Next &rsaquo;</a>", page + 1);
+            let _ = write!(controls, "<a href=\"{}\">Next &rsaquo;</a>", link(page + 1));
         }
     }
     format!("<div class=pager><span class=muted>Showing {from}&ndash;{to} of {total} {noun}</span>{controls}</div>")
@@ -2024,6 +2032,24 @@ async fn create_repo(
 #[derive(Deserialize)]
 struct PageQuery {
     page: Option<i64>,
+    /// Package-name search (substring).
+    q: Option<String>,
+    /// State filter: `held` | `yanked` | `approved`.
+    state: Option<String>,
+}
+
+/// Percent-encode a query-string value (RFC 3986 unreserved set kept as-is).
+fn urlencode(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_lines)] // one big page builder; clearer kept together
@@ -2033,15 +2059,25 @@ async fn repo_page(
     Path((org, repo)): Path<(String, String)>,
     Query(q): Query<PageQuery>,
 ) -> Result<Html<String>, StatusCode> {
-    // Paginate the (potentially long) packages & versions list.
+    // Paginate the (potentially long) packages & versions list, with optional
+    // name search + state filter.
     const PER_PAGE: i64 = 50;
     let summary = lookup(&s, &user, &org, &repo).await?;
-    let total_versions = s.catalog.count_package_versions(summary.id).await.map_err(e500)?;
+    let name_q = q.q.as_deref().map(str::trim).filter(|x| !x.is_empty());
+    let state_q = q
+        .state
+        .as_deref()
+        .filter(|x| matches!(*x, "held" | "yanked" | "approved"));
+    let total_versions = s
+        .catalog
+        .count_package_versions(summary.id, name_q, state_q)
+        .await
+        .map_err(e500)?;
     let last_page = ((total_versions + PER_PAGE - 1) / PER_PAGE).max(1);
     let page = q.page.unwrap_or(1).clamp(1, last_page);
     let versions = s
         .catalog
-        .admin_package_versions(summary.id, PER_PAGE, (page - 1) * PER_PAGE)
+        .admin_package_versions(summary.id, PER_PAGE, (page - 1) * PER_PAGE, name_q, state_q)
         .await
         .map_err(e500)?;
     let tokens = s.catalog.list_tokens(summary.id).await.map_err(e500)?;
@@ -2120,13 +2156,48 @@ async fn repo_page(
             rel = esc(v.released_at.as_deref().unwrap_or("")),
         );
     }
-    if versions.is_empty() && total_versions == 0 {
-        rows = "<tr><td colspan=5 class=muted>No packages yet. Mirror one with <code>sconce mirror</code>.</td></tr>".into();
+    if versions.is_empty() {
+        let why = if name_q.is_some() || state_q.is_some() {
+            "No versions match the filter."
+        } else {
+            "No packages yet. Mirror one with <code>sconce mirror</code>."
+        };
+        rows = format!("<tr><td colspan=5 class=muted>{why}</td></tr>");
+    }
+    // Search + state-filter toolbar (GET; preserved across pages).
+    let chip = |val: &str, label: &str| {
+        let on = state_q == Some(val) || (val.is_empty() && state_q.is_none());
+        let cls = if on { "badge violet" } else { "badge" };
+        let qs = if val.is_empty() { String::new() } else { format!("&state={val}") };
+        let qpart = name_q.map_or(String::new(), |n| format!("q={}", urlencode(n)));
+        format!("<a href=\"/r/{slug}?{qpart}{qs}\" class='{cls}' style=text-decoration:none>{label}</a> ")
+    };
+    let search_q = name_q.map_or(String::new(), esc);
+    let filter_bar = format!(
+        "<form class=inline method=get action=\"/r/{slug}\" style=\"margin:.2rem 0 .6rem\">\
+         <input name=q value=\"{search_q}\" placeholder=\"search packages\" style=width:14em> \
+         <button>Search</button></form> \
+         <span class=muted style=font-size:12px>{all}{held}{yanked}{approved}</span>",
+        all = chip("", "all"),
+        held = chip("held", "held"),
+        yanked = chip("yanked", "yanked"),
+        approved = chip("approved", "approved"),
+    );
+    // Query string to preserve filters across pagination.
+    let mut extra = String::new();
+    if let Some(n) = name_q {
+        let _ = write!(extra, "q={}", urlencode(n));
+    }
+    if let Some(st) = state_q {
+        if !extra.is_empty() {
+            extra.push('&');
+        }
+        let _ = write!(extra, "state={st}");
     }
     let pager = if total_versions == 0 {
         String::new()
     } else {
-        paginator("versions", total_versions, page, PER_PAGE, &format!("/r/{slug}"))
+        paginator("versions", total_versions, page, PER_PAGE, &format!("/r/{slug}"), &extra)
     };
 
     // Package health: only the actionable ones (broken or archived). Already-
@@ -2516,7 +2587,7 @@ composer config --auth http-basic.{host} token \"$TOKEN\"</pre>"
              <a class=muted style=\"font-size:.85rem\" href=\"/r/{slug}/settings\">settings</a></div>\
              {attention_banner}<p class=summary>{summary}</p>{install_hero}\
              {ro_open}{policy}\
-             <h2>Packages &amp; versions</h2><table>\
+             <h2>Packages &amp; versions</h2>{filter_bar}<table>\
              <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}\
              {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{tokens_section}{ci_section}{ro_close}"
         ),
