@@ -1824,6 +1824,7 @@ async fn remove_member(
 
 // ----- index + org/repo creation -----
 
+#[allow(clippy::too_many_lines)] // page builder; clearer kept together
 async fn index(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
@@ -1897,6 +1898,34 @@ async fn index(
                 rp = esc(&r.repo),
                 mode = esc(&r.update_mode),
                 cd = r.cooldown_days,
+            );
+        }
+        body.push_str("</table>");
+    }
+
+    // Recent activity (B2): a compact roll-up of the latest mirror jobs.
+    let scoped: Vec<Uuid> = user.tenants.iter().copied().collect();
+    let org_ids = if s.single_tenant || user.is_superadmin {
+        None
+    } else {
+        Some(scoped.as_slice())
+    };
+    let jobs = s.catalog.recent_jobs(6, org_ids).await.map_err(e500)?;
+    if !jobs.is_empty() {
+        body.push_str("<h2>Recent activity <a class=muted style=\"font-size:.75rem\" href=/activity>view all</a></h2><table><tr><th>Status</th><th>Job</th><th>Target</th><th>When</th></tr>");
+        for j in &jobs {
+            let badge = match j.status.as_str() {
+                "ready" => "<span class='badge ok'>ready</span>",
+                "running" => "<span class='badge blue'>running</span>",
+                "failed" => "<span class='badge held'>failed</span>",
+                _ => "<span class='badge slate'>queued</span>",
+            };
+            let _ = write!(
+                body,
+                "<tr><td>{badge}</td><td class=muted>{kind}</td><td class=mono>{target}</td><td class=muted>{when}</td></tr>",
+                kind = esc(&j.kind),
+                target = esc(&j.target),
+                when = esc(&j.updated),
             );
         }
         body.push_str("</table>");
