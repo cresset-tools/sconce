@@ -105,6 +105,8 @@ pub fn router(
         .route("/activity", get(activity_page))
         .route("/users/grant", post(grant_tenant))
         .route("/orgs", post(create_org))
+        .route("/orgs/new", get(new_org_page))
+        .route("/repos/new", get(new_repo_page))
         .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
         .route("/o/{org}/rename", post(rename_org_action))
         .route("/o/{org}/oidc", post(save_oidc))
@@ -338,6 +340,9 @@ text-transform:uppercase;letter-spacing:.06em;margin:18px 0}\
 .authsep::before,.authsep::after{content:'';flex:1;height:1px;background:var(--border)}\
 .errbanner{padding:.55rem .75rem;border-radius:8px;font-size:12.5px;background:#fceae7;color:#a82c20;\
 border:1px solid #f4cfc8;margin-bottom:13px;text-align:center}\
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}\
+.toolbar h1{margin:0}\
+.toolbar a{text-decoration:none}\
 ";
 
 /// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
@@ -871,12 +876,17 @@ struct RenameForm {
 }
 
 /// Render a rename failure (taken/retired) with the reason and a back link.
-fn rename_failed(s: &Ui, user: &CurrentUser, back: &str, msg: &str) -> Response {
+/// A simple error page: title + an amber banner message + a back link.
+fn error_card(s: &Ui, user: &CurrentUser, title: &str, msg: &str, back: &str) -> Response {
     let body = format!(
-        "<h1>Rename failed</h1><p class=banner>{}</p><p><a href=\"{back}\">← back</a></p>",
+        "<h1>{title}</h1><p class=banner>{}</p><p><a href=\"{back}\">← back</a></p>",
         esc(msg)
     );
-    shell(s, user, "Rename failed", &body).into_response()
+    shell(s, user, title, &body).into_response()
+}
+
+fn rename_failed(s: &Ui, user: &CurrentUser, back: &str, msg: &str) -> Response {
+    error_card(s, user, "Rename failed", msg, back)
 }
 
 async fn rename_repo_action(
@@ -1658,10 +1668,25 @@ async fn index(
         .collect();
     let broken_for = |repo_id: Uuid| attention.iter().find(|(id, _)| *id == repo_id).map(|(_, n)| *n);
 
-    let mut body = String::from("<h1>Organizations &amp; repositories</h1>");
+    let can_create_repo = orgs.iter().any(|o| user.can_admin(o.id));
+    let new_org_btn = if user.is_superadmin {
+        "<a href=/orgs/new><button>New organization</button></a> "
+    } else {
+        ""
+    };
+    let new_repo_btn = if can_create_repo {
+        "<a href=/repos/new><button class=primary>＋ New repository</button></a>"
+    } else {
+        ""
+    };
+    let mut body = format!(
+        "<div class=toolbar><h1>Repositories</h1><div>{new_org_btn}{new_repo_btn}</div></div>"
+    );
     let visible: Vec<_> = orgs.iter().filter(|o| user.can(o.id)).collect();
     if visible.is_empty() {
-        body.push_str("<p class=muted>No tenants you can access yet.</p>");
+        body.push_str(
+            "<p class=muted>No organizations you can access yet.</p>",
+        );
     }
     for o in &visible {
         let label = o
@@ -1678,7 +1703,12 @@ async fn index(
         );
         let org_repos: Vec<_> = repos.iter().filter(|r| r.org_id == o.id).collect();
         if org_repos.is_empty() {
-            body.push_str("<p class=muted>No repositories yet — add one below.</p>");
+            let cta = if user.can_admin(o.id) {
+                " — <a href=/repos/new>create one</a>"
+            } else {
+                ""
+            };
+            let _ = write!(body, "<p class=muted>No repositories yet{cta}.</p>");
             continue;
         }
         body.push_str(
@@ -1700,20 +1730,70 @@ async fn index(
         }
         body.push_str("</table>");
     }
-
-    // Only superadmins (incl. single-tenant all-access) create orgs.
-    if user.is_superadmin {
-        body.push_str(
-            "<h2>Create</h2>\
-            <form class=row method=post action=/orgs>org slug <input name=slug required> \
-            name <input name=name> <button>Create org</button></form>",
-        );
-    }
-    body.push_str(
-        "<form class=row method=post action=/repos>org <input name=org required> \
-         repo <input name=repo required> <button>Create repo</button></form>",
-    );
     Ok(shell(&s, &user, "Repositories", &body))
+}
+
+/// The "New repository" screen: pick an org you administer + a name.
+async fn new_repo_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Html<String>, StatusCode> {
+    let orgs = s.catalog.list_organizations().await.map_err(e500)?;
+    let admin_orgs: Vec<_> = orgs.iter().filter(|o| user.can_admin(o.id)).collect();
+    if admin_orgs.is_empty() {
+        let hint = if user.is_superadmin {
+            "<p><a href=/orgs/new>Create an organization</a> first.</p>"
+        } else {
+            "<p class=muted>You don't administer any organization yet — ask an org admin.</p>"
+        };
+        return Ok(shell(
+            &s,
+            &user,
+            "New repository",
+            &format!("<h1>New repository</h1>{hint}<p><a href=/>← back</a></p>"),
+        ));
+    }
+    let mut options = String::new();
+    for o in &admin_orgs {
+        let _ = write!(options, "<option value=\"{sl}\">{sl}</option>", sl = esc(&o.slug));
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "New repository",
+        &format!(
+            "<h1>New repository</h1>\
+             <p class=muted>A repository serves a Composer registry — mirror packages into it, gate \
+             versions by policy, and hand out install tokens.</p>\
+             <form class=row method=post action=/repos>\
+             <p>Organization <select name=org required>{options}</select></p>\
+             <p>Repository name <input name=repo placeholder=\"e.g. web\" required></p>\
+             <button class=primary>Create repository</button></form>\
+             <p><a href=/>← cancel</a></p>"
+        ),
+    ))
+}
+
+/// The "New organization" screen (superadmin).
+async fn new_org_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Html<String>, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "New organization",
+        "<h1>New organization</h1>\
+         <p class=muted>An organization (tenant) owns repositories, members, and its own SSO.</p>\
+         <form class=row method=post action=/orgs>\
+         <p>Slug <input name=slug placeholder=\"acme\" required> <span class=muted>(used in URLs)</span></p>\
+         <p>Display name <input name=name placeholder=\"Acme Inc\"></p>\
+         <button class=primary>Create organization</button></form>\
+         <p><a href=/>← cancel</a></p>",
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1726,17 +1806,23 @@ async fn create_org(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
     Form(f): Form<OrgForm>,
-) -> Result<Redirect, StatusCode> {
+) -> Result<Response, StatusCode> {
     if !user.is_superadmin {
         return Err(StatusCode::FORBIDDEN);
     }
     // A retired slug can never be re-registered (it still redirects elsewhere).
     if s.catalog.org_slug_retired(f.slug.trim()).await.map_err(e500)? {
-        return Err(StatusCode::CONFLICT);
+        return Ok(error_card(
+            &s,
+            &user,
+            "Couldn't create organization",
+            "That name was previously used and is permanently retired.",
+            "/orgs/new",
+        ));
     }
     let name = f.name.as_deref().filter(|n| !n.is_empty());
     s.catalog.create_org(&f.slug, name).await.map_err(e500)?;
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/").into_response())
 }
 
 #[derive(Deserialize)]
@@ -1749,7 +1835,7 @@ async fn create_repo(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
     Form(f): Form<RepoForm>,
-) -> Result<Redirect, StatusCode> {
+) -> Result<Response, StatusCode> {
     // Must have access to the target org.
     let org = s
         .catalog
@@ -1764,13 +1850,19 @@ async fn create_repo(
     }
     // A retired repo slug can't be reused (it still redirects).
     if s.catalog.repo_slug_retired(org.id, f.repo.trim()).await.map_err(e500)? {
-        return Err(StatusCode::CONFLICT);
+        return Ok(error_card(
+            &s,
+            &user,
+            "Couldn't create repository",
+            "That name was previously used in this organization and is retired.",
+            "/repos/new",
+        ));
     }
     s.catalog
         .create_repo(&f.org, &f.repo)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Redirect::to(&format!("/r/{}/{}", f.org, f.repo)))
+    Ok(Redirect::to(&format!("/r/{}/{}", f.org, f.repo)).into_response())
 }
 
 // ----- repository detail -----
