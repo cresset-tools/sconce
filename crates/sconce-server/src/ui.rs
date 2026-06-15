@@ -316,6 +316,20 @@ background:var(--surface);border-bottom:1px solid var(--border);position:sticky;
 .content h1:first-child{margin-top:0}\
 .pager{display:flex;align-items:center;gap:12px;font-size:12px;margin:-.4rem 0 1.2rem}\
 .pager a{font-weight:600}\
+.authwrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--bg)}\
+.authcard{width:100%;max-width:380px;background:var(--surface);border:1px solid var(--border);\
+border-radius:14px;box-shadow:0 4px 24px rgba(20,23,28,.06);padding:30px 28px}\
+.authcard .brand{justify-content:center;margin-bottom:6px}\
+.authcard h1{font-size:18px;font-weight:650;text-align:center;margin:.4rem 0 1.3rem}\
+.authform{display:flex;flex-direction:column;gap:11px}\
+.authform label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px}\
+.authform input{width:100%;height:34px}\
+.authcard button{width:100%;justify-content:center;height:36px;font-size:13px}\
+.authsep{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px;\
+text-transform:uppercase;letter-spacing:.06em;margin:18px 0}\
+.authsep::before,.authsep::after{content:'';flex:1;height:1px;background:var(--border)}\
+.errbanner{padding:.55rem .75rem;border-radius:8px;font-size:12.5px;background:#fceae7;color:#a82c20;\
+border:1px solid #f4cfc8;margin-bottom:13px;text-align:center}\
 ";
 
 /// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
@@ -333,17 +347,6 @@ fn doc(title: &str, inner: &str) -> Html<String> {
          <title>{title} · Bougie Repo</title>\
          <style>{STYLE}</style></head><body>{inner}</body></html>"
     ))
-}
-
-/// A standalone page with no app chrome (sign-in): brand bar + centered body.
-fn page(title: &str, body: &str) -> Html<String> {
-    doc(
-        title,
-        &format!(
-            "<header class=appbar><a class=brand href=/><span class=brandmark>{MARK_SVG}</span> \
-             <span>Bougie Repo</span></a></header><main class=wrap>{body}</main>"
-        ),
-    )
 }
 
 /// An authenticated app page, wrapped in the sidebar `AppShell` (left nav + top
@@ -790,29 +793,44 @@ async fn save_repo_settings(
 
 // ----- login -----
 
+/// A centered sign-in card (brand + `inner`), full-viewport, no app chrome.
+fn auth_page(title: &str, inner: &str) -> Html<String> {
+    doc(
+        title,
+        &format!(
+            "<div class=authwrap><div class=authcard>\
+               <a class=brand href=/><span class=brandmark>{MARK_SVG}</span> <span>Bougie Repo</span></a>\
+               {inner}</div></div>"
+        ),
+    )
+}
+
 async fn login_form(State(s): State<Ui>) -> Html<String> {
     // Offer SSO if any connection exists: a direct button for the instance
     // default, and an email box that routes org domains to their own IdP.
     let mut sso = String::new();
     if s.catalog.oidc_configured().await.unwrap_or(false) {
+        sso.push_str("<div class=authsep>or</div>");
         if matches!(s.catalog.oidc_connection().await, Ok(Some(_))) {
             sso.push_str(
-                "<p><a href=\"/auth/start\"><button type=button>Sign in with SSO</button></a></p>",
+                "<a href=\"/auth/start\"><button type=button>Sign in with SSO</button></a>",
             );
         }
         sso.push_str(
-            "<form method=post action=/auth/route>\
-             <p>or organization email <input name=email type=email> \
-             <button>Continue with SSO</button></p></form><hr>",
+            "<form class=authform method=post action=/auth/route style=\"margin-top:11px\">\
+             <div><label>Organization email</label>\
+             <input name=email type=email placeholder=\"you@company.com\"></div>\
+             <button type=submit>Continue with SSO</button></form>",
         );
     }
-    page(
+    auth_page(
         "Sign in",
         &format!(
-            "<h1>Sign in</h1>{sso}<form method=post action=/login>\
-             <p>email <input name=email type=email required></p>\
-             <p>password <input name=password type=password required></p>\
-             <button>Sign in</button></form>"
+            "<h1>Sign in</h1>\
+             <form class=authform method=post action=/login>\
+             <div><label>Email</label><input name=email type=email required autofocus></div>\
+             <div><label>Password</label><input name=password type=password required></div>\
+             <button class=primary type=submit>Sign in</button></form>{sso}"
         ),
     )
 }
@@ -830,12 +848,7 @@ async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response
         .await
         .map_err(e500)?
     else {
-        return Ok(page(
-            "Sign in",
-            "<h1>Sign in</h1><p class=held>Invalid email or password.</p>\
-             <p><a href=/login>try again</a></p>",
-        )
-        .into_response());
+        return Ok(login_error("Invalid email or password."));
     };
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
     let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
@@ -974,12 +987,14 @@ async fn auth_callback(
     Ok(redirect_with_cookie(&dest, &cookie))
 }
 
-/// A login-page error response.
+/// A login-page error response (centered card with a red banner).
 fn login_error(msg: &str) -> Response {
-    page(
+    auth_page(
         "Sign in",
         &format!(
-            "<h1>Sign in</h1><p class=held>{msg}</p><p><a href=/login>try again</a></p>"
+            "<h1>Sign in</h1><p class=errbanner>{}</p>\
+             <p style=\"text-align:center\"><a href=/login>← try again</a></p>",
+            esc(msg)
         ),
     )
     .into_response()
