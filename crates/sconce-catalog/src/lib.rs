@@ -404,12 +404,20 @@ pub struct AuthUser {
     pub admin_org_ids: Vec<Uuid>,
 }
 
+/// A user's membership in one tenant, with role and active state.
+#[derive(Debug, Clone)]
+pub struct TenantMembership {
+    pub slug: String,
+    pub role: String,
+    pub active: bool,
+}
+
 /// A user in the superadmin listing.
 #[derive(Debug, Clone)]
 pub struct UserSummary {
     pub email: String,
     pub is_superadmin: bool,
-    pub tenants: Vec<String>,
+    pub tenants: Vec<TenantMembership>,
 }
 
 /// One of a user's active login sessions (for the account page).
@@ -1161,7 +1169,8 @@ impl Catalog {
     pub async fn list_users(&self) -> Result<Vec<UserSummary>, sqlx::Error> {
         let rows = sqlx::query(
             "select u.email as email, u.is_superadmin as is_superadmin, \
-                    coalesce(array_agg(o.slug) filter (where o.slug is not null), '{}') as tenants \
+                    coalesce(json_agg(json_build_object('slug', o.slug, 'role', ut.role, \
+                        'active', ut.active) order by o.slug) filter (where o.slug is not null), '[]') as tenants \
              from users u \
              left join user_tenants ut on ut.user_id = u.id \
              left join organizations o on o.id = ut.org_id \
@@ -1171,10 +1180,25 @@ impl Catalog {
         .await?;
         rows.iter()
             .map(|row| {
+                let tj: Value = row.try_get("tenants")?;
+                let tenants = tj
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| {
+                                Some(TenantMembership {
+                                    slug: v.get("slug")?.as_str()?.to_owned(),
+                                    role: v.get("role")?.as_str()?.to_owned(),
+                                    active: v.get("active")?.as_bool()?,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(UserSummary {
                     email: row.try_get("email")?,
                     is_superadmin: row.try_get("is_superadmin")?,
-                    tenants: row.try_get("tenants")?,
+                    tenants,
                 })
             })
             .collect()

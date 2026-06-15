@@ -1482,12 +1482,33 @@ async fn users_page(
     let users = s.catalog.list_users().await.map_err(e500)?;
     let mut rows = String::new();
     for u in &users {
+        // Each membership as a chip: slug + role, greyed + "deactivated" if inactive.
+        let mut chips = String::new();
+        for t in &u.tenants {
+            let (tone, suffix) = if t.active {
+                (if t.role == "admin" { "violet" } else { "slate" }, String::new())
+            } else {
+                ("held", " · deactivated".to_owned())
+            };
+            let _ = write!(
+                chips,
+                "<span class='badge {tone}'>{slug} · {role}{suffix}</span> ",
+                slug = esc(&t.slug),
+                role = esc(&t.role),
+            );
+        }
+        if u.tenants.is_empty() {
+            chips.push_str("<span class=muted>—</span>");
+        }
         let _ = write!(
             rows,
-            "<tr><td>{email}</td><td>{sa}</td><td>{tenants}</td></tr>",
+            "<tr><td>{email}</td><td>{sa}</td><td>{chips}</td></tr>",
             email = esc(&u.email),
-            sa = if u.is_superadmin { "yes" } else { "" },
-            tenants = esc(&u.tenants.join(", ")),
+            sa = if u.is_superadmin {
+                "<span class='badge amber'>superadmin</span>"
+            } else {
+                ""
+            },
         );
     }
     Ok(shell(
@@ -1495,7 +1516,7 @@ async fn users_page(
         &user,
         "Users",
         &format!(
-            "<h1>Users</h1><table><tr><th>Email</th><th>Superadmin</th><th>Tenants</th></tr>{rows}</table>\
+            "<h1>Members</h1><table><tr><th>Email</th><th>Role</th><th>Tenants</th></tr>{rows}</table>\
              <h2>Create user</h2>\
              <form class=row method=post action=/users>email <input name=email type=email required> \
              password <input name=password type=password required> \
