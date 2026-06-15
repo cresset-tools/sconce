@@ -134,6 +134,7 @@ pub fn router(
         .route("/r/{org}/{repo}/package/archive", post(package_archive))
         .route("/r/{org}/{repo}/ci", post(add_ci))
         .route("/r/{org}/{repo}/ci/remove", post(remove_ci))
+        .fallback(not_found_page)
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }
@@ -1060,6 +1061,27 @@ async fn save_repo_settings(
 }
 
 // ----- login -----
+
+/// A standalone centered status page (404 etc.) — themed, needs no user.
+fn status_page(title: &str, msg: &str) -> Html<String> {
+    doc(
+        title,
+        &format!(
+            "<div class=authwrap><div class=authcard style=text-align:center>\
+             <a class=brand href=/ style=justify-content:center><span class=brandmark>{MARK_SVG}</span> \
+             <span>Bougie Repo</span></a>\
+             <h1 style=\"font-size:18px;margin:1.1rem 0 .3rem\">{title}</h1>\
+             <p class=muted>{msg}</p><p><a href=/>← Home</a></p></div></div>"
+        ),
+    )
+}
+
+async fn not_found_page() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        status_page("Page not found", "That page doesn't exist."),
+    )
+}
 
 /// A centered sign-in card (brand + `inner`), full-viewport, no app chrome.
 fn auth_page(title: &str, inner: &str) -> Html<String> {
