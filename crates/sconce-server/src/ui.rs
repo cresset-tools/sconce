@@ -106,6 +106,7 @@ pub fn router(
         .route("/r/{org}/{repo}/version", post(version_action))
         .route("/r/{org}/{repo}/token", post(create_token))
         .route("/r/{org}/{repo}/token/revoke", post(revoke_token))
+        .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
@@ -1438,9 +1439,34 @@ async fn repo_page(
             (None, _) => "never".to_owned(),
         };
         let last = t.last_used.as_deref().map_or("never".to_owned(), esc);
+        // Per-credential supply-chain policy: an inline form for labelled tokens
+        // (the override is keyed by label); unnamed tokens just show "inherit".
+        let policy_cell = if let Some(label) = &t.label {
+            let m = t.policy.update_mode.as_deref().unwrap_or("");
+            let mode_opt = |v: &str, text: &str| {
+                let sel = if v == m { " selected" } else { "" };
+                format!("<option value=\"{v}\"{sel}>{text}</option>")
+            };
+            format!(
+                "<form class=inline method=post action=\"/r/{slug}/token/policy\">\
+                 <input type=hidden name=label value=\"{lbl}\">\
+                 <select name=mode>{inherit}{auto}{manual}{delayed}</select>\
+                 <input name=cooldown_days type=number min=0 placeholder=cooldown style=\"width:5em\" value=\"{cd}\">\
+                 <button>Set</button></form>",
+                lbl = esc(label),
+                inherit = mode_opt("", "inherit"),
+                auto = mode_opt("auto", "auto"),
+                manual = mode_opt("manual", "manual"),
+                delayed = mode_opt("delayed", "delayed"),
+                cd = t.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
+            )
+        } else {
+            "<span class=muted>inherit</span>".to_owned()
+        };
         let _ = write!(
             acc,
             "<tr><td>{name}</td><td>{origin}</td><td>{created}</td><td>{last}</td><td>{expiry}</td>\
+             <td>{policy_cell}</td>\
              <td><form class=inline method=post action=\"/r/{slug}/token/revoke\" \
              onsubmit=\"return confirm('Revoke this token? Installs using it will stop working.')\">\
              <input type=hidden name=id value=\"{id}\"><button>Revoke</button></form></td></tr>",
@@ -1455,7 +1481,8 @@ async fn repo_page(
          <pre>composer config repositories.{r} composer {base}/{slug}\ncomposer require &lt;package&gt;</pre>\
          <p class=muted>Authenticate with a token (created below); it is the http-basic \
          <em>password</em>.</p>\
-         <table><tr><th>Name</th><th>Origin</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr>{token_rows}</table>\
+         <table><tr><th>Name</th><th>Origin</th><th>Created</th><th>Last used</th><th>Expires</th><th>Policy</th><th></th></tr>{token_rows}</table>\
+         <p class=muted>Policy tightens the repo's supply-chain gate for that credential only (e.g. <code>delayed</code> + cooldown for a conservative buyer); it can never loosen it.</p>\
          <form class=row method=post action=\"/r/{slug}/token\">\
          name <input name=label placeholder=\"e.g. ci-deploy\"> \
          expires in <input name=expires_days type=number min=1 placeholder=days style=\"width:6em\"> days \
@@ -1911,6 +1938,38 @@ async fn revoke_token(
     let token_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
     s.catalog
         .revoke_token(repo_id, token_id)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct TokenPolicyForm {
+    label: String,
+    mode: String,
+    cooldown_days: Option<String>,
+}
+
+async fn set_token_policy(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<TokenPolicyForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    // Empty mode = inherit (clear). Cooldown parses to None when blank.
+    let update_mode = match f.mode.as_str() {
+        "auto" | "manual" | "delayed" => Some(f.mode.clone()),
+        "" => None,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let cooldown_days = match f.cooldown_days.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
+    };
+    let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
+    s.catalog
+        .set_token_policy(repo_id, &f.label, &policy)
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))

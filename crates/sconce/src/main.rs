@@ -695,6 +695,27 @@ enum TokenAction {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+    /// Set (or clear) a token's per-credential supply-chain policy override. Omit
+    /// both `--mode` and `--cooldown-days` to clear it (inherit the repo). The
+    /// override can only *tighten* the repo policy at serve time.
+    Policy {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Token label to target (see `token list`).
+        #[arg(long)]
+        label: String,
+        /// Update mode override: `auto`, `manual`, or `delayed`. Omit to leave
+        /// the mode inherited.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Cooldown-days override (a positive value implies `delayed`).
+        #[arg(long)]
+        cooldown_days: Option<i32>,
+        /// Postgres connection string.
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 // A flat command dispatcher; its length is just the number of subcommands.
@@ -921,6 +942,13 @@ fn main() -> Result<()> {
                 id,
                 database_url,
             } => token_revoke(&repo, id, &database_url),
+            TokenAction::Policy {
+                repo,
+                label,
+                mode,
+                cooldown_days,
+                database_url,
+            } => token_policy(&repo, &label, mode.as_deref(), cooldown_days, &database_url),
         },
         Command::Policy { action } => match action {
             PolicyAction::Show { repo, database_url } => policy_show(&repo, &database_url),
@@ -1837,7 +1865,48 @@ fn token_list(repo: &str, database_url: &str) -> Result<()> {
                 (None, _) => "never expires".to_owned(),
             };
             let last = t.last_used.as_deref().unwrap_or("never used");
-            println!("{}  {label}  [{}]  ({expires}; {last})", t.id, t.origin);
+            let policy = match (t.policy.update_mode.as_deref(), t.policy.cooldown_days) {
+                (None, None) => String::new(),
+                (m, c) => format!(
+                    "  policy={}/{}",
+                    m.unwrap_or("inherit"),
+                    c.map_or_else(|| "-".to_owned(), |d| d.to_string())
+                ),
+            };
+            println!("{}  {label}  [{}]  ({expires}; {last}){policy}", t.id, t.origin);
+        }
+        Ok(())
+    })
+}
+
+fn token_policy(
+    repo: &str,
+    label: &str,
+    mode: Option<&str>,
+    cooldown_days: Option<i32>,
+    database_url: &str,
+) -> Result<()> {
+    if let Some(m) = mode {
+        anyhow::ensure!(
+            matches!(m, "auto" | "manual" | "delayed"),
+            "--mode must be auto, manual, or delayed"
+        );
+    }
+    let policy = sconce_catalog::PolicyOverride {
+        update_mode: mode.map(ToOwned::to_owned),
+        cooldown_days,
+    };
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let changed = catalog
+            .set_token_policy(repo_id, label, &policy)
+            .await
+            .context("setting token policy")?;
+        anyhow::ensure!(changed, "no token labelled `{label}` in {repo}");
+        if policy.is_some() {
+            println!("token `{label}`: policy set (tighten-only at serve time)");
+        } else {
+            println!("token `{label}`: policy cleared (inherits the repo)");
         }
         Ok(())
     })

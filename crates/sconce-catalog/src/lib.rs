@@ -447,6 +447,8 @@ pub struct TokenSummary {
     pub expires: Option<String>,
     /// Whether the token is already past its expiry.
     pub expired: bool,
+    /// Per-credential supply-chain policy override (empty = inherits the repo).
+    pub policy: PolicyOverride,
 }
 
 /// A grant shown in the admin UI: a package owned elsewhere, exposed here.
@@ -2022,7 +2024,8 @@ impl Catalog {
                     to_char(created_at, 'YYYY-MM-DD') as created, \
                     to_char(last_used_at, 'YYYY-MM-DD') as last_used, \
                     to_char(expires_at, 'YYYY-MM-DD') as expires, \
-                    coalesce(expires_at <= now(), false) as expired \
+                    coalesce(expires_at <= now(), false) as expired, \
+                    update_mode, cooldown_days \
              from tokens where repo_id = $1 order by created_at desc",
         )
         .bind(repo_id)
@@ -2038,6 +2041,10 @@ impl Catalog {
                     last_used: row.try_get("last_used")?,
                     expires: row.try_get("expires")?,
                     expired: row.try_get("expired")?,
+                    policy: PolicyOverride {
+                        update_mode: row.try_get("update_mode").ok().flatten(),
+                        cooldown_days: row.try_get("cooldown_days").ok().flatten(),
+                    },
                 })
             })
             .collect()
