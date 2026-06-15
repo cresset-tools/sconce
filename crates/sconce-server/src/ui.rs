@@ -82,6 +82,7 @@ pub fn router(
     };
     Router::new()
         .route("/", get(index))
+        .route("/assets/fonts/{file}", get(font_asset))
         .route("/login", get(login_form).post(login))
         .route("/auth/start", get(auth_start))
         .route("/auth/route", post(auth_route))
@@ -136,8 +137,13 @@ pub async fn serve(
 /// Auth gate. Single-tenant: optional HTTP basic, then all-access. Multi-tenant:
 /// require a login session (except for `/login`), resolving the user's tenants.
 async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    // Vendored fonts are public (the sign-in page needs them, pre-auth).
+    if path.starts_with("/assets/") {
+        return next.run(req).await;
+    }
     // SCIM has its own bearer-token auth (in-handler), independent of UI mode.
-    if req.uri().path().starts_with("/scim/") {
+    if path.starts_with("/scim/") {
         return next.run(req).await;
     }
     if s.single_tenant {
@@ -222,6 +228,10 @@ fn esc(s: &str) -> String {
 /// the Claude Design handoff: Geist + Geist Mono, neutral light palette, indigo
 /// accent (#5a4ff0), first-class status-badge tones. Shared by every page.
 const STYLE: &str = "\
+@font-face{font-family:'Geist Variable';src:url('/assets/fonts/geist.woff2') format('woff2');\
+font-weight:100 900;font-style:normal;font-display:swap}\
+@font-face{font-family:'Geist Mono Variable';src:url('/assets/fonts/geist-mono.woff2') format('woff2');\
+font-weight:100 900;font-style:normal;font-display:swap}\
 :root{--bg:#f7f8fa;--surface:#fff;--border:#e7e9ee;--soft:#eef0f3;\
 --text:#15171c;--text2:#545b68;--muted:#9098a4;\
 --accent:#5a4ff0;--accent-press:#4f44e6;--accent-fg:#4b3fc4;\
@@ -273,49 +283,157 @@ overflow:auto;font-size:12.5px;line-height:1.55}\
 pre code{background:none;border:none;color:inherit;padding:0}\
 .banner{display:flex;align-items:center;gap:8px;padding:.6rem .85rem;border-radius:9px;font-size:13px;\
 font-weight:500;background:#fbf1d9;color:#8a5a00;border:1px solid #f0e0ac;margin:1rem 0}\
+.layout{display:flex;min-height:100vh}\
+.sidebar{width:240px;flex:none;background:var(--surface);border-right:1px solid var(--border);\
+display:flex;flex-direction:column;padding:14px 12px;position:sticky;top:0;height:100vh}\
+.org{display:flex;align-items:center;gap:10px;padding:8px 9px;border:1px solid var(--border);border-radius:9px;background:#fbfbfc;text-decoration:none}\
+.org:hover{text-decoration:none}\
+.org .mk{width:30px;height:30px;flex:none;border-radius:8px;display:flex;align-items:center;justify-content:center;\
+background:linear-gradient(150deg,#7b6cf6,#5a4ff0);box-shadow:0 1px 2px rgba(74,63,196,.35)}\
+.org .name{display:block;font-size:13.5px;font-weight:600;color:var(--text);line-height:1.2}\
+.org .sub{display:block;font-size:11px;color:var(--muted)}\
+.side-nav{display:flex;flex-direction:column;gap:1px;margin-top:16px;flex:1}\
+.side-nav .grp{font-size:10.5px;font-weight:600;letter-spacing:.07em;color:#a2a9b4;padding:14px 10px 5px}\
+.side-nav a{display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:7px;\
+font-size:13.5px;font-weight:500;color:var(--text2);text-decoration:none}\
+.side-nav a:hover{background:#f6f7f9;text-decoration:none}\
+.side-nav a.active{background:#f1effc;color:var(--accent-fg);font-weight:600}\
+.side-nav a.active svg{color:var(--accent)}\
+.side-nav svg{color:#8b94a3;flex:none}\
+.userbox{display:flex;align-items:center;gap:9px;padding:10px 8px 4px;border-top:1px solid var(--soft);margin-top:8px}\
+.userbox .avatar{width:30px;height:30px;flex:none;border-radius:50%;background:#ece9fb;color:#5a4ff0;\
+display:flex;align-items:center;justify-content:center}\
+.userbox form{margin:0}.userbox button{padding:.2rem .5rem;font-size:11.5px}\
+.rolepill{display:inline-flex;align-items:center;height:17px;padding:0 7px;border-radius:5px;font-size:10.5px;font-weight:600;background:#f0edfd;color:#4b3fc4}\
+.col{flex:1;display:flex;flex-direction:column;min-width:0}\
+.topbar{height:56px;flex:none;display:flex;align-items:center;gap:9px;padding:0 30px;\
+background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5;font-size:13.5px}\
+.topbar .sep{color:#cdd2da}.topbar .here{font-weight:600;color:var(--text)}\
+.content{flex:1;padding:24px 30px;min-width:0;max-width:1120px}\
+.content h1:first-child{margin-top:0}\
 ";
 
-/// The brand mark (the hexagon-package glyph from the design's `AppShell`).
-const BRAND_MARK: &str = "<span class=brandmark>\
-<svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round>\
-<path d=\"M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z\"></path><path d=\"M4 7.5l8 4.5 8-4.5\"></path><path d=\"M12 12v9\"></path></svg></span>";
+/// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
+/// for the gradient mark chip.
+const MARK_SVG: &str = "<svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none stroke=#fff stroke-width=2 \
+stroke-linecap=round stroke-linejoin=round><path d=\"M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z\"></path>\
+<path d=\"M4 7.5l8 4.5 8-4.5\"></path><path d=\"M12 12v9\"></path></svg>";
 
-fn page(title: &str, body: &str) -> Html<String> {
+/// Full HTML scaffold shared by every page. Fonts + stylesheet live in `STYLE`;
+/// the Geist woff2 are vendored and served from `/assets/fonts` (no CDN).
+fn doc(title: &str, inner: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · Bougie Repo</title>\
-         <link rel=stylesheet href=\"https://cdn.jsdelivr.net/npm/@fontsource-variable/geist@5/index.min.css\">\
-         <link rel=stylesheet href=\"https://cdn.jsdelivr.net/npm/@fontsource-variable/geist-mono@5/index.min.css\">\
-         <style>{STYLE}</style></head><body>\
-         <header class=appbar><a class=brand href=/>{BRAND_MARK} <span>Bougie Repo</span></a>\
-         <nav class=appnav></nav></header>\
-         <main class=wrap>{body}</main></body></html>"
+         <style>{STYLE}</style></head><body>{inner}</body></html>"
     ))
 }
 
-// Header nav: a logout + users link (only meaningful in multi-tenant).
-fn nav(s: &Ui, user: &CurrentUser) -> String {
-    if s.single_tenant {
-        return String::new();
-    }
-    let users = if user.is_superadmin {
-        " · <a href=/users>users</a>"
-    } else {
-        ""
-    };
-    format!("<form class=inline method=post action=/logout><button>log out</button></form>{users}")
+/// A standalone page with no app chrome (sign-in): brand bar + centered body.
+fn page(title: &str, body: &str) -> Html<String> {
+    doc(
+        title,
+        &format!(
+            "<header class=appbar><a class=brand href=/><span class=brandmark>{MARK_SVG}</span> \
+             <span>Bougie Repo</span></a></header><main class=wrap>{body}</main>"
+        ),
+    )
 }
 
+/// An authenticated app page, wrapped in the sidebar `AppShell` (left nav + top
+/// breadcrumb bar + content).
 fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
-    let mut html = page(title, body).0;
-    // Inject the nav (page() leaves the app-bar nav empty so we build it per-request).
-    html = html.replacen(
-        "<nav class=appnav></nav>",
-        &format!("<nav class=appnav>{}</nav>", nav(s, user)),
-        1,
+    doc(
+        title,
+        &format!(
+            "<div class=layout>{sidebar}<div class=col>\
+               <header class=topbar><span class=muted>Bougie Repo</span>\
+               <span class=sep>&rsaquo;</span><span class=here>{here}</span></header>\
+               <main class=content>{body}</main></div></div>",
+            sidebar = sidebar(s, user, title),
+            here = esc(title),
+        ),
+    )
+}
+
+/// A 24×24 stroke nav icon.
+fn nav_icon(paths: &str) -> String {
+    format!(
+        "<svg width=17 height=17 viewBox=\"0 0 24 24\" fill=none stroke=currentColor stroke-width=1.7 \
+         stroke-linecap=round stroke-linejoin=round>{paths}</svg>"
+    )
+}
+
+/// The left sidebar: brand/org block, route-grounded nav (active state derived
+/// from `title`), and the user/role + log-out footer.
+fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
+    const REPOS: &str = "<path d=\"M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z\"></path>\
+<path d=\"M4 7.5l8 4.5 8-4.5\"></path><path d=\"M12 12v9\"></path>";
+    const MEMBERS: &str = "<circle cx=9 cy=8 r=3.2></circle><path d=\"M3 20a6 6 0 0 1 12 0\"></path>\
+<path d=\"M16 5.5a3 3 0 0 1 0 5.5\"></path><path d=\"M21 20a6 6 0 0 0-4-5.6\"></path>";
+    let on_members = title == "Users";
+    let cls = |on: bool| if on { " class=active" } else { "" };
+
+    let mut nav = format!(
+        "<a href=/{c}>{ic}<span>Repositories</span></a>",
+        c = cls(!on_members),
+        ic = nav_icon(REPOS),
     );
-    Html(html)
+    // Members lives in multi-tenant and is superadmin-managed.
+    if !s.single_tenant && user.is_superadmin {
+        let _ = write!(
+            nav,
+            "<div class=grp>ORGANIZATION</div><a href=/users{c}>{ic}<span>Members</span></a>",
+            c = cls(on_members),
+            ic = nav_icon(MEMBERS),
+        );
+    }
+
+    let sub = if s.single_tenant { "Single-tenant" } else { "Hosted" };
+    // Single-tenant is all-access; otherwise admin if they manage any tenant.
+    let role = if s.single_tenant || user.is_superadmin || !user.admin_tenants.is_empty() {
+        "Admin"
+    } else {
+        "Member"
+    };
+    // No session to end in single-tenant (HTTP-basic), so no log-out there.
+    let logout = if s.single_tenant {
+        String::new()
+    } else {
+        "<form method=post action=/logout><button>Log out</button></form>".to_owned()
+    };
+
+    format!(
+        "<aside class=sidebar>\
+           <a class=org href=/><span class=mk>{MARK_SVG}</span>\
+             <span><span class=name>Bougie Repo</span><span class=sub>{sub}</span></span></a>\
+           <nav class=side-nav>{nav}</nav>\
+           <div class=userbox>\
+             <span class=avatar><svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none stroke=currentColor \
+               stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=8 r=4></circle>\
+               <path d=\"M4 21a8 8 0 0 1 16 0\"></path></svg></span>\
+             <span style=\"flex:1;min-width:0\"><span class=rolepill>{role}</span></span>{logout}\
+           </div></aside>"
+    )
+}
+
+/// Serve a vendored Geist woff2, embedded in the binary (no runtime file or CDN
+/// dependency — keeps the single-binary deploy self-contained). Public + immutable.
+async fn font_asset(Path(file): Path<String>) -> Response {
+    let bytes: &'static [u8] = match file.as_str() {
+        "geist.woff2" => include_bytes!("../assets/fonts/geist.woff2"),
+        "geist-mono.woff2" => include_bytes!("../assets/fonts/geist-mono.woff2"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn lookup(
