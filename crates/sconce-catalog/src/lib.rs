@@ -370,8 +370,13 @@ pub struct AdminVersion {
     pub stability: String,
     pub held: bool,
     pub approved: bool,
+    pub yanked: bool,
     /// Release time as text (`null` if unknown).
     pub released_at: Option<String>,
+    /// Whole days until this version clears the repo's cooldown (`0` once past,
+    /// `None` when it has no release date). Lets the operator view show a
+    /// countdown that matches what serving hides.
+    pub cooldown_days_left: Option<i64>,
 }
 
 /// A license key in the admin listing (the key itself is never recoverable).
@@ -532,8 +537,15 @@ impl Catalog {
         let rows = sqlx::query(
             "select p.name as package, pv.version, pv.normalized_version, pv.stability, \
                     (pv.held_at is not null) as held, (pv.approved_at is not null) as approved, \
-                    pv.released_at::text as released_at \
-             from package_versions pv join packages p on p.id = pv.package_id \
+                    (pv.yanked_at is not null) as yanked, \
+                    pv.released_at::text as released_at, \
+                    case when pv.released_at is null then null else \
+                        greatest(0, ceil(extract(epoch from \
+                            (pv.released_at + make_interval(days => r.cooldown_days) - now())) / 86400))::bigint \
+                    end as cooldown_days_left \
+             from package_versions pv \
+             join packages p on p.id = pv.package_id \
+             join repositories r on r.id = $1 \
              where p.repo_id = $1 \
              order by p.name, pv.normalized_version",
         )
@@ -549,7 +561,9 @@ impl Catalog {
                     stability: row.try_get("stability")?,
                     held: row.try_get("held")?,
                     approved: row.try_get("approved")?,
+                    yanked: row.try_get("yanked")?,
                     released_at: row.try_get("released_at")?,
+                    cooldown_days_left: row.try_get("cooldown_days_left")?,
                 })
             })
             .collect()
@@ -2295,6 +2309,30 @@ impl Catalog {
             .await
     }
 
+    /// Yank a version: withdraw a bad/compromised release permanently (hides it
+    /// like a hold, but signals "this version is withdrawn", not "pending
+    /// review"). Reversible via [`Self::unyank_version`].
+    pub async fn yank_version(
+        &self,
+        repo_id: Uuid,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        self.set_version_timestamp("yanked_at", "now()", repo_id, package, normalized_version)
+            .await
+    }
+
+    /// Reinstate a yanked version.
+    pub async fn unyank_version(
+        &self,
+        repo_id: Uuid,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        self.set_version_timestamp("yanked_at", "null", repo_id, package, normalized_version)
+            .await
+    }
+
     /// Approve a version (makes it visible under `manual`, or early under
     /// `delayed`).
     pub async fn approve_version(
@@ -2678,6 +2716,31 @@ mod tests {
             norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
             ["1.0.0.0", "1.1.0.0"]
         );
+
+        // Yank hides a version unconditionally (even though it was approved); a
+        // prior approval doesn't override a yank. Un-yank reinstates it.
+        assert!(cat.yank_version(repo_id, p, "1.1.0.0").await.unwrap());
+        assert_eq!(
+            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
+            ["1.0.0.0"]
+        );
+        assert!(cat.unyank_version(repo_id, p, "1.1.0.0").await.unwrap());
+
+        // The operator view's countdown matches serving: under a 7-day cooldown
+        // the 30-day-old version is past (0 left) while the just-released one has
+        // ~7 days to go. (We set this repo's policy so admin_package_versions
+        // computes against the real cooldown_days.)
+        cat.set_update_policy(repo_id, "delayed", 7).await.unwrap();
+        let av = cat.admin_package_versions(repo_id).await.unwrap();
+        let old = av.iter().find(|v| v.normalized_version == "1.0.0.0").unwrap();
+        let fresh = av.iter().find(|v| v.normalized_version == "1.1.0.0").unwrap();
+        assert_eq!(old.cooldown_days_left, Some(0), "30-day-old is past cooldown");
+        assert!(
+            matches!(fresh.cooldown_days_left, Some(n) if (1..=7).contains(&n)),
+            "fresh release counts down (got {:?})",
+            fresh.cooldown_days_left
+        );
+        assert!(fresh.approved, "approved flag surfaces in the operator view");
     }
 
     #[tokio::test]

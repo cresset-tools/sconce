@@ -1188,26 +1188,45 @@ async fn repo_page(
 
     let mut rows = String::new();
     for v in &versions {
-        let mut badges = String::new();
-        if v.held {
-            badges.push_str("<span class='badge held'>held</span> ");
-        }
-        if v.approved {
-            badges.push_str("<span class='badge ok'>approved</span> ");
-        }
+        // The effective gated state, matching what serving hides (visible_versions):
+        // yanked/held hide unconditionally; approved overrides mode/cooldown;
+        // otherwise auto=live, manual=pending, delayed=cooldown-countdown.
+        let badge = if v.yanked {
+            "<span class='badge held'>yanked</span>".to_owned()
+        } else if v.held {
+            "<span class='badge held'>held</span>".to_owned()
+        } else if v.approved {
+            "<span class='badge ok'>approved</span>".to_owned()
+        } else {
+            match summary.update_mode.as_str() {
+                "manual" => "<span class='badge'>pending approval</span>".to_owned(),
+                "delayed" => match v.cooldown_days_left {
+                    None => "<span class='badge'>pending</span>".to_owned(),
+                    Some(0) => "<span class='badge ok'>live</span>".to_owned(),
+                    Some(n) => format!("<span class='badge'>cooldown · {n}d left</span>"),
+                },
+                _ => "<span class='badge ok'>live</span>".to_owned(),
+            }
+        };
         let (hold_label, hold_action) = if v.held {
             ("Unhold", "unhold")
         } else {
             ("Hold", "hold")
         };
+        let (yank_label, yank_action) = if v.yanked {
+            ("Unyank", "unyank")
+        } else {
+            ("Yank", "yank")
+        };
         let _ = write!(
             rows,
             "<tr><td>{pkg}</td><td>{ver} <span class=muted>{norm}</span></td><td>{stab}</td>\
-             <td>{badges}<span class=muted>{rel}</span></td><td>\
+             <td>{badge} <span class=muted>{rel}</span></td><td>\
              <form class=inline method=post action=\"/r/{slug}/version\">\
              <input type=hidden name=package value=\"{pkg}\"><input type=hidden name=normalized value=\"{norm}\">\
              <button name=action value={hold_action}>{hold_label}</button> \
-             <button name=action value=approve>Approve</button></form></td></tr>",
+             <button name=action value=approve>Approve</button> \
+             <button name=action value={yank_action}>{yank_label}</button></form></td></tr>",
             pkg = esc(&v.package),
             ver = esc(&v.version),
             norm = esc(&v.normalized_version),
@@ -1519,6 +1538,8 @@ async fn version_action(
                 .approve_version(id, &f.package, &f.normalized)
                 .await
         }
+        "yank" => s.catalog.yank_version(id, &f.package, &f.normalized).await,
+        "unyank" => s.catalog.unyank_version(id, &f.package, &f.normalized).await,
         _ => return Err(StatusCode::BAD_REQUEST),
     }
     .map_err(e500)?;
