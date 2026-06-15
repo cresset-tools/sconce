@@ -103,6 +103,7 @@ pub fn router(
         .route("/account/revoke", post(revoke_my_session))
         .route("/users", get(users_page).post(create_user))
         .route("/activity", get(activity_page))
+        .route("/console", get(console_page))
         .route("/users/grant", post(grant_tenant))
         .route("/users/remove", post(remove_member))
         .route("/orgs", post(create_org))
@@ -355,6 +356,10 @@ border:1px solid #f4cfc8;margin-bottom:13px;text-align:center}\
 .hero{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:14px 16px;\
 margin:0 0 1.4rem;box-shadow:0 1px 2px rgba(20,23,28,.04)}\
 .hero h2{margin:0 0 .5rem}.hero pre{margin:0}\
+.stats{display:flex;gap:14px;flex-wrap:wrap;margin:.5rem 0 1.4rem}\
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:14px 20px;min-width:120px}\
+.stat .n{font-size:24px;font-weight:650;line-height:1.1}\
+.stat .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:3px}\
 ";
 
 /// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
@@ -434,13 +439,16 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
     const MEMBERS: &str = "<circle cx=9 cy=8 r=3.2></circle><path d=\"M3 20a6 6 0 0 1 12 0\"></path>\
 <path d=\"M16 5.5a3 3 0 0 1 0 5.5\"></path><path d=\"M21 20a6 6 0 0 0-4-5.6\"></path>";
     const ACTIVITY: &str = "<path d=\"M3 12h4l2.5 7 4-14 2.5 7h5\"></path>";
+    const CONSOLE: &str = "<path d=\"M12 3l8 3v6c0 4.6-3.3 7.8-8 9-4.7-1.2-8-4.4-8-9V6l8-3z\"></path>\
+<path d=\"M9 12l2 2 4-4\"></path>";
     let on_members = title == "Users";
     let on_activity = title == "Activity";
+    let on_console = title == "Instance console";
     let cls = |on: bool| if on { " class=active" } else { "" };
 
     let mut nav = format!(
         "<a href=/{c}>{ic}<span>Repositories</span></a>",
-        c = cls(!on_members && !on_activity),
+        c = cls(!on_members && !on_activity && !on_console),
         ic = nav_icon(REPOS),
     );
     // Members lives in multi-tenant and is superadmin-managed.
@@ -458,6 +466,14 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
         c = cls(on_activity),
         ic = nav_icon(ACTIVITY),
     );
+    if user.is_superadmin {
+        let _ = write!(
+            nav,
+            "<a href=/console{c}>{ic}<span>Instance console</span></a>",
+            c = cls(on_console),
+            ic = nav_icon(CONSOLE),
+        );
+    }
 
     let sub = if s.single_tenant { "Single-tenant" } else { "Hosted" };
     // Single-tenant is all-access; otherwise admin if they manage any tenant.
@@ -1686,6 +1702,51 @@ async fn users_page(
              tenant <input name=tenant placeholder=org-slug required> \
              <select name=role><option value=member>member</option><option value=admin>admin</option></select> \
              <button>Grant</button></form>"
+        ),
+    ))
+}
+
+/// G2 — superadmin instance console: totals, instance SSO, and all orgs.
+async fn console_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Html<String>, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let orgs = s.catalog.list_organizations().await.map_err(e500)?;
+    let repos = s.catalog.list_repositories().await.map_err(e500)?;
+    let users = s.catalog.list_users().await.map_err(e500)?;
+    let oidc = s.catalog.oidc_connection().await.map_err(e500)?;
+    let oidc_badge = if oidc.is_some() {
+        "<span class='badge ok'>configured</span>"
+    } else {
+        "<span class='badge slate'>not set</span>"
+    };
+    let stat = |n: usize, l: &str| format!("<div class=stat><div class=n>{n}</div><div class=l>{l}</div></div>");
+    let mut org_rows = String::new();
+    for o in &orgs {
+        let rc = repos.iter().filter(|r| r.org_id == o.id).count();
+        let _ = write!(
+            org_rows,
+            "<tr><td><a href=\"/o/{sl}\">{sl}</a></td><td>{rc}</td>\
+             <td class=muted><a href=\"/o/{sl}/settings\">settings</a></td></tr>",
+            sl = esc(&o.slug),
+        );
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "Instance console",
+        &format!(
+            "<h1>Instance console</h1>\
+             <div class=stats>{so}{sr}{su}</div>\
+             <h2>Instance SSO</h2><p>Default OIDC connection (all orgs without their own): {oidc_badge}</p>\
+             <h2>Organizations</h2>\
+             <table><tr><th>Organization</th><th>Repos</th><th></th></tr>{org_rows}</table>",
+            so = stat(orgs.len(), "organizations"),
+            sr = stat(repos.len(), "repositories"),
+            su = stat(users.len(), "users"),
         ),
     ))
 }
