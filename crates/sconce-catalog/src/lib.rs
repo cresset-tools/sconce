@@ -114,6 +114,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0026_credential_policy",
         include_str!("../migrations/0026_credential_policy.sql"),
     ),
+    (
+        "0027_slug_history",
+        include_str!("../migrations/0027_slug_history.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -349,6 +353,34 @@ pub enum CreateTokenError {
     Policy(String),
 }
 
+/// Why a rename failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RenameError {
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    /// The new slug is in use by a live entity.
+    #[error("that name is already taken")]
+    Taken,
+    /// The new slug was previously used and is permanently retired (reusing it
+    /// would let old locks/tokens resolve to different content).
+    #[error("that name was previously used and is retired")]
+    Retired,
+    /// Invalid (empty/malformed) slug.
+    #[error("invalid name")]
+    Invalid,
+}
+
+/// Where an `(org, repo)` slug pair currently resolves: the repo id, its
+/// **canonical** slugs, and whether the request used an old (renamed) slug and
+/// should be redirected.
+#[derive(Debug, Clone)]
+pub struct RepoLocation {
+    pub repo_id: Uuid,
+    pub org_slug: String,
+    pub repo_slug: String,
+    pub moved: bool,
+}
+
 /// A repository in the admin listing.
 #[derive(Debug, Clone)]
 pub struct RepoSummary {
@@ -547,6 +579,187 @@ impl Catalog {
         .bind(repo_slug)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// Resolve `(org, repo)` to its **canonical** location, following one or both
+    /// renamed slugs via `slug_history`. `moved` is true when the request used an
+    /// old slug (the wire router 301s it). `None` if neither resolves. Chained
+    /// renames resolve to the final slug because history rows are repointed to the
+    /// current entity id and the final lookup is always against the live tables.
+    pub async fn resolve_repo_canonical(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> Result<Option<RepoLocation>, sqlx::Error> {
+        // 1. Resolve the org slug → (org_id, canonical slug, moved?).
+        let live_org: Option<(Uuid, String)> =
+            sqlx::query_as("select id, slug from organizations where slug = $1")
+                .bind(org)
+                .fetch_optional(&self.pool)
+                .await?;
+        let (org_id, org_slug, org_moved) = if let Some((id, slug)) = live_org {
+            (id, slug, false)
+        } else {
+            let hist: Option<(Uuid, String)> = sqlx::query_as(
+                "select o.id, o.slug from slug_history h join organizations o on o.id = h.entity_id \
+                 where h.entity_type = 'org' and h.old_slug = $1",
+            )
+            .bind(org)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((id, slug)) = hist else {
+                return Ok(None);
+            };
+            (id, slug, true)
+        };
+        // 2. Resolve the repo slug within that org → (repo_id, canonical slug, moved?).
+        let live_repo: Option<(Uuid, String)> =
+            sqlx::query_as("select id, slug from repositories where org_id = $1 and slug = $2")
+                .bind(org_id)
+                .bind(repo)
+                .fetch_optional(&self.pool)
+                .await?;
+        let (repo_id, repo_slug, repo_moved) = if let Some((id, slug)) = live_repo {
+            (id, slug, false)
+        } else {
+            let hist: Option<(Uuid, String)> = sqlx::query_as(
+                "select r.id, r.slug from slug_history h join repositories r on r.id = h.entity_id \
+                 where h.entity_type = 'repo' and h.org_id = $1 and h.old_slug = $2",
+            )
+            .bind(org_id)
+            .bind(repo)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((id, slug)) = hist else {
+                return Ok(None);
+            };
+            (id, slug, true)
+        };
+        Ok(Some(RepoLocation {
+            repo_id,
+            org_slug,
+            repo_slug,
+            moved: org_moved || repo_moved,
+        }))
+    }
+
+    /// Whether an org slug is in use by a live org **or** retired in history — the
+    /// guard that keeps a retired slug from being re-registered.
+    pub async fn org_slug_unavailable(&self, slug: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "select exists(select 1 from organizations where slug = $1) \
+                 or exists(select 1 from slug_history where entity_type = 'org' and old_slug = $1)",
+        )
+        .bind(slug)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// As [`Self::org_slug_unavailable`], scoped within an org for a repo slug.
+    pub async fn repo_slug_unavailable(
+        &self,
+        org_id: Uuid,
+        slug: &str,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "select exists(select 1 from repositories where org_id = $1 and slug = $2) \
+                 or exists(select 1 from slug_history \
+                           where entity_type = 'repo' and org_id = $1 and old_slug = $2)",
+        )
+        .bind(org_id)
+        .bind(slug)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Rename an org: record the old slug in `slug_history` (so it redirects) and
+    /// switch to `new_slug`. Rejects a name that's live or retired.
+    pub async fn rename_org(&self, org_id: Uuid, new_slug: &str) -> Result<(), RenameError> {
+        let new_slug = new_slug.trim();
+        if new_slug.is_empty() {
+            return Err(RenameError::Invalid);
+        }
+        let current: Option<String> =
+            sqlx::query_scalar("select slug from organizations where id = $1")
+                .bind(org_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(current) = current else {
+            return Err(RenameError::Invalid);
+        };
+        if current == new_slug {
+            return Ok(());
+        }
+        if self.org_slug_unavailable(new_slug).await? {
+            // Distinguish live-taken from retired for a clearer message.
+            let live: bool =
+                sqlx::query_scalar("select exists(select 1 from organizations where slug = $1)")
+                    .bind(new_slug)
+                    .fetch_one(&self.pool)
+                    .await?;
+            return Err(if live { RenameError::Taken } else { RenameError::Retired });
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into slug_history (entity_type, old_slug, entity_id) values ('org', $1, $2)",
+        )
+        .bind(&current)
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("update organizations set slug = $2 where id = $1")
+            .bind(org_id)
+            .bind(new_slug)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Rename a repo within its org: record the old slug and switch to `new_slug`.
+    pub async fn rename_repo(&self, repo_id: Uuid, new_slug: &str) -> Result<(), RenameError> {
+        let new_slug = new_slug.trim();
+        if new_slug.is_empty() {
+            return Err(RenameError::Invalid);
+        }
+        let row: Option<(Uuid, String)> =
+            sqlx::query_as("select org_id, slug from repositories where id = $1")
+                .bind(repo_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((org_id, current)) = row else {
+            return Err(RenameError::Invalid);
+        };
+        if current == new_slug {
+            return Ok(());
+        }
+        if self.repo_slug_unavailable(org_id, new_slug).await? {
+            let live: bool = sqlx::query_scalar(
+                "select exists(select 1 from repositories where org_id = $1 and slug = $2)",
+            )
+            .bind(org_id)
+            .bind(new_slug)
+            .fetch_one(&self.pool)
+            .await?;
+            return Err(if live { RenameError::Taken } else { RenameError::Retired });
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into slug_history (entity_type, old_slug, org_id, entity_id) \
+             values ('repo', $1, $2, $3)",
+        )
+        .bind(&current)
+        .bind(org_id)
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("update repositories set slug = $2 where id = $1")
+            .bind(repo_id)
+            .bind(new_slug)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// All organizations (tenants), sorted — so a freshly created org is visible
@@ -3783,5 +3996,46 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn rename_redirects_retires_and_chains() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let o = format!("ren{}", std::process::id());
+        let org_id = cat.create_org(&o, None).await.unwrap();
+        let repo_id = cat.create_repo(&o, "web").await.unwrap();
+
+        // Canonical resolves, not moved.
+        let loc = cat.resolve_repo_canonical(&o, "web").await.unwrap().unwrap();
+        assert!(!loc.moved && loc.repo_id == repo_id);
+
+        // Rename the repo: the old slug now redirects to the canonical one.
+        cat.rename_repo(repo_id, "site").await.unwrap();
+        let loc = cat.resolve_repo_canonical(&o, "web").await.unwrap().unwrap();
+        assert!(loc.moved && loc.repo_slug == "site" && loc.repo_id == repo_id);
+        assert!(!cat.resolve_repo_canonical(&o, "site").await.unwrap().unwrap().moved);
+
+        // The retired slug can't be re-used (renamed back, or recreated).
+        assert!(matches!(cat.rename_repo(repo_id, "web").await, Err(RenameError::Retired)));
+        assert!(cat.repo_slug_unavailable(org_id, "web").await.unwrap());
+
+        // Rename the org too: the old org+repo slug pair redirects (chained) to
+        // the new canonical pair.
+        cat.rename_org(org_id, &format!("{o}-new")).await.unwrap();
+        let loc = cat.resolve_repo_canonical(&o, "web").await.unwrap().unwrap();
+        assert!(loc.moved);
+        assert_eq!(loc.org_slug, format!("{o}-new"));
+        assert_eq!(loc.repo_slug, "site");
+
+        // A live slug can't be taken by another rename.
+        cat.create_repo(&format!("{o}-new"), "site2").await.unwrap();
+        assert!(matches!(cat.rename_repo(repo_id, "site2").await, Err(RenameError::Taken)));
+
+        // Unknown slug → no location.
+        assert!(cat.resolve_repo_canonical("nope-org", "nope").await.unwrap().is_none());
     }
 }

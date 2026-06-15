@@ -26,7 +26,7 @@ pub mod ui;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use sconce_cas::{BlobId, BlobStore, FsBlobStore};
@@ -76,26 +76,40 @@ impl Access {
     }
 }
 
-/// Resolve `(org, repo)` to a repository id and the access a credential grants.
-/// 404 if the repository is unknown, 401 if the credential is missing/invalid.
-///
-/// A repo **token** grants [`Access::Full`]; a seller **license key** grants
-/// [`Access::Licensed`] to its entitled packages only.
-async fn authorize(
+/// Resolve `(org, repo)` to its canonical location, **301-redirecting** a request
+/// that used an old (renamed) slug so existing `composer.lock` URLs keep working.
+/// `suffix` is the per-endpoint path tail (e.g. `packages.json`, `p2/v/n.json`).
+/// `Ok(Ok(loc))` = serve `loc.repo_id`; `Ok(Err(redirect))` = send the 301.
+async fn locate(
     s: &AppState,
     org: &str,
     repo: &str,
-    headers: &HeaderMap,
-) -> Result<(Uuid, Access, sconce_catalog::PolicyOverride), AppError> {
-    let repo_id = s
+    suffix: &str,
+) -> Result<Result<sconce_catalog::RepoLocation, Response>, AppError> {
+    let loc = s
         .catalog
-        .resolve_repo(org, repo)
+        .resolve_repo_canonical(org, repo)
         .await?
         .ok_or(AppError::NotFound)?;
+    if loc.moved {
+        let to = format!("/{}/{}/{suffix}", loc.org_slug, loc.repo_slug);
+        return Ok(Err(Redirect::permanent(&to).into_response()));
+    }
+    Ok(Ok(loc))
+}
+
+/// The access a credential grants to an already-resolved repo. 401 if the
+/// credential is missing/invalid. A repo **token** grants [`Access::Full`]; a
+/// seller **license key** grants [`Access::Licensed`] to its entitled packages.
+async fn authorize(
+    s: &AppState,
+    repo_id: Uuid,
+    headers: &HeaderMap,
+) -> Result<(Access, sconce_catalog::PolicyOverride), AppError> {
     let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
 
     if let Some(policy) = s.catalog.resolve_token_policy(repo_id, &cred).await? {
-        return Ok((repo_id, Access::Full, policy));
+        return Ok((Access::Full, policy));
     }
     if let Some(license_id) = s.catalog.resolve_license(repo_id, &cred).await? {
         let entitled = s
@@ -105,7 +119,7 @@ async fn authorize(
             .into_iter()
             .collect();
         let policy = s.catalog.license_policy(license_id).await?;
-        return Ok((repo_id, Access::Licensed(entitled), policy));
+        return Ok((Access::Licensed(entitled), policy));
     }
     Err(AppError::Unauthorized)
 }
@@ -157,10 +171,14 @@ async fn packages_json(
     State(s): State<AppState>,
     Path((org, repo)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let (repo_id, access, _policy) = authorize(&s, &org, &repo, &headers).await?;
+) -> Result<Response, AppError> {
+    let loc = match locate(&s, &org, &repo, "packages.json").await? {
+        Ok(loc) => loc,
+        Err(redirect) => return Ok(redirect),
+    };
+    let (access, _policy) = authorize(&s, loc.repo_id, &headers).await?;
     let names = match access {
-        Access::Full => s.catalog.all_package_names(repo_id).await?,
+        Access::Full => s.catalog.all_package_names(loc.repo_id).await?,
         Access::Licensed(entitled) => {
             let mut v: Vec<String> = entitled.into_iter().collect();
             v.sort();
@@ -169,16 +187,21 @@ async fn packages_json(
     };
     Ok(Json(sconce_metadata::render_root(
         &names,
-        &repo_base(&s.base_url, &org, &repo),
-    )))
+        &repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug),
+    ))
+    .into_response())
 }
 
 async fn p2(
     State(s): State<AppState>,
     Path((org, repo, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let (repo_id, access, policy) = authorize(&s, &org, &repo, &headers).await?;
+) -> Result<Response, AppError> {
+    let loc = match locate(&s, &org, &repo, &format!("p2/{rest}")).await? {
+        Ok(loc) => loc,
+        Err(redirect) => return Ok(redirect),
+    };
+    let (access, policy) = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -190,23 +213,24 @@ async fn p2(
     // A license key only unlocks its entitled packages; everything else (and the
     // dev variant) is an empty document.
     if is_dev || !access.allows(package) {
-        return Ok(Json(json!({ "packages": { package: [] } })));
+        return Ok(Json(json!({ "packages": { package: [] } })).into_response());
     }
 
     // Apply the supply-chain gate (cooldown / manual approval / holds) so clients
     // only ever see versions that have cleared it. The presenting credential's
     // policy override can tighten — never loosen — the repo default.
-    let (repo_mode, repo_cooldown) = s.catalog.update_policy(repo_id).await?;
+    let (repo_mode, repo_cooldown) = s.catalog.update_policy(loc.repo_id).await?;
     let (mode, cooldown_days) = policy.effective(&repo_mode, repo_cooldown);
     let versions = s
         .catalog
-        .visible_versions(repo_id, package, &mode, cooldown_days)
+        .visible_versions(loc.repo_id, package, &mode, cooldown_days)
         .await?;
     Ok(Json(sconce_metadata::render_package(
         package,
         &versions,
-        &repo_base(&s.base_url, &org, &repo),
-    )))
+        &repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug),
+    ))
+    .into_response())
 }
 
 async fn dist(
@@ -214,7 +238,11 @@ async fn dist(
     Path((org, repo, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    authorize(&s, &org, &repo, &headers).await?;
+    let loc = match locate(&s, &org, &repo, &format!("dist/{rest}")).await? {
+        Ok(loc) => loc,
+        Err(redirect) => return Ok(redirect),
+    };
+    authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
     let file = rest.rsplit('/').next().ok_or(AppError::NotFound)?;
