@@ -218,20 +218,79 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The design-system stylesheet (Bougie Repo · Stripe/Linear-style). Grounded in
+/// the Claude Design handoff: Geist + Geist Mono, neutral light palette, indigo
+/// accent (#5a4ff0), first-class status-badge tones. Shared by every page.
+const STYLE: &str = "\
+:root{--bg:#f7f8fa;--surface:#fff;--border:#e7e9ee;--soft:#eef0f3;\
+--text:#15171c;--text2:#545b68;--muted:#9098a4;\
+--accent:#5a4ff0;--accent-press:#4f44e6;--accent-fg:#4b3fc4;\
+--sans:'Geist Variable','Geist',system-ui,-apple-system,sans-serif;\
+--mono:'Geist Mono Variable','Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}\
+*{box-sizing:border-box}\
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}\
+a{color:var(--accent-fg);text-decoration:none}a:hover{text-decoration:underline}\
+code,pre,.mono{font-family:var(--mono)}\
+.appbar{display:flex;align-items:center;justify-content:space-between;height:56px;padding:0 28px;\
+background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}\
+.brand{display:flex;align-items:center;gap:10px;color:var(--text);font-weight:700;font-size:15px}\
+.brand:hover{text-decoration:none}\
+.brandmark{display:flex;width:28px;height:28px;align-items:center;justify-content:center;border-radius:8px;\
+background:linear-gradient(150deg,#7b6cf6,#5a4ff0);box-shadow:0 1px 2px rgba(74,63,196,.35)}\
+.appnav{display:flex;align-items:center;gap:14px;color:var(--muted);font-size:13px}\
+.appnav a{color:var(--text2)}\
+.wrap{max-width:74rem;margin:26px auto 4rem;padding:0 28px}\
+h1{font-size:22px;font-weight:650;letter-spacing:-.01em;margin:.2rem 0 1rem}\
+h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:2.2rem 0 .7rem}\
+table{width:100%;border-collapse:separate;border-spacing:0;margin:.5rem 0 1rem;background:var(--surface);\
+border:1px solid var(--border);border-radius:11px;overflow:hidden;box-shadow:0 1px 2px rgba(20,23,28,.04)}\
+th,td{text-align:left;padding:.6rem .8rem;border-bottom:1px solid var(--soft);vertical-align:middle}\
+th{background:#fbfbfc;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.045em;color:var(--muted)}\
+tr:last-child td{border-bottom:none}\
+.muted{color:var(--muted)}\
+.badge{display:inline-flex;align-items:center;gap:5px;height:21px;padding:0 8px;border-radius:6px;\
+font-size:11.5px;font-weight:600;line-height:1;white-space:nowrap;background:#f3f4f6;color:#4b5260;border:1px solid #e5e7ec}\
+.badge.ok{background:#e8f5ec;color:#127544;border-color:#cfe9d8}\
+.badge.held{background:#fceae7;color:#a82c20;border-color:#f4cfc8}\
+.badge.amber{background:#fbf1d9;color:#8a5a00;border-color:#f0e0ac}\
+.badge.slate{background:#eef1f6;color:#3f4756;border-color:#dfe4ec}\
+.badge.blue{background:#e9f0fc;color:#1f54ad;border-color:#d3e1f7}\
+.badge.violet{background:#f0edfd;color:#4b3fc4;border-color:#e1dbf8}\
+button{font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;color:var(--text2);background:var(--surface);\
+border:1px solid var(--border);border-radius:7px;padding:.32rem .62rem;transition:background .12s,border-color .12s}\
+button:hover{background:#f6f7f9;border-color:#dcdfe6}\
+form.row button,button.primary{color:#fff;background:var(--accent);border-color:var(--accent-press);\
+box-shadow:0 1px 2px rgba(74,63,196,.28)}\
+form.row button:hover,button.primary:hover{background:var(--accent-press);border-color:var(--accent-press)}\
+input,select{font:inherit;font-size:13px;color:var(--text);background:var(--surface);border:1px solid var(--border);\
+border-radius:7px;padding:.32rem .5rem}\
+input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(90,79,240,.15)}\
+form.inline{display:inline-flex;gap:.3rem;align-items:center;flex-wrap:wrap}\
+form.row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.7rem 0}\
+code{background:#f1f3f6;border:1px solid var(--soft);border-radius:5px;padding:.05rem .3rem;font-size:12.5px}\
+pre{background:#0f1115;color:#e6e8ee;border:1px solid #1f232b;border-radius:10px;padding:.9rem 1rem;\
+overflow:auto;font-size:12.5px;line-height:1.55}\
+pre code{background:none;border:none;color:inherit;padding:0}\
+.banner{display:flex;align-items:center;gap:8px;padding:.6rem .85rem;border-radius:9px;font-size:13px;\
+font-weight:500;background:#fbf1d9;color:#8a5a00;border:1px solid #f0e0ac;margin:1rem 0}\
+";
+
+/// The brand mark (the hexagon-package glyph from the design's `AppShell`).
+const BRAND_MARK: &str = "<span class=brandmark>\
+<svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round>\
+<path d=\"M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z\"></path><path d=\"M4 7.5l8 4.5 8-4.5\"></path><path d=\"M12 12v9\"></path></svg></span>";
+
 fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
-        "<!doctype html><html><head><meta charset=utf-8><title>{title} · sconce</title>\
-         <style>\
-         body{{font:15px/1.5 system-ui,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem;color:#222}}\
-         h1,h2{{font-weight:600}} h2{{margin-top:2rem}} a{{color:#2456a6;text-decoration:none}} a:hover{{text-decoration:underline}}\
-         table{{border-collapse:collapse;width:100%;margin:1rem 0}} th,td{{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #eee}}\
-         .badge{{display:inline-block;padding:.05rem .4rem;border-radius:.4rem;font-size:.8rem}}\
-         .held{{background:#fde2e2;color:#a12}} .ok{{background:#e2f5e6;color:#161}} .muted{{color:#888}}\
-         form.inline{{display:inline}} form.row{{margin:.4rem 0}} button{{font:inherit;cursor:pointer}}\
-         code,pre{{background:#f6f7f9;border-radius:.3rem}} pre{{padding:.8rem;overflow:auto}} input,select{{font:inherit;padding:.2rem}}\
-         nav{{float:right}}\
-         </style></head><body><nav class=muted>{nav}</nav><p class=muted><a href=/>sconce admin</a></p>{body}</body></html>",
-        nav = "",
+        "<!doctype html><html lang=en><head><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>{title} · Bougie Repo</title>\
+         <link rel=stylesheet href=\"https://cdn.jsdelivr.net/npm/@fontsource-variable/geist@5/index.min.css\">\
+         <link rel=stylesheet href=\"https://cdn.jsdelivr.net/npm/@fontsource-variable/geist-mono@5/index.min.css\">\
+         <style>{STYLE}</style></head><body>\
+         <header class=appbar><a class=brand href=/>{BRAND_MARK} <span>Bougie Repo</span></a>\
+         <nav class=appnav></nav></header>\
+         <main class=wrap>{body}</main></body></html>"
     ))
 }
 
@@ -250,10 +309,10 @@ fn nav(s: &Ui, user: &CurrentUser) -> String {
 
 fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
     let mut html = page(title, body).0;
-    // Inject the nav (page() leaves it empty so we can build it per-request).
+    // Inject the nav (page() leaves the app-bar nav empty so we build it per-request).
     html = html.replacen(
-        "<nav class=muted></nav>",
-        &format!("<nav class=muted>{}</nav>", nav(s, user)),
+        "<nav class=appnav></nav>",
+        &format!("<nav class=appnav>{}</nav>", nav(s, user)),
         1,
     );
     Html(html)
@@ -1201,11 +1260,11 @@ async fn repo_page(
             "<span class='badge ok'>approved</span>".to_owned()
         } else {
             match summary.update_mode.as_str() {
-                "manual" => "<span class='badge'>pending approval</span>".to_owned(),
+                "manual" => "<span class='badge amber'>pending approval</span>".to_owned(),
                 "delayed" => match v.cooldown_days_left {
-                    None => "<span class='badge'>pending</span>".to_owned(),
+                    None => "<span class='badge amber'>pending</span>".to_owned(),
                     Some(0) => "<span class='badge ok'>live</span>".to_owned(),
-                    Some(n) => format!("<span class='badge'>cooldown · {n}d left</span>"),
+                    Some(n) => format!("<span class='badge blue'>cooldown · {n}d left</span>"),
                 },
                 _ => "<span class='badge ok'>live</span>".to_owned(),
             }
@@ -1250,14 +1309,14 @@ async fn repo_page(
     for p in packages.iter().filter(|p| p.archived || p.sync_health == "broken") {
         let (badge, action, label) = if p.archived {
             (
-                "<span class=badge>archived · frozen</span>".to_owned(),
+                "<span class='badge slate'>archived · frozen</span>".to_owned(),
                 "unarchive",
                 "Un-archive",
             )
         } else {
             (
                 format!(
-                    "<span class='badge held'>broken</span> <span class=muted>{}</span>",
+                    "<span class='badge amber'>broken</span> <span class=muted>{}</span>",
                     esc(p.broken_reason.as_deref().unwrap_or("?"))
                 ),
                 "archive",
@@ -1482,6 +1541,12 @@ async fn repo_page(
         } else {
             "<span class=muted>inherit</span>".to_owned()
         };
+        let origin_tone = match t.origin.as_str() {
+            "ci" => "violet",
+            "session" => "blue",
+            _ => "slate",
+        };
+        let origin = format!("<span class='badge {origin_tone}'>{}</span>", esc(&t.origin));
         let _ = write!(
             acc,
             "<tr><td>{name}</td><td>{origin}</td><td>{created}</td><td>{last}</td><td>{expiry}</td>\
@@ -1489,7 +1554,6 @@ async fn repo_page(
              <td><form class=inline method=post action=\"/r/{slug}/token/revoke\" \
              onsubmit=\"return confirm('Revoke this token? Installs using it will stop working.')\">\
              <input type=hidden name=id value=\"{id}\"><button>Revoke</button></form></td></tr>",
-            origin = esc(&t.origin),
             created = esc(&t.created),
             id = t.id,
         );
@@ -1517,7 +1581,7 @@ async fn repo_page(
     } else {
         (
             "<style>.ro form{display:none}</style>\
-             <p class=held>Read-only (member) access — ask an org admin to make changes.</p>\
+             <p class=banner>Read-only (member) access — ask an org admin to make changes.</p>\
              <div class=ro>"
                 .to_owned(),
             "</div>".to_owned(),
