@@ -238,6 +238,12 @@ enum Command {
         action: DepsAction,
     },
 
+    /// Inspect package lifecycle and archive/un-archive broken packages.
+    Package {
+        #[command(subcommand)]
+        action: PackageAction,
+    },
+
     /// Run the background mirror worker: drain the job queue, then wait for
     /// NOTIFY (with a poll backstop) and repeat. Runs until killed.
     Worker {
@@ -619,6 +625,39 @@ enum DepsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum PackageAction {
+    /// List packages with their lifecycle (healthy / broken / archived / stale).
+    List {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Archive a package: freeze it and silence its broken flag. Its already-
+    /// mirrored versions keep serving; no new versions are pulled.
+    Archive {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Package name, e.g. `vendor/abandoned`.
+        package: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Un-archive a package: resume syncing (health is re-detected).
+    Unarchive {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Package name.
+        package: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum TokenAction {
     /// Create a new token for a repository and print it once.
     Create {
@@ -778,6 +817,19 @@ fn main() -> Result<()> {
                 package,
                 database_url,
             } => deps_add(&repo, &package, &database_url),
+        },
+        Command::Package { action } => match action {
+            PackageAction::List { repo, database_url } => package_list(&repo, &database_url),
+            PackageAction::Archive {
+                repo,
+                package,
+                database_url,
+            } => package_set_archived(&repo, &package, true, &database_url),
+            PackageAction::Unarchive {
+                repo,
+                package,
+                database_url,
+            } => package_set_archived(&repo, &package, false, &database_url),
         },
         Command::Worker { cas, database_url } => worker(&cas, &database_url),
         Command::RepoSettings {
@@ -1126,6 +1178,49 @@ fn deps_resolve(repo: &str, database_url: &str) -> Result<()> {
             .await
             .context("enqueueing resolve job")?;
         println!("queued dependency resolution for {repo} — run `sconce worker` to compute it, then `sconce deps plan --repo {repo}`.");
+        Ok(())
+    })
+}
+
+fn package_list(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let packages = catalog.list_packages(repo_id).await.context("listing packages")?;
+        if packages.is_empty() {
+            eprintln!("No packages yet.");
+        }
+        for p in &packages {
+            // archived masks broken; a long-stale healthy package is informational.
+            let state = if p.archived {
+                "archived".to_owned()
+            } else if p.sync_health == "broken" {
+                format!("BROKEN ({})", p.broken_reason.as_deref().unwrap_or("?"))
+            } else {
+                "ok".to_owned()
+            };
+            let last = p.last_success_at.as_deref().unwrap_or("never");
+            println!("{:<22} {:<8} {:<22} last-sync {last}", state, p.visibility, p.name);
+        }
+        Ok(())
+    })
+}
+
+fn package_set_archived(repo: &str, package: &str, archived: bool, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let changed = if archived {
+            catalog.archive_package(repo_id, package).await
+        } else {
+            catalog.unarchive_package(repo_id, package).await
+        }
+        .context("updating archive state")?;
+        if !changed {
+            anyhow::bail!("no such package `{package}` in {repo}");
+        }
+        println!(
+            "{package}: {}",
+            if archived { "archived (frozen)" } else { "un-archived (syncing resumes)" }
+        );
         Ok(())
     })
 }

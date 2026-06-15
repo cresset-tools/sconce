@@ -113,6 +113,7 @@ pub fn router(
         .route("/r/{org}/{repo}/upstream/sync", post(sync_upstream))
         .route("/r/{org}/{repo}/deps/resolve", post(resolve_deps))
         .route("/r/{org}/{repo}/deps/add", post(add_dep))
+        .route("/r/{org}/{repo}/package/archive", post(package_archive))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }
@@ -1162,6 +1163,7 @@ async fn repo_page(
     let licenses = s.catalog.list_licenses(summary.id).await.map_err(e500)?;
     let grants = s.catalog.list_grants(summary.id).await.map_err(e500)?;
     let upstreams = s.catalog.list_upstreams(summary.id).await.map_err(e500)?;
+    let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
     let dep_plan = s.catalog.list_dependency_plan(summary.id).await.map_err(e500)?;
     let slug = format!("{}/{}", esc(&org), esc(&repo));
 
@@ -1216,6 +1218,55 @@ async fn repo_page(
     if versions.is_empty() {
         rows = "<tr><td colspan=5 class=muted>No packages yet. Mirror one with <code>sconce mirror</code>.</td></tr>".into();
     }
+
+    // Package health: only the actionable ones (broken or archived). Already-
+    // mirrored versions keep serving regardless — this is about new versions.
+    let mut health_rows = String::new();
+    let broken_count = packages
+        .iter()
+        .filter(|p| p.sync_health == "broken" && !p.archived)
+        .count();
+    for p in packages.iter().filter(|p| p.archived || p.sync_health == "broken") {
+        let (badge, action, label) = if p.archived {
+            (
+                "<span class=badge>archived · frozen</span>".to_owned(),
+                "unarchive",
+                "Un-archive",
+            )
+        } else {
+            (
+                format!(
+                    "<span class='badge held'>broken</span> <span class=muted>{}</span>",
+                    esc(p.broken_reason.as_deref().unwrap_or("?"))
+                ),
+                "archive",
+                "Archive",
+            )
+        };
+        let last = p.last_success_at.as_deref().unwrap_or("never");
+        let _ = write!(
+            health_rows,
+            "<tr><td>{pkg}</td><td>{badge}</td><td class=muted>last sync {last}</td><td>\
+             <form class=inline method=post action=\"/r/{slug}/package/archive\">\
+             <input type=hidden name=package value=\"{pkg}\">\
+             <button name=action value={action}>{label}</button></form></td></tr>",
+            pkg = esc(&p.name),
+            last = esc(last),
+        );
+    }
+    let health_section = if health_rows.is_empty() {
+        String::new()
+    } else {
+        let note = if broken_count > 0 {
+            format!("<p class=muted>{broken_count} package(s) can't sync (still serving their existing versions). Archive to acknowledge and silence.</p>")
+        } else {
+            String::new()
+        };
+        format!(
+            "<h2>Package health</h2>{note}<table>\
+             <tr><th>Package</th><th>State</th><th>Last sync</th><th>Actions</th></tr>{health_rows}</table>"
+        )
+    };
 
     let mut grant_rows = String::new();
     for g in &grants {
@@ -1415,7 +1466,7 @@ async fn repo_page(
             "<h1>{slug} <a class=muted style=\"font-size:.9rem\" href=\"/r/{slug}/settings\">settings</a></h1>{ro_open}{policy}\
              <h2>Packages &amp; versions</h2><table>\
              <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>\
-             {upstreams_section}{deps_section}{grants_section}{licenses_section}{install}{ro_close}"
+             {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{install}{ro_close}"
         ),
     ))
 }
@@ -1468,6 +1519,28 @@ async fn version_action(
                 .approve_version(id, &f.package, &f.normalized)
                 .await
         }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct PackageActionForm {
+    package: String,
+    action: String,
+}
+
+async fn package_archive(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<PackageActionForm>,
+) -> Result<Redirect, StatusCode> {
+    let id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    match f.action.as_str() {
+        "archive" => s.catalog.archive_package(id, &f.package).await,
+        "unarchive" => s.catalog.unarchive_package(id, &f.package).await,
         _ => return Err(StatusCode::BAD_REQUEST),
     }
     .map_err(e500)?;
