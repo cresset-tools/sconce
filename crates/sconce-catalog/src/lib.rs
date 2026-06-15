@@ -106,6 +106,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     ("0023_scim", include_str!("../migrations/0023_scim.sql")),
     ("0024_ci_oidc", include_str!("../migrations/0024_ci_oidc.sql")),
+    (
+        "0025_package_lifecycle",
+        include_str!("../migrations/0025_package_lifecycle.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -191,6 +195,21 @@ pub struct UpstreamSummary {
     pub job_status: Option<String>,
     /// Error from the most recent job, if it failed.
     pub job_error: Option<String>,
+}
+
+/// A package with its lifecycle state, for the operator view. `sync_health` is
+/// `ok`/`broken`; `archived_at` non-null means the operator froze it (which masks
+/// a broken flag). `broken`/`stale` are *not* serving states — every mirrored
+/// version keeps serving from the CAS regardless.
+#[derive(Debug, Clone)]
+pub struct PackageStatus {
+    pub name: String,
+    pub visibility: String,
+    pub sync_health: String,
+    pub broken_reason: Option<String>,
+    pub broken_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub archived: bool,
 }
 
 /// A claimed job handed to the worker. `kind` selects which fields are set:
@@ -1208,6 +1227,132 @@ impl Catalog {
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// Packages in a repo with their lifecycle state, newest-broken first then by
+    /// name. The operator view (not the serving read path — serving ignores
+    /// lifecycle).
+    pub async fn list_packages(&self, repo_id: Uuid) -> Result<Vec<PackageStatus>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select name, visibility, sync_health, broken_reason, \
+                    to_char(broken_at,       'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as broken_at, \
+                    to_char(last_success_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as last_success_at, \
+                    archived_at is not null as archived \
+             from packages where repo_id = $1 \
+             order by (sync_health = 'broken' and archived_at is null) desc, name",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(PackageStatus {
+                    name: r.try_get("name")?,
+                    visibility: r.try_get("visibility")?,
+                    sync_health: r.try_get("sync_health")?,
+                    broken_reason: r.try_get("broken_reason")?,
+                    broken_at: r.try_get("broken_at")?,
+                    last_success_at: r.try_get("last_success_at")?,
+                    archived: r.try_get("archived")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record a successful sync of a package: stamp `last_success_at` and **clear
+    /// any broken flag** (a package that synced is healthy again). No-op if the
+    /// package doesn't exist.
+    pub async fn mark_package_synced(&self, repo_id: Uuid, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update packages set last_success_at = now(), \
+                 sync_health = 'ok', broken_reason = null, broken_at = null \
+             where repo_id = $1 and name = $2",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Flag an **existing** package broken after a *terminal* sync failure (the
+    /// caller has already classified it). Preserves an earlier `broken_at`.
+    /// Returns whether a row was flagged (only existing packages are flagged —
+    /// we never create one here). Archived packages are skipped (the operator
+    /// already acknowledged them).
+    pub async fn mark_package_broken(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+        reason: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update packages set sync_health = 'broken', broken_reason = $3, \
+                 broken_at = coalesce(broken_at, now()) \
+             where repo_id = $1 and name = $2 and archived_at is null",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Archive a package: freeze it (stop scheduling syncs) and mask any broken
+    /// flag. Also cancels its pending per-package mirror jobs. Idempotent.
+    pub async fn archive_package(&self, repo_id: Uuid, name: &str) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let n = sqlx::query(
+            "update packages set archived_at = coalesce(archived_at, now()) \
+             where repo_id = $1 and name = $2",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        // Cancel any pending sync for this package so it stops failing.
+        // mirror_package jobs carry (upstream_id, package), not repo_id, so scope
+        // by the package's upstream belonging to this repo.
+        sqlx::query(
+            "delete from mirror_jobs mj using upstreams u \
+             where mj.kind = 'mirror_package' and mj.status = 'pending' \
+               and mj.package = $2 and mj.upstream_id = u.id and u.repo_id = $1",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Un-archive a package: resume syncing (health is re-detected on next sync).
+    pub async fn unarchive_package(&self, repo_id: Uuid, name: &str) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update packages set archived_at = null where repo_id = $1 and name = $2",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Names of packages in a repo bound to `upstream_id` that are **not**
+    /// archived — used by the registry mirror to skip frozen packages and to
+    /// reconcile removals.
+    pub async fn upstream_package_names(
+        &self,
+        upstream_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select name from packages where upstream_id = $1 and archived_at is null order by name",
+        )
+        .bind(upstream_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| r.try_get("name")).collect()
     }
 
     /// Upsert a version of a package, returning its id.
@@ -2952,6 +3097,51 @@ mod tests {
         assert!(got.credential.is_none(), "public upstream stores no credential");
         let listed = cat.list_upstreams(repo_id).await.unwrap();
         assert!(!listed.iter().find(|u| u.id == id).unwrap().has_credential);
+    }
+
+    #[tokio::test]
+    async fn package_lifecycle_broken_synced_archived() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let name = "vendor/lifecycle";
+        cat.upsert_package(repo_id, name, "composer", None, Visibility::Private)
+            .await
+            .unwrap();
+
+        // Fresh package: healthy, not archived, no broken info.
+        let p = &cat.list_packages(repo_id).await.unwrap()[0];
+        assert_eq!(p.sync_health, "ok");
+        assert!(!p.archived);
+        assert!(p.broken_reason.is_none() && p.last_success_at.is_none());
+
+        // A terminal failure flags an existing package; a missing one is a no-op.
+        assert!(cat.mark_package_broken(repo_id, name, "source_gone").await.unwrap());
+        assert!(!cat.mark_package_broken(repo_id, "vendor/nope", "x").await.unwrap());
+        let p = &cat.list_packages(repo_id).await.unwrap()[0];
+        assert_eq!(p.sync_health, "broken");
+        assert_eq!(p.broken_reason.as_deref(), Some("source_gone"));
+        assert!(p.broken_at.is_some());
+
+        // A successful sync clears broken and stamps last_success_at.
+        cat.mark_package_synced(repo_id, name).await.unwrap();
+        let p = &cat.list_packages(repo_id).await.unwrap()[0];
+        assert_eq!(p.sync_health, "ok");
+        assert!(p.broken_reason.is_none() && p.broken_at.is_none());
+        assert!(p.last_success_at.is_some());
+
+        // Archiving masks the broken flag: a later terminal failure won't re-flag.
+        cat.mark_package_broken(repo_id, name, "source_gone").await.unwrap();
+        assert!(cat.archive_package(repo_id, name).await.unwrap());
+        assert!(
+            !cat.mark_package_broken(repo_id, name, "source_gone").await.unwrap(),
+            "archived packages are not re-flagged"
+        );
+        assert!(cat.list_packages(repo_id).await.unwrap()[0].archived);
+
+        // Un-archive resumes normal handling.
+        assert!(cat.unarchive_package(repo_id, name).await.unwrap());
+        assert!(!cat.list_packages(repo_id).await.unwrap()[0].archived);
     }
 
     #[tokio::test]
