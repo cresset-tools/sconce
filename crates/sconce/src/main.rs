@@ -182,6 +182,27 @@ enum Command {
         database_url: String,
     },
 
+    /// Rename an organization. The old slug keeps redirecting (so composer.lock
+    /// URLs still work) and is permanently retired.
+    OrgRename {
+        /// Current organization slug.
+        org: String,
+        /// New slug.
+        new_slug: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Rename a repository. The old name keeps redirecting and is retired.
+    RepoRename {
+        /// Repository, as `<org>/<repo>`.
+        repo: String,
+        /// New repository slug.
+        new_slug: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Manage a repo's upstreams (where packages are mirrored from).
     Upstream {
         #[command(subcommand)]
@@ -871,6 +892,16 @@ fn main() -> Result<()> {
             repo,
             database_url,
         } => repo_create(&org, &repo, &database_url),
+        Command::OrgRename {
+            org,
+            new_slug,
+            database_url,
+        } => org_rename(&org, &new_slug, &database_url),
+        Command::RepoRename {
+            repo,
+            new_slug,
+            database_url,
+        } => repo_rename(&repo, &new_slug, &database_url),
         Command::UserCreate {
             email,
             password,
@@ -1475,11 +1506,39 @@ async fn resolve_repo(catalog: &sconce_catalog::Catalog, spec: &str) -> Result<u
 
 fn org_create(slug: &str, name: Option<&str>, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
+        if catalog.org_slug_retired(slug).await? {
+            anyhow::bail!("'{slug}' was previously used and is retired");
+        }
         catalog
             .create_org(slug, name)
             .await
             .context("creating org")?;
         println!("org created: {slug}");
+        Ok(())
+    })
+}
+
+fn org_rename(org: &str, new_slug: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let org_id = catalog
+            .list_organizations()
+            .await
+            .context("listing orgs")?
+            .into_iter()
+            .find(|o| o.slug == org)
+            .with_context(|| format!("no such org: {org}"))?
+            .id;
+        catalog.rename_org(org_id, new_slug).await?;
+        println!("org renamed: {org} → {new_slug} (old slug retired; still redirects)");
+        Ok(())
+    })
+}
+
+fn repo_rename(repo: &str, new_slug: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        catalog.rename_repo(repo_id, new_slug).await?;
+        println!("repo renamed to {new_slug} (old name retired; still redirects)");
         Ok(())
     })
 }
@@ -1591,6 +1650,18 @@ fn repo_settings(
 
 fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
+        // A retired repo slug can't be reused (it still redirects).
+        if let Some(org_id) = catalog
+            .list_organizations()
+            .await
+            .context("listing orgs")?
+            .into_iter()
+            .find(|o| o.slug == org)
+            .map(|o| o.id)
+            && catalog.repo_slug_retired(org_id, repo).await?
+        {
+            anyhow::bail!("'{repo}' was previously used in {org} and is retired");
+        }
         catalog
             .create_repo(org, repo)
             .await

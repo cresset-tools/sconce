@@ -101,9 +101,11 @@ pub fn router(
         .route("/users/grant", post(grant_tenant))
         .route("/orgs", post(create_org))
         .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
+        .route("/o/{org}/rename", post(rename_org_action))
         .route("/repos", post(create_repo))
         .route("/r/{org}/{repo}", get(repo_page))
         .route("/r/{org}/{repo}/settings", get(repo_settings_page).post(save_repo_settings))
+        .route("/r/{org}/{repo}/rename", post(rename_repo_action))
         .route("/r/{org}/{repo}/policy", post(set_policy))
         .route("/r/{org}/{repo}/version", post(version_action))
         .route("/r/{org}/{repo}/token", post(create_token))
@@ -563,9 +565,33 @@ async fn org_settings_page(
          <p>Max token expiry (days), blank = no limit: \
          <input name=max_token_ttl_days type=number min=1 value=\"{max_ttl}\" style=\"width:7em\"></p>\
          <button>Save settings</button></form>\
-         <p><a href=\"/\">← back</a></p>"
+         <h2>Rename organization</h2>{former}\
+         <p class=muted>Old URLs keep working via redirect, so existing \
+         <code>composer.lock</code> files don't break. The old slug is \
+         <strong>permanently retired</strong> and can't be reused.</p>\
+         <form class=row method=post action=\"/o/{slug}/rename\">\
+         new slug <input name=slug placeholder=\"{slug}\" required> <button>Rename</button></form>\
+         <p><a href=\"/\">← back</a></p>",
+        former = former_line(&s, "org", summary.id).await,
     );
     Ok(shell(&s, &user, &format!("{org} settings"), &body))
+}
+
+async fn rename_org_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path(org): Path<String>,
+    Form(f): Form<RenameForm>,
+) -> Result<Response, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    let new = f.slug.trim().to_owned();
+    match s.catalog.rename_org(summary.id, &new).await {
+        Ok(()) => Ok(Redirect::to(&format!("/o/{new}/settings")).into_response()),
+        Err(e @ (sconce_catalog::RenameError::Taken | sconce_catalog::RenameError::Retired)) => {
+            Ok(rename_failed(&s, &user, &format!("/o/{org}/settings"), &e.to_string()))
+        }
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -664,9 +690,59 @@ async fn repo_settings_page(
          added and any already present aren't served.</span></p>\
          <button>Save settings</button></form>\
          <p><strong>Effective now:</strong> raw tokens {eff_raw}, max TTL {eff_ttl}.</p>\
-         <p><a href=\"/r/{slug}\">← back to {slug}</a></p>"
+         <h2>Rename repository</h2>{former}\
+         <p class=muted>Old URLs keep working via redirect, so existing \
+         <code>composer.lock</code> files don't break. The old name is \
+         <strong>permanently retired</strong> and can't be reused. Update your \
+         <code>composer config</code> when convenient.</p>\
+         <form class=row method=post action=\"/r/{slug}/rename\">\
+         new name <input name=slug placeholder=\"{repo}\" required> <button>Rename</button></form>\
+         <p><a href=\"/r/{slug}\">← back to {slug}</a></p>",
+        former = former_line(&s, "repo", summary.id).await,
     );
     Ok(shell(&s, &user, &format!("{org}/{repo} settings"), &body))
+}
+
+/// A muted "Formerly: a, b" line (still redirecting), or empty if never renamed.
+async fn former_line(s: &Ui, entity_type: &str, entity_id: Uuid) -> String {
+    match s.catalog.former_slugs(entity_type, entity_id).await {
+        Ok(v) if !v.is_empty() => format!(
+            "<p class=muted>Formerly (still redirecting): {}</p>",
+            v.iter().map(|x| format!("<code>{}</code>", esc(x))).collect::<Vec<_>>().join(", ")
+        ),
+        _ => String::new(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameForm {
+    slug: String,
+}
+
+/// Render a rename failure (taken/retired) with the reason and a back link.
+fn rename_failed(s: &Ui, user: &CurrentUser, back: &str, msg: &str) -> Response {
+    let body = format!(
+        "<h1>Rename failed</h1><p class=banner>{}</p><p><a href=\"{back}\">← back</a></p>",
+        esc(msg)
+    );
+    shell(s, user, "Rename failed", &body).into_response()
+}
+
+async fn rename_repo_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<RenameForm>,
+) -> Result<Response, StatusCode> {
+    let summary = lookup_admin(&s, &user, &org, &repo).await?;
+    let new = f.slug.trim().to_owned();
+    match s.catalog.rename_repo(summary.id, &new).await {
+        Ok(()) => Ok(Redirect::to(&format!("/r/{org}/{new}")).into_response()),
+        Err(e @ (sconce_catalog::RenameError::Taken | sconce_catalog::RenameError::Retired)) => {
+            Ok(rename_failed(&s, &user, &format!("/r/{org}/{repo}/settings"), &e.to_string()))
+        }
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1395,6 +1471,10 @@ async fn create_org(
     if !user.is_superadmin {
         return Err(StatusCode::FORBIDDEN);
     }
+    // A retired slug can never be re-registered (it still redirects elsewhere).
+    if s.catalog.org_slug_retired(f.slug.trim()).await.map_err(e500)? {
+        return Err(StatusCode::CONFLICT);
+    }
     let name = f.name.as_deref().filter(|n| !n.is_empty());
     s.catalog.create_org(&f.slug, name).await.map_err(e500)?;
     Ok(Redirect::to("/"))
@@ -1422,6 +1502,10 @@ async fn create_repo(
         .ok_or(StatusCode::BAD_REQUEST)?;
     if !user.can_admin(org.id) {
         return Err(StatusCode::FORBIDDEN);
+    }
+    // A retired repo slug can't be reused (it still redirects).
+    if s.catalog.repo_slug_retired(org.id, f.repo.trim()).await.map_err(e500)? {
+        return Err(StatusCode::CONFLICT);
     }
     s.catalog
         .create_repo(&f.org, &f.repo)

@@ -643,6 +643,47 @@ impl Catalog {
         }))
     }
 
+    /// Former (retired) slugs for an entity, newest first — for showing "formerly
+    /// known as" on the settings page.
+    pub async fn former_slugs(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select old_slug from slug_history \
+             where entity_type = $1 and entity_id = $2 order by retired_at desc",
+        )
+        .bind(entity_type)
+        .bind(entity_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| r.try_get("old_slug")).collect()
+    }
+
+    /// Whether an org slug is **retired** (in history) — the guard that blocks
+    /// re-registering a name that still redirects elsewhere.
+    pub async fn org_slug_retired(&self, slug: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "select exists(select 1 from slug_history where entity_type = 'org' and old_slug = $1)",
+        )
+        .bind(slug)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// As [`Self::org_slug_retired`], scoped within an org for a repo slug.
+    pub async fn repo_slug_retired(&self, org_id: Uuid, slug: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "select exists(select 1 from slug_history \
+             where entity_type = 'repo' and org_id = $1 and old_slug = $2)",
+        )
+        .bind(org_id)
+        .bind(slug)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Whether an org slug is in use by a live org **or** retired in history — the
     /// guard that keeps a retired slug from being re-registered.
     pub async fn org_slug_unavailable(&self, slug: &str) -> Result<bool, sqlx::Error> {
