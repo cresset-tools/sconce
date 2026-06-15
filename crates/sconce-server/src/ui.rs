@@ -133,6 +133,7 @@ pub fn router(
         .route("/r/{org}/{repo}/deps/resolve", post(resolve_deps))
         .route("/r/{org}/{repo}/deps/add", post(add_dep))
         .route("/r/{org}/{repo}/package/archive", post(package_archive))
+        .route("/r/{org}/{repo}/p/{*pkg}", get(package_detail_page))
         .route("/r/{org}/{repo}/ci", post(add_ci))
         .route("/r/{org}/{repo}/ci/remove", post(remove_ci))
         .fallback(not_found_page)
@@ -2254,7 +2255,7 @@ async fn repo_page(
         };
         let _ = write!(
             rows,
-            "<tr><td>{pkg}</td><td>{ver} <span class=muted>{norm}</span></td><td>{stab}</td>\
+            "<tr><td><a href=\"/r/{slug}/p/{pkg}\">{pkg}</a></td><td>{ver} <span class=muted>{norm}</span></td><td>{stab}</td>\
              <td>{badge} <span class=muted>{rel}</span></td><td>\
              <form class=inline method=post action=\"/r/{slug}/version\">\
              <input type=hidden name=package value=\"{pkg}\"><input type=hidden name=normalized value=\"{norm}\">\
@@ -2789,6 +2790,124 @@ async fn version_action(
 struct PackageActionForm {
     package: String,
     action: String,
+}
+
+/// D11 — per-package detail: lifecycle header + version provenance + actions.
+#[allow(clippy::too_many_lines)] // page builder; clearer kept together
+async fn package_detail_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo, pkg)): Path<(String, String, String)>,
+) -> Result<Html<String>, StatusCode> {
+    let summary = lookup(&s, &user, &org, &repo).await?;
+    let slug = format!("{}/{}", esc(&org), esc(&repo));
+    let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
+    let Some(ps) = packages.iter().find(|p| p.name == pkg) else {
+        return Ok(status_page("Package not found", "No such package in this repository."));
+    };
+    let versions = s
+        .catalog
+        .admin_package_versions(summary.id, 500, 0, Some(&pkg), None)
+        .await
+        .map_err(e500)?;
+
+    // Lifecycle header badge + optional archive action.
+    let stale = ps.sync_health == "ok" && !ps.archived && ps.upstream_error.is_some();
+    let (life_badge, life_action) = if ps.archived {
+        (
+            "<span class='badge slate'>archived · frozen</span>".to_owned(),
+            "<button name=action value=unarchive>Un-archive</button>",
+        )
+    } else if ps.sync_health == "broken" {
+        (
+            format!(
+                "<span class='badge amber'>broken</span> <span class=muted>{}</span>",
+                esc(ps.broken_reason.as_deref().unwrap_or("?"))
+            ),
+            "<button name=action value=archive>Archive</button>",
+        )
+    } else if stale {
+        (
+            "<span class='badge blue'>sync stale · retrying</span>".to_owned(),
+            "<button name=action value=archive>Archive</button>",
+        )
+    } else {
+        ("<span class='badge ok'>healthy</span>".to_owned(), "")
+    };
+    let action_form = if life_action.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<form class=inline method=post action=\"/r/{slug}/package/archive\">\
+             <input type=hidden name=package value=\"{}\">{life_action}</form>",
+            esc(&pkg)
+        )
+    };
+    let last = ps.last_success_at.as_deref().unwrap_or("never");
+
+    let mut rows = String::new();
+    for v in &versions {
+        let badge = if v.yanked {
+            "<span class='badge held'>yanked</span>".to_owned()
+        } else if v.held {
+            "<span class='badge held'>held</span>".to_owned()
+        } else if v.approved {
+            "<span class='badge ok'>approved</span>".to_owned()
+        } else {
+            match summary.update_mode.as_str() {
+                "manual" => "<span class='badge amber'>pending</span>".to_owned(),
+                "delayed" => match v.cooldown_days_left {
+                    None | Some(0) => "<span class='badge ok'>live</span>".to_owned(),
+                    Some(n) => format!("<span class='badge blue'>cooldown · {n}d</span>"),
+                },
+                _ => "<span class='badge ok'>live</span>".to_owned(),
+            }
+        };
+        let _ = write!(
+            rows,
+            "<tr><td class=mono>{ver}</td><td>{badge}</td><td class=muted>{rel}</td>\
+             <td class=mono style=\"font-size:11px\">{sha}</td><td class=mono style=\"font-size:11px\">{src}</td><td>\
+             <form class=inline method=post action=\"/r/{slug}/version\">\
+             <input type=hidden name=package value=\"{pkg}\"><input type=hidden name=normalized value=\"{norm}\">\
+             <button name=action value={hold_act}>{hold_lbl}</button> \
+             <button name=action value=approve>Approve</button> \
+             <button name=action value={yank_act}>{yank_lbl}</button></form></td></tr>",
+            ver = esc(&v.version),
+            rel = esc(v.released_at.as_deref().unwrap_or("")),
+            sha = esc(v.dist_shasum.as_deref().unwrap_or("—")),
+            src = esc(v.source_reference.as_deref().unwrap_or("—")),
+            pkg = esc(&pkg),
+            norm = esc(&v.normalized_version),
+            hold_act = if v.held { "unhold" } else { "hold" },
+            hold_lbl = if v.held { "Unhold" } else { "Hold" },
+            yank_act = if v.yanked { "unyank" } else { "yank" },
+            yank_lbl = if v.yanked { "Unyank" } else { "Yank" },
+        );
+    }
+
+    let abandoned = ps
+        .upstream_error
+        .as_deref()
+        .filter(|_| stale)
+        .map_or(String::new(), |e| {
+            format!("<p class=muted>Last sync error: <code>{}</code></p>", esc(e))
+        });
+    Ok(shell(
+        &s,
+        &user,
+        &pkg,
+        &format!(
+            "<div class=repohead><h1 class=mono>{pkgname}</h1> {life_badge} \
+             <a class=muted style=\"font-size:.85rem\" href=\"/r/{slug}\">← {slug}</a></div>\
+             <p class=summary>{vis} · {nver} version(s) · last sync {last}</p>{action_form}{abandoned}\
+             <h2>Versions</h2><table>\
+             <tr><th>Version</th><th>State</th><th>Released</th><th>Dist sha1</th><th>Source</th><th>Actions</th></tr>{rows}</table>",
+            pkgname = esc(&pkg),
+            vis = esc(&ps.visibility),
+            nver = versions.len(),
+            last = esc(last),
+        ),
+    ))
 }
 
 async fn package_archive(

@@ -463,6 +463,10 @@ pub struct AdminVersion {
     /// `None` when it has no release date). Lets the operator view show a
     /// countdown that matches what serving hides.
     pub cooldown_days_left: Option<i64>,
+    /// Provenance (shown on the package detail page): the dist sha1 and the
+    /// source git ref/commit.
+    pub dist_shasum: Option<String>,
+    pub source_reference: Option<String>,
 }
 
 /// A credential's optional supply-chain policy override (`None` = inherit the
@@ -999,7 +1003,8 @@ impl Catalog {
                     case when pv.released_at is null then null else \
                         greatest(0, ceil(extract(epoch from \
                             (pv.released_at + make_interval(days => r.cooldown_days) - now())) / 86400))::bigint \
-                    end as cooldown_days_left \
+                    end as cooldown_days_left, \
+                    pv.dist_shasum as dist_shasum, pv.source_reference as source_reference \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
              join repositories r on r.id = $1 \
@@ -1026,6 +1031,8 @@ impl Catalog {
                     yanked: row.try_get("yanked")?,
                     released_at: row.try_get("released_at")?,
                     cooldown_days_left: row.try_get("cooldown_days_left")?,
+                    dist_shasum: row.try_get("dist_shasum")?,
+                    source_reference: row.try_get("source_reference")?,
                 })
             })
             .collect()
