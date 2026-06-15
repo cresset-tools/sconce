@@ -41,6 +41,8 @@ struct Ui {
 /// The viewer's access, resolved per request.
 #[derive(Clone)]
 struct CurrentUser {
+    /// The user id, or `None` for single-tenant all-access (no real account).
+    id: Option<Uuid>,
     is_superadmin: bool,
     /// Orgs the user is a member of (read access).
     tenants: HashSet<Uuid>,
@@ -51,6 +53,7 @@ struct CurrentUser {
 impl CurrentUser {
     fn all_access() -> Self {
         Self {
+            id: None,
             is_superadmin: true,
             tenants: HashSet::new(),
             admin_tenants: HashSet::new(),
@@ -96,6 +99,8 @@ pub fn router(
                 .delete(scim_delete_user),
         )
         .route("/logout", post(logout))
+        .route("/account", get(account_page))
+        .route("/account/revoke", post(revoke_my_session))
         .route("/users", get(users_page).post(create_user))
         .route("/activity", get(activity_page))
         .route("/users/grant", post(grant_tenant))
@@ -172,6 +177,7 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
     match user {
         Some(u) => {
             req.extensions_mut().insert(CurrentUser {
+                id: Some(u.id),
                 is_superadmin: u.is_superadmin,
                 tenants: u.tenant_org_ids.into_iter().collect(),
                 admin_tenants: u.admin_org_ids.into_iter().collect(),
@@ -435,11 +441,16 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
     } else {
         "Member"
     };
-    // No session to end in single-tenant (HTTP-basic), so no log-out there.
+    // No session to end in single-tenant (HTTP-basic), so no log-out / account.
     let logout = if s.single_tenant {
         String::new()
     } else {
         "<form method=post action=/logout><button>Log out</button></form>".to_owned()
+    };
+    let (user_open, user_close) = if s.single_tenant {
+        ("", "")
+    } else {
+        ("<a href=/account title=Account style=\"display:flex;align-items:center;gap:9px;flex:1;min-width:0;text-decoration:none\">", "</a>")
     };
 
     format!(
@@ -448,10 +459,10 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
              <span><span class=name>Bougie Repo</span><span class=sub>{sub}</span></span></a>\
            <nav class=side-nav>{nav}</nav>\
            <div class=userbox>\
-             <span class=avatar><svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none stroke=currentColor \
+             {user_open}<span class=avatar><svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none stroke=currentColor \
                stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=8 r=4></circle>\
                <path d=\"M4 21a8 8 0 0 1 16 0\"></path></svg></span>\
-             <span style=\"flex:1;min-width:0\"><span class=rolepill>{role}</span></span>{logout}\
+             <span style=\"flex:1;min-width:0\"><span class=rolepill>{role}</span></span>{user_close}{logout}\
            </div></aside>"
     )
 }
@@ -1382,6 +1393,81 @@ async fn logout(State(s): State<Ui>, headers: HeaderMap) -> Response {
         "/login",
         "sconce_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
     )
+}
+
+/// A4 — the signed-in user's account: email + active sessions (revocable).
+async fn account_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
+    let Some(uid) = user.id else {
+        return Ok(shell(
+            &s,
+            &user,
+            "Account",
+            "<h1>Account</h1><p class=muted>Single-tenant mode uses HTTP-basic admin auth — \
+             there's no per-user account here.</p>",
+        ));
+    };
+    let email = s.catalog.user_email(uid).await.map_err(e500)?.unwrap_or_default();
+    let current = session_cookie(&headers);
+    let sessions = s
+        .catalog
+        .list_sessions(uid, current.as_deref())
+        .await
+        .map_err(e500)?;
+    let mut rows = String::new();
+    for sn in &sessions {
+        let this = if sn.current {
+            " <span class='badge ok'>this device</span>"
+        } else {
+            ""
+        };
+        let _ = write!(
+            rows,
+            "<tr><td>{created}{this}</td><td class=muted>{expires}</td><td>\
+             <form class=inline method=post action=/account/revoke>\
+             <input type=hidden name=id value=\"{id}\"><button>Revoke</button></form></td></tr>",
+            created = esc(&sn.created),
+            expires = esc(&sn.expires),
+            id = esc(&sn.hash_hex),
+        );
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "Account",
+        &format!(
+            "<h1>Account</h1>\
+             <p>Signed in as <strong>{email}</strong>{admin}.</p>\
+             <h2>Active sessions</h2>\
+             <p class=muted>Revoke any session to sign that device out. Revoking <em>this device</em> \
+             signs you out here.</p>\
+             <table><tr><th>Signed in</th><th>Expires</th><th></th></tr>{rows}</table>\
+             <form class=row method=post action=/logout><button>Sign out</button></form>",
+            email = esc(&email),
+            admin = if user.is_superadmin { " (superadmin)" } else { "" },
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RevokeSessionForm {
+    id: String,
+}
+
+async fn revoke_my_session(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<RevokeSessionForm>,
+) -> Result<Redirect, StatusCode> {
+    let uid = user.id.ok_or(StatusCode::FORBIDDEN)?;
+    s.catalog
+        .revoke_session_for_user(uid, &f.id)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to("/account"))
 }
 
 // ----- superadmin: users -----

@@ -412,6 +412,17 @@ pub struct UserSummary {
     pub tenants: Vec<String>,
 }
 
+/// One of a user's active login sessions (for the account page).
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// Hex of the token hash — identifies the session for revocation.
+    pub hash_hex: String,
+    pub created: String,
+    pub expires: String,
+    /// Whether this is the session making the current request.
+    pub current: bool,
+}
+
 /// A version row for the admin UI, with its control state.
 #[derive(Debug, Clone)]
 pub struct AdminVersion {
@@ -1088,6 +1099,62 @@ impl Catalog {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// A user's email (for the account page).
+    pub async fn user_email(&self, user_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("select email from users where id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// A user's active login sessions, newest first. `current_token` marks which
+    /// row is *this* session. The hex of the token hash identifies a session for
+    /// revocation (the token itself is never stored).
+    pub async fn list_sessions(
+        &self,
+        user_id: Uuid,
+        current_token: Option<&str>,
+    ) -> Result<Vec<SessionInfo>, sqlx::Error> {
+        let current_hex = current_token.map(|t| hex_lower(&token_hash(t)));
+        let rows = sqlx::query(
+            "select encode(token_hash, 'hex') as h, \
+                    to_char(created_at, 'YYYY-MM-DD HH24:MI') as created, \
+                    to_char(expires_at, 'YYYY-MM-DD HH24:MI') as expires \
+             from sessions where user_id = $1 and expires_at > now() order by created_at desc",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let h: String = r.try_get("h")?;
+                Ok(SessionInfo {
+                    current: current_hex.as_deref() == Some(h.as_str()),
+                    hash_hex: h,
+                    created: r.try_get("created")?,
+                    expires: r.try_get("expires")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Revoke one of a user's sessions by the hex of its token hash. Scoped to the
+    /// user so nobody can revoke another's session.
+    pub async fn revoke_session_for_user(
+        &self,
+        user_id: Uuid,
+        hash_hex: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "delete from sessions where user_id = $1 and encode(token_hash, 'hex') = $2",
+        )
+        .bind(user_id)
+        .bind(hash_hex)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
     }
 
     /// All users with their tenant slugs — for the superadmin user list.
@@ -2893,6 +2960,15 @@ fn generate_secret(prefix: &str) -> String {
 fn token_hash(token: &str) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// Lowercase hex of bytes (matches Postgres `encode(_, 'hex')`).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Hash a (low-entropy) user password with argon2 → a PHC string for storage.
