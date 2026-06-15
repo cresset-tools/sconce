@@ -218,6 +218,10 @@ pub struct PackageStatus {
     pub broken_at: Option<String>,
     pub last_success_at: Option<String>,
     pub archived: bool,
+    /// The bound upstream's most recent job error, if any. A *healthy* package
+    /// (`sync_health = ok`) with a non-null error is **stale** — its last sync
+    /// failed (non-terminal, still retrying) but its mirrored versions still serve.
+    pub upstream_error: Option<String>,
 }
 
 /// A mirror job for the Activity view: what it targets, which repo it belongs
@@ -1813,12 +1817,15 @@ impl Catalog {
     /// lifecycle).
     pub async fn list_packages(&self, repo_id: Uuid) -> Result<Vec<PackageStatus>, sqlx::Error> {
         let rows = sqlx::query(
-            "select name, visibility, sync_health, broken_reason, \
-                    to_char(broken_at,       'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as broken_at, \
-                    to_char(last_success_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as last_success_at, \
-                    archived_at is not null as archived \
-             from packages where repo_id = $1 \
-             order by (sync_health = 'broken' and archived_at is null) desc, name",
+            "select p.name as name, p.visibility as visibility, p.sync_health as sync_health, \
+                    p.broken_reason as broken_reason, \
+                    to_char(p.broken_at,       'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as broken_at, \
+                    to_char(p.last_success_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as last_success_at, \
+                    p.archived_at is not null as archived, \
+                    (select j.last_error from mirror_jobs j where j.upstream_id = p.upstream_id \
+                     order by j.updated_at desc limit 1) as upstream_error \
+             from packages p where p.repo_id = $1 \
+             order by (p.sync_health = 'broken' and p.archived_at is null) desc, p.name",
         )
         .bind(repo_id)
         .fetch_all(&self.pool)
@@ -1833,6 +1840,7 @@ impl Catalog {
                     broken_at: r.try_get("broken_at")?,
                     last_success_at: r.try_get("last_success_at")?,
                     archived: r.try_get("archived")?,
+                    upstream_error: r.try_get("upstream_error")?,
                 })
             })
             .collect()

@@ -2319,30 +2319,52 @@ async fn repo_page(
         .iter()
         .filter(|p| p.sync_health == "broken" && !p.archived)
         .count();
-    for p in packages.iter().filter(|p| p.archived || p.sync_health == "broken") {
-        let (badge, action, label) = if p.archived {
+    // Stale = healthy package whose last sync errored (non-terminal, retrying):
+    // existing versions still serve, but new ones are blocked until it recovers.
+    let is_stale = |p: &sconce_catalog::PackageStatus| {
+        p.sync_health == "ok" && !p.archived && p.upstream_error.is_some()
+    };
+    for p in packages
+        .iter()
+        .filter(|p| p.archived || p.sync_health == "broken" || is_stale(p))
+    {
+        // (badge, optional archive/unarchive action button)
+        let (badge, action) = if p.archived {
             (
                 "<span class='badge slate'>archived · frozen</span>".to_owned(),
-                "unarchive",
-                "Un-archive",
+                "<button name=action value=unarchive>Un-archive</button>",
             )
-        } else {
+        } else if p.sync_health == "broken" {
             (
                 format!(
                     "<span class='badge amber'>broken</span> <span class=muted>{}</span>",
                     esc(p.broken_reason.as_deref().unwrap_or("?"))
                 ),
-                "archive",
-                "Archive",
+                "<button name=action value=archive>Archive</button>",
+            )
+        } else {
+            // stale (retrying); no operator action needed
+            (
+                format!(
+                    "<span class='badge blue'>sync stale</span> <span class=muted>retrying — {}</span>",
+                    esc(p.upstream_error.as_deref().unwrap_or("").chars().take(60).collect::<String>().trim())
+                ),
+                "",
             )
         };
         let last = p.last_success_at.as_deref().unwrap_or("never");
+        let actions = if action.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<form class=inline method=post action=\"/r/{slug}/package/archive\">\
+                 <input type=hidden name=package value=\"{}\">{action}</form>",
+                esc(&p.name)
+            )
+        };
         let _ = write!(
             health_rows,
-            "<tr><td>{pkg}</td><td>{badge}</td><td class=muted>last sync {last}</td><td>\
-             <form class=inline method=post action=\"/r/{slug}/package/archive\">\
-             <input type=hidden name=package value=\"{pkg}\">\
-             <button name=action value={action}>{label}</button></form></td></tr>",
+            "<tr><td>{pkg}</td><td>{badge}</td><td class=muted>last sync {last}</td><td>{actions}</td></tr>",
             pkg = esc(&p.name),
             last = esc(last),
         );
