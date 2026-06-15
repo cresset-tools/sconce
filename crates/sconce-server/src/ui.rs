@@ -130,6 +130,8 @@ pub fn router(
         .route("/r/{org}/{repo}/deps/resolve", post(resolve_deps))
         .route("/r/{org}/{repo}/deps/add", post(add_dep))
         .route("/r/{org}/{repo}/package/archive", post(package_archive))
+        .route("/r/{org}/{repo}/ci", post(add_ci))
+        .route("/r/{org}/{repo}/ci/remove", post(remove_ci))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }
@@ -1972,6 +1974,7 @@ async fn repo_page(
     let licenses = s.catalog.list_licenses(summary.id).await.map_err(e500)?;
     let grants = s.catalog.list_grants(summary.id).await.map_err(e500)?;
     let upstreams = s.catalog.list_upstreams(summary.id).await.map_err(e500)?;
+    let ci_policies = s.catalog.ci_policies(summary.id).await.map_err(e500)?;
     let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
     let dep_plan = s.catalog.list_dependency_plan(summary.id).await.map_err(e500)?;
     let slug = format!("{}/{}", esc(&org), esc(&repo));
@@ -2340,6 +2343,56 @@ async fn repo_page(
          <button>Create token</button></form>"
     );
 
+    // D8 — CI access (OIDC policies). Zero-secret CI: a workflow exchanges its
+    // platform OIDC JWT at /oauth/ci for a short-lived repo token if a policy
+    // matches (issuer + audience + every claim).
+    let mut ci_rows = String::new();
+    for p in &ci_policies {
+        let claims = p.claims.as_object().map_or_else(String::new, |m| {
+            m.iter()
+                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        let _ = write!(
+            ci_rows,
+            "<tr><td><span class='badge slate'>{prov}</span></td><td class=mono>{iss}</td>\
+             <td class=mono>{aud}</td><td class=mono>{claims}</td><td>{ttl}s</td><td>\
+             <form class=inline method=post action=\"/r/{slug}/ci/remove\" \
+             onsubmit=\"return confirm('Remove this CI policy?')\">\
+             <input type=hidden name=id value=\"{id}\"><button>Remove</button></form></td></tr>",
+            prov = esc(&p.provider),
+            iss = esc(&p.issuer),
+            aud = esc(&p.audience),
+            claims = esc(&claims),
+            ttl = p.token_ttl_secs,
+            id = p.id,
+        );
+    }
+    if ci_policies.is_empty() {
+        ci_rows = "<tr><td colspan=6 class=muted>No CI policies yet — add one for zero-secret CI installs.</td></tr>".into();
+    }
+    let base = s.public_base_url.trim_end_matches('/');
+    let host = base.split_once("://").map_or(base, |(_, r)| r).split('/').next().unwrap_or(base);
+    let ci_section = format!(
+        "<h2 id=ci>CI access (OIDC)</h2>\
+         <p class=muted>Zero-secret CI: a workflow POSTs its platform OIDC JWT to \
+         <code>{base}/oauth/ci</code>; a matching policy mints a short-lived repo token \
+         (no stored secret). Bind the <strong>audience</strong> to this repo.</p>\
+         <table><tr><th>Provider</th><th>Issuer</th><th>Audience</th><th>Claims</th><th>Token TTL</th><th></th></tr>{ci_rows}</table>\
+         <form class=row method=post action=\"/r/{slug}/ci\">\
+         provider <select name=provider><option value=github>github</option><option value=gitlab>gitlab</option></select> \
+         issuer <input name=issuer placeholder=\"https://token.actions.githubusercontent.com\" required style=\"width:21em\"> \
+         audience <input name=audience value=\"{base}/{slug}\" required style=\"width:16em\"> \
+         claims <input name=claims placeholder=\"repository=acme/app, ref=refs/heads/main\" style=\"width:20em\"> \
+         TTL(s) <input name=ttl type=number value=900 min=60 style=\"width:6em\"> \
+         <button>Add policy</button></form>\
+         <pre># GitHub Actions (permissions: id-token: write):\n\
+JWT=$(curl -s \"$ACTIONS_ID_TOKEN_REQUEST_URL&amp;audience={base}/{slug}\" -H \"Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN\" | jq -r .value)\n\
+TOKEN=$(curl -s -X POST {base}/oauth/ci -H 'content-type: application/json' -d \"{{\\\"repository\\\":\\\"$GITHUB_REPOSITORY\\\",\\\"jwt\\\":\\\"$JWT\\\"}}\" | jq -r .access_token)\n\
+composer config --auth http-basic.{host} token \"$TOKEN\"</pre>"
+    );
+
     // Members get a read-only view: hide every management form on this page
     // (scoped so the nav's log-out stays). Mutations are also enforced server-side.
     let (ro_open, ro_close) = if user.can_admin(summary.org_id) {
@@ -2391,7 +2444,7 @@ async fn repo_page(
              {ro_open}{policy}\
              <h2>Packages &amp; versions</h2><table>\
              <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}\
-             {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{tokens_section}{ro_close}"
+             {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{tokens_section}{ci_section}{ro_close}"
         ),
     ))
 }
@@ -2472,6 +2525,68 @@ async fn package_archive(
     }
     .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+/// Parse `k=v, k2=v2` into a JSON object of claim matchers.
+fn parse_claims(raw: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    for pair in raw.split(',') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() {
+                m.insert(k.to_owned(), Value::String(v.trim().to_owned()));
+            }
+        }
+    }
+    Value::Object(m)
+}
+
+#[derive(Deserialize)]
+struct CiForm {
+    provider: String,
+    issuer: String,
+    audience: String,
+    claims: Option<String>,
+    ttl: Option<String>,
+}
+
+async fn add_ci(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<CiForm>,
+) -> Result<Redirect, StatusCode> {
+    let id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    if !matches!(f.provider.as_str(), "github" | "gitlab") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let ttl = match f.ttl.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        Some(t) => t.parse::<i64>().map_err(|_| StatusCode::BAD_REQUEST)?.max(60),
+        None => 900,
+    };
+    let claims = parse_claims(f.claims.as_deref().unwrap_or(""));
+    s.catalog
+        .add_ci_policy(id, &f.provider, f.issuer.trim(), f.audience.trim(), &claims, ttl)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}#ci")))
+}
+
+#[derive(Deserialize)]
+struct CiRemoveForm {
+    id: String,
+}
+
+async fn remove_ci(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<CiRemoveForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog.delete_ci_policy(repo_id, id).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}#ci")))
 }
 
 #[derive(Deserialize)]

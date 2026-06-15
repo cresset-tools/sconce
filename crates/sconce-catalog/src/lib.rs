@@ -1628,6 +1628,17 @@ impl Catalog {
             .collect()
     }
 
+    /// Remove a CI OIDC policy by id, scoped to its repo. Returns whether one was
+    /// removed.
+    pub async fn delete_ci_policy(&self, repo_id: Uuid, id: Uuid) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query("delete from ci_oidc_policies where repo_id = $1 and id = $2")
+            .bind(repo_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
     /// Mint a short-lived **CI** token (`origin = 'ci'`). Bypasses the
     /// `allow_raw_tokens` org policy by design — a CI token carries a
     /// deprovisionable workload identity, not a raw operator secret.
