@@ -430,6 +430,8 @@ pub struct LicenseSummary {
     pub buyer: Option<String>,
     pub status: String,
     pub packages: Vec<String>,
+    /// Per-credential supply-chain policy override (empty = inherits the repo).
+    pub policy: PolicyOverride,
 }
 
 /// A read token in the admin listing (the token itself is never recoverable).
@@ -627,12 +629,13 @@ impl Catalog {
     pub async fn list_licenses(&self, repo_id: Uuid) -> Result<Vec<LicenseSummary>, sqlx::Error> {
         let rows = sqlx::query(
             "select l.id as id, l.buyer_ref as buyer, l.status as status, \
+                    l.update_mode as update_mode, l.cooldown_days as cooldown_days, \
                     coalesce(array_agg(p.name) filter (where p.name is not null), '{}') as packages \
              from license_keys l \
              left join entitlements e on e.license_key_id = l.id \
              left join packages p on p.id = e.package_id \
              where l.repo_id = $1 \
-             group by l.id, l.buyer_ref, l.status, l.created_at \
+             group by l.id, l.buyer_ref, l.status, l.update_mode, l.cooldown_days, l.created_at \
              order by l.created_at",
         )
         .bind(repo_id)
@@ -645,6 +648,10 @@ impl Catalog {
                     buyer: row.try_get("buyer")?,
                     status: row.try_get("status")?,
                     packages: row.try_get("packages")?,
+                    policy: PolicyOverride {
+                        update_mode: row.try_get("update_mode").ok().flatten(),
+                        cooldown_days: row.try_get("cooldown_days").ok().flatten(),
+                    },
                 })
             })
             .collect()
@@ -3648,5 +3655,45 @@ mod tests {
         // A license from one repo does not resolve in another.
         let (_, other) = repo().await.unwrap();
         assert!(cat.resolve_license(other, &key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn license_policy_round_trips() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let (_key, lic) = cat.create_license_key(repo_id, Some("buyer")).await.unwrap();
+        // Default: no override.
+        assert!(!cat.license_policy(lic).await.unwrap().is_some());
+
+        // Set delayed/30; it reads back via both license_policy and list_licenses,
+        // and tightens an `auto` repo default.
+        assert!(
+            cat.set_license_policy(
+                repo_id,
+                lic,
+                &PolicyOverride { update_mode: Some("delayed".into()), cooldown_days: Some(30) },
+            )
+            .await
+            .unwrap()
+        );
+        let pol = cat.license_policy(lic).await.unwrap();
+        assert_eq!(pol.effective("auto", 0), ("delayed".to_owned(), 30));
+        let listed = &cat.list_licenses(repo_id).await.unwrap()[0];
+        assert_eq!(listed.policy.cooldown_days, Some(30));
+
+        // Clear it (inherit again).
+        cat.set_license_policy(repo_id, lic, &PolicyOverride::default())
+            .await
+            .unwrap();
+        assert!(!cat.license_policy(lic).await.unwrap().is_some());
+
+        // Scoped: another repo can't touch this license.
+        let (_, other) = repo().await.unwrap();
+        assert!(
+            !cat.set_license_policy(other, lic, &PolicyOverride::default())
+                .await
+                .unwrap()
+        );
     }
 }

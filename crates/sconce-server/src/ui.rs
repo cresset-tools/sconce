@@ -107,6 +107,7 @@ pub fn router(
         .route("/r/{org}/{repo}/token", post(create_token))
         .route("/r/{org}/{repo}/token/revoke", post(revoke_token))
         .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
+        .route("/r/{org}/{repo}/license/policy", post(set_license_policy))
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
@@ -1413,19 +1414,37 @@ async fn repo_page(
 
     let mut lic_rows = String::new();
     for l in &licenses {
+        // Per-license supply-chain policy, keyed by id (a conservative buyer can
+        // be served "delayed + cooldown" while others see the repo default).
+        let m = l.policy.update_mode.as_deref().unwrap_or("");
+        let mode_opt = |v: &str, text: &str| {
+            let sel = if v == m { " selected" } else { "" };
+            format!("<option value=\"{v}\"{sel}>{text}</option>")
+        };
         let _ = write!(
             lic_rows,
-            "<tr><td>{buyer}</td><td>{status}</td><td>{pkgs}</td></tr>",
+            "<tr><td>{buyer}</td><td>{status}</td><td>{pkgs}</td><td>\
+             <form class=inline method=post action=\"/r/{slug}/license/policy\">\
+             <input type=hidden name=id value=\"{id}\">\
+             <select name=mode>{inherit}{auto}{manual}{delayed}</select>\
+             <input name=cooldown_days type=number min=0 placeholder=cooldown style=\"width:5em\" value=\"{cd}\">\
+             <button>Set</button></form></td></tr>",
             buyer = esc(l.buyer.as_deref().unwrap_or("—")),
             status = esc(&l.status),
             pkgs = esc(&l.packages.join(", ")),
+            id = l.id,
+            inherit = mode_opt("", "inherit"),
+            auto = mode_opt("auto", "auto"),
+            manual = mode_opt("manual", "manual"),
+            delayed = mode_opt("delayed", "delayed"),
+            cd = l.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
         );
     }
     if licenses.is_empty() {
-        lic_rows = "<tr><td colspan=3 class=muted>none</td></tr>".into();
+        lic_rows = "<tr><td colspan=4 class=muted>none</td></tr>".into();
     }
     let licenses_section = format!(
-        "<h2>License keys</h2><table><tr><th>Buyer</th><th>Status</th><th>Entitled packages</th></tr>{lic_rows}</table>\
+        "<h2>License keys</h2><table><tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Policy</th></tr>{lic_rows}</table>\
          <form class=row method=post action=\"/r/{slug}/license\">buyer <input name=buyer> \
          packages <input name=packages placeholder=\"vendor/a vendor/b\" required> <button>Issue license</button></form>"
     );
@@ -1970,6 +1989,38 @@ async fn set_token_policy(
     let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
     s.catalog
         .set_token_policy(repo_id, &f.label, &policy)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct LicensePolicyForm {
+    id: String,
+    mode: String,
+    cooldown_days: Option<String>,
+}
+
+async fn set_license_policy(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<LicensePolicyForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let update_mode = match f.mode.as_str() {
+        "auto" | "manual" | "delayed" => Some(f.mode.clone()),
+        "" => None,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let cooldown_days = match f.cooldown_days.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
+    };
+    let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
+    s.catalog
+        .set_license_policy(repo_id, license_id, &policy)
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
