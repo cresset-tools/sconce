@@ -343,6 +343,12 @@ border:1px solid #f4cfc8;margin-bottom:13px;text-align:center}\
 .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}\
 .toolbar h1{margin:0}\
 .toolbar a{text-decoration:none}\
+.repohead{display:flex;align-items:center;flex-wrap:wrap;gap:9px;margin-bottom:2px}\
+.repohead h1{margin:0}.repohead a{text-decoration:none;margin-left:auto}\
+.summary{color:var(--muted);font-size:13px;margin:.1rem 0 1.1rem}\
+.hero{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:14px 16px;\
+margin:0 0 1.4rem;box-shadow:0 1px 2px rgba(20,23,28,.04)}\
+.hero h2{margin:0 0 .5rem}.hero pre{margin:0}\
 ";
 
 /// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
@@ -2256,19 +2262,23 @@ async fn repo_page(
         );
         acc
     });
-    let install = format!(
-        "<h2>Install &amp; tokens</h2>\
+    // Overview hero: the copy-paste install instructions (the brief's hero).
+    let install_hero = format!(
+        "<div class=hero><h2>Install</h2>\
          <pre>composer config repositories.{r} composer {base}/{slug}\ncomposer require &lt;package&gt;</pre>\
-         <p class=muted>Authenticate with a token (created below); it is the http-basic \
-         <em>password</em>.</p>\
+         <p class=muted style=\"margin:.6rem 0 0\">Authenticate with a token (under <a href=\"#tokens\">Tokens</a>); \
+         it's the http-basic <em>password</em>.</p></div>",
+        r = esc(&repo),
+        base = esc(s.public_base_url.trim_end_matches('/')),
+    );
+    let tokens_section = format!(
+        "<h2 id=tokens>Tokens</h2>\
          <table><tr><th>Name</th><th>Origin</th><th>Created</th><th>Last used</th><th>Expires</th><th>Policy</th><th></th></tr>{token_rows}</table>\
          <p class=muted>Policy tightens the repo's supply-chain gate for that credential only (e.g. <code>delayed</code> + cooldown for a conservative buyer); it can never loosen it.</p>\
          <form class=row method=post action=\"/r/{slug}/token\">\
          name <input name=label placeholder=\"e.g. ci-deploy\"> \
          expires in <input name=expires_days type=number min=1 placeholder=days style=\"width:6em\"> days \
-         <button>Create token</button></form>",
-        r = esc(&repo),
-        base = esc(s.public_base_url.trim_end_matches('/')),
+         <button>Create token</button></form>"
     );
 
     // Members get a read-only view: hide every management form on this page
@@ -2284,15 +2294,45 @@ async fn repo_page(
             "</div>".to_owned(),
         )
     };
+    // Overview header badges: visibility + overall sync status (from upstreams).
+    let repo_cfg = s.catalog.repo_settings(summary.id).await.map_err(e500)?;
+    let vis_badge = if repo_cfg.allow_private_packages {
+        "<span class='badge slate'>private packages</span>"
+    } else {
+        "<span class='badge blue'>public-only</span>"
+    };
+    let has_status = |st: &str| upstreams.iter().any(|u| u.job_status.as_deref() == Some(st));
+    let sync_badge = if upstreams.is_empty() {
+        "<span class='badge slate'>no upstreams</span>"
+    } else if has_status("failed") {
+        "<span class='badge held'>sync failing</span>"
+    } else if has_status("running") || has_status("pending") {
+        "<span class='badge blue'>syncing</span>"
+    } else {
+        "<span class='badge ok'>synced</span>"
+    };
+    let broken_note = if broken_count > 0 {
+        format!(" · <span style=\"color:#a82c20\">{broken_count} can't sync</span>")
+    } else {
+        String::new()
+    };
+    let summary = format!(
+        "{} package(s) · {total_versions} version(s){broken_note}",
+        packages.len()
+    );
+
     Ok(shell(
         &s,
         &user,
         &slug,
         &format!(
-            "<h1>{slug} <a class=muted style=\"font-size:.9rem\" href=\"/r/{slug}/settings\">settings</a></h1>{attention_banner}{ro_open}{policy}\
+            "<div class=repohead><h1>{slug}</h1> {vis_badge} {sync_badge} \
+             <a class=muted style=\"font-size:.85rem\" href=\"/r/{slug}/settings\">settings</a></div>\
+             {attention_banner}<p class=summary>{summary}</p>{install_hero}\
+             {ro_open}{policy}\
              <h2>Packages &amp; versions</h2><table>\
              <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}\
-             {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{install}{ro_close}"
+             {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{tokens_section}{ro_close}"
         ),
     ))
 }
