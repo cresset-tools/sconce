@@ -1074,6 +1074,25 @@ impl Catalog {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Remove a user's membership in an org entirely. (Sessions stay valid for
+    /// the user's other tenants; `resolve_session` only honors active memberships
+    /// anyway.) Returns whether a membership was removed.
+    pub async fn remove_from_tenant(
+        &self,
+        email: &str,
+        org_slug: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "delete from user_tenants ut using users u, organizations o \
+             where ut.user_id = u.id and ut.org_id = o.id and u.email = $1 and o.slug = $2",
+        )
+        .bind(email)
+        .bind(org_slug)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
     /// Verify an email/password and, on success, return the user's id.
     pub async fn verify_credentials(
         &self,

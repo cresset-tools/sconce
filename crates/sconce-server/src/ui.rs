@@ -104,6 +104,7 @@ pub fn router(
         .route("/users", get(users_page).post(create_user))
         .route("/activity", get(activity_page))
         .route("/users/grant", post(grant_tenant))
+        .route("/users/remove", post(remove_member))
         .route("/orgs", post(create_org))
         .route("/orgs/new", get(new_org_page))
         .route("/repos/new", get(new_repo_page))
@@ -1559,19 +1560,37 @@ async fn users_page(
     let users = s.catalog.list_users().await.map_err(e500)?;
     let mut rows = String::new();
     for u in &users {
-        // Each membership as a chip: slug + role, greyed + "deactivated" if inactive.
+        // Each membership: slug + role badge, inline role select (Set) + Remove.
+        // Deactivated (SCIM-offboarded) memberships are shown in red.
         let mut chips = String::new();
         for t in &u.tenants {
-            let (tone, suffix) = if t.active {
-                (if t.role == "admin" { "violet" } else { "slate" }, String::new())
+            let tone = if !t.active {
+                "held"
+            } else if t.role == "admin" {
+                "violet"
             } else {
-                ("held", " · deactivated".to_owned())
+                "slate"
+            };
+            let dt = if t.active { "" } else { " · deactivated" };
+            let opt = |v: &str| {
+                let sel = if v == t.role { " selected" } else { "" };
+                format!("<option value={v}{sel}>{v}</option>")
             };
             let _ = write!(
                 chips,
-                "<span class='badge {tone}'>{slug} · {role}{suffix}</span> ",
+                "<div style=\"display:flex;align-items:center;gap:6px;margin:.15rem 0\">\
+                 <span class='badge {tone}'>{slug}{dt}</span>\
+                 <form class=inline method=post action=/users/grant>\
+                 <input type=hidden name=email value=\"{email}\"><input type=hidden name=tenant value=\"{slug}\">\
+                 <select name=role>{m}{a}</select><button>Set</button></form>\
+                 <form class=inline method=post action=/users/remove \
+                 onsubmit=\"return confirm('Remove {email} from {slug}?')\">\
+                 <input type=hidden name=email value=\"{email}\"><input type=hidden name=tenant value=\"{slug}\">\
+                 <button>Remove</button></form></div>",
                 slug = esc(&t.slug),
-                role = esc(&t.role),
+                email = esc(&u.email),
+                m = opt("member"),
+                a = opt("admin"),
             );
         }
         if u.tenants.is_empty() {
@@ -1713,6 +1732,27 @@ async fn grant_tenant(
     };
     s.catalog
         .add_user_to_tenant(&f.email, &f.tenant, role)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to("/users"))
+}
+
+#[derive(Deserialize)]
+struct RemoveMemberForm {
+    email: String,
+    tenant: String,
+}
+
+async fn remove_member(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<RemoveMemberForm>,
+) -> Result<Redirect, StatusCode> {
+    if !user.is_superadmin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    s.catalog
+        .remove_from_tenant(&f.email, &f.tenant)
         .await
         .map_err(e500)?;
     Ok(Redirect::to("/users"))
