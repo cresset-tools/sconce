@@ -558,12 +558,22 @@ pub struct PackageVersion {
 }
 
 /// Shared WHERE fragment for the admin package-version list/count: `$2` = name
-/// (`ilike`, null = any), `$3` = state (`held`|`yanked`|`approved`, null = any).
+/// (`ilike`, null = any), `$3` = state (`held`|`yanked`|`approved`|`pending`,
+/// null = any). `pending` = gated by the repo policy (the approval queue):
+/// not held/yanked/approved and either `manual` mode or still in `delayed`
+/// cooldown. Both callers join `repositories r` so `r.update_mode`/`cooldown_days`
+/// are in scope.
 const VERSION_FILTER: &str = " and ($2::text is null or p.name ilike '%' || $2 || '%') \
      and ($3::text is null \
           or ($3 = 'held' and pv.held_at is not null) \
           or ($3 = 'yanked' and pv.yanked_at is not null) \
-          or ($3 = 'approved' and pv.approved_at is not null))";
+          or ($3 = 'approved' and pv.approved_at is not null) \
+          or ($3 = 'pending' and pv.held_at is null and pv.yanked_at is null \
+              and pv.approved_at is null \
+              and ( r.update_mode = 'manual' \
+                    or ( r.update_mode = 'delayed' \
+                         and ( pv.released_at is null \
+                               or pv.released_at + make_interval(days => r.cooldown_days) > now() ) ) )))";
 
 impl Catalog {
     /// Connect to Postgres at `database_url` (e.g.
@@ -962,7 +972,9 @@ impl Catalog {
     ) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(&format!(
             "select count(*) from package_versions pv \
-             join packages p on p.id = pv.package_id where p.repo_id = $1 {VERSION_FILTER}"
+             join packages p on p.id = pv.package_id \
+             join repositories r on r.id = $1 \
+             where p.repo_id = $1 {VERSION_FILTER}"
         ))
         .bind(repo_id)
         .bind(name)

@@ -2179,7 +2179,7 @@ async fn repo_page(
     let state_q = q
         .state
         .as_deref()
-        .filter(|x| matches!(*x, "held" | "yanked" | "approved"));
+        .filter(|x| matches!(*x, "held" | "yanked" | "approved" | "pending"));
     let total_versions = s
         .catalog
         .count_package_versions(summary.id, name_q, state_q)
@@ -2289,8 +2289,9 @@ async fn repo_page(
         "<form class=inline method=get action=\"/r/{slug}\" style=\"margin:.2rem 0 .6rem\">\
          <input name=q value=\"{search_q}\" placeholder=\"search packages\" style=width:14em> \
          <button>Search</button></form> \
-         <span class=muted style=font-size:12px>{all}{held}{yanked}{approved}</span>",
+         <span class=muted style=font-size:12px>{all}{pending}{held}{yanked}{approved}</span>",
         all = chip("", "all"),
+        pending = chip("pending", "pending approval"),
         held = chip("held", "held"),
         yanked = chip("yanked", "yanked"),
         approved = chip("approved", "approved"),
