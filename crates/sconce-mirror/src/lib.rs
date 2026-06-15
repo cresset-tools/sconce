@@ -42,8 +42,15 @@ pub enum Error {
     Secret(#[from] sconce_catalog::secret::SecretError),
     #[error("git clone failed: {0}")]
     Clone(String),
+    /// A transport-level HTTP failure (connect / DNS / timeout / read) — no
+    /// status was received, so it's treated as transient.
     #[error("http error: {0}")]
     Http(String),
+    /// A definite HTTP response status. Distinguished from [`Error::Http`] so the
+    /// worker can tell a *permanent* `404`/`403` (the source is gone / access is
+    /// refused) from a transient `5xx`/`429`.
+    #[error("http {code} from {url}")]
+    HttpStatus { code: u16, url: String },
     #[error("upstream metadata for {package} is malformed")]
     BadMetadata { package: String },
     #[error("dist sha1 mismatch for {package} {version} (corrupt download or tampered upstream)")]
@@ -52,6 +59,86 @@ pub enum Error {
     BadPattern(String),
     #[error("a composer upstream requires a non-empty package filter (refusing to mirror the entire registry)")]
     FilterRequired,
+}
+
+impl Error {
+    /// Whether this failure is **terminal** — retrying the same job will fail the
+    /// same way, so the worker should stop (and the package can be flagged
+    /// *broken*) rather than back off. Non-terminal failures (transport errors,
+    /// our own DB/disk, transient corruption) should retry with backoff.
+    ///
+    /// **Ambiguity routes to non-terminal**: we never want a maybe-temporary
+    /// failure to wrongly flag a package broken (the same rule the dependency
+    /// classifier uses — a probe failure is not a fact).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            // Deterministically bad upstream content — re-fetching is identical.
+            Error::BadComposerJson { .. } | Error::NoName { .. } | Error::BadMetadata { .. }
+            // The upstream is gone, or its config can never succeed as-is.
+            | Error::UnknownUpstream
+            | Error::Secret(_)
+            | Error::BadPattern(_)
+            | Error::FilterRequired => true,
+            // A definite status: gone / forbidden are terminal; 5xx/429 retry.
+            Error::HttpStatus { code, .. } => matches!(code, 401 | 403 | 404 | 410),
+            // git clone: classify from its (credential-redacted) stderr.
+            Error::Clone(stderr) => clone_error_reason(stderr).is_some(),
+            // Our infra, transport errors, transient corruption → retry.
+            Error::Git(_)
+            | Error::Cas(_)
+            | Error::Catalog(_)
+            | Error::Http(_)
+            | Error::ShasumMismatch { .. } => false,
+        }
+    }
+
+    /// A stable reason code for a *terminal* failure (drives the package's
+    /// `broken_reason`): `bad_content` | `auth_failed` | `source_gone` |
+    /// `credential_error` | `config_error`. `None` for non-terminal failures.
+    #[must_use]
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Error::BadComposerJson { .. } | Error::NoName { .. } | Error::BadMetadata { .. } => {
+                Some("bad_content")
+            }
+            Error::HttpStatus { code: 401 | 403, .. } => Some("auth_failed"),
+            Error::UnknownUpstream | Error::HttpStatus { code: 404 | 410, .. } => Some("source_gone"),
+            Error::Secret(_) => Some("credential_error"),
+            Error::BadPattern(_) | Error::FilterRequired => Some("config_error"),
+            Error::Clone(stderr) => clone_error_reason(stderr),
+            _ => None,
+        }
+    }
+}
+
+/// Classify a `git clone` failure from its stderr. Returns the terminal reason
+/// (`auth_failed` / `source_gone`) or `None` when the message looks transient
+/// (host unresolved, connection refused/timed out, TLS) — those retry.
+fn clone_error_reason(stderr: &str) -> Option<&'static str> {
+    /// Access permanently refused — wrong/expired/missing credential.
+    const AUTH: &[&str] = &[
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "invalid username or password",
+        "permission denied",
+        "access denied",
+        "401 unauthorized",
+        "403 forbidden",
+        "error: 401",
+        "error: 403",
+    ];
+    /// The repository / ref is gone.
+    const GONE: &[&str] = &["not found", "does not exist", "could not be found", "error: 404"];
+    let s = stderr.to_ascii_lowercase();
+    if AUTH.iter().any(|m| s.contains(m)) {
+        Some("auth_failed")
+    } else if GONE.iter().any(|m| s.contains(m)) {
+        Some("source_gone")
+    } else {
+        None
+    }
 }
 
 /// A version that was mirrored.
@@ -462,7 +549,7 @@ fn fetch_p2(base: &str, package: &str) -> Result<Option<Vec<serde_json::Value>>,
             Ok(Some(versions))
         }
         Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(e) => Err(Error::Http(e.to_string())),
+        Err(e) => Err(http_error(&url, e)),
     }
 }
 
@@ -492,22 +579,31 @@ fn composer_stability(version: &str) -> String {
     "stable".to_owned()
 }
 
+/// Map a `ureq` failure to our error, **preserving the HTTP status** (so a
+/// permanent `404`/`403` is distinguishable from a transient transport error).
+fn http_error(url: &str, e: ureq::Error) -> Error {
+    match e {
+        ureq::Error::Status(code, _) => Error::HttpStatus { code, url: url.to_owned() },
+        ureq::Error::Transport(t) => Error::Http(format!("{url}: {t}")),
+    }
+}
+
 fn http_get_string(url: &str) -> Result<String, Error> {
     ureq::get(url)
         .call()
-        .map_err(|e| Error::Http(e.to_string()))?
+        .map_err(|e| http_error(url, e))?
         .into_string()
-        .map_err(|e| Error::Http(e.to_string()))
+        .map_err(|e| Error::Http(format!("{url}: {e}")))
 }
 
 fn http_get_bytes(url: &str) -> Result<Vec<u8>, Error> {
     use std::io::Read as _;
-    let resp = ureq::get(url).call().map_err(|e| Error::Http(e.to_string()))?;
+    let resp = ureq::get(url).call().map_err(|e| http_error(url, e))?;
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_DIST_BYTES + 1)
         .read_to_end(&mut buf)
-        .map_err(|e| Error::Http(e.to_string()))?;
+        .map_err(|e| Error::Http(format!("{url}: {e}")))?;
     if buf.len() as u64 > MAX_DIST_BYTES {
         return Err(Error::Http(format!("dist exceeds {MAX_DIST_BYTES} bytes: {url}")));
     }
@@ -1000,6 +1096,76 @@ mod tests {
         assert!(!report.mirrored.is_empty());
 
         std::fs::remove_dir_all(&cas).ok();
+    }
+
+    #[test]
+    fn error_classification_terminal_vs_transient() {
+        // Bad upstream content — deterministic, won't fix on retry.
+        let bad = Error::BadComposerJson { tag: "v1".into() };
+        assert!(bad.is_terminal());
+        assert_eq!(bad.reason(), Some("bad_content"));
+        assert_eq!(
+            Error::BadMetadata { package: "a/b".into() }.reason(),
+            Some("bad_content")
+        );
+
+        // HTTP status: 404/410 gone, 401/403 auth → terminal; 5xx/429 → retry.
+        let url = "https://repo.test/p2/a/b.json".to_owned();
+        assert_eq!(
+            Error::HttpStatus { code: 404, url: url.clone() }.reason(),
+            Some("source_gone")
+        );
+        assert!(Error::HttpStatus { code: 410, url: url.clone() }.is_terminal());
+        assert_eq!(
+            Error::HttpStatus { code: 403, url: url.clone() }.reason(),
+            Some("auth_failed")
+        );
+        for transient in [500u16, 502, 503, 429] {
+            let e = Error::HttpStatus { code: transient, url: url.clone() };
+            assert!(!e.is_terminal(), "{transient} should retry");
+            assert_eq!(e.reason(), None);
+        }
+
+        // Transport error (no status) → transient.
+        assert!(!Error::Http("connect timed out".into()).is_terminal());
+        // Our own infra / transient corruption → transient.
+        assert!(!Error::ShasumMismatch { package: "a/b".into(), version: "1.0".into() }.is_terminal());
+
+        // Upstream gone / config errors → terminal.
+        assert_eq!(Error::UnknownUpstream.reason(), Some("source_gone"));
+        assert_eq!(Error::FilterRequired.reason(), Some("config_error"));
+    }
+
+    #[test]
+    fn clone_stderr_classification() {
+        // Auth failures → terminal/auth_failed.
+        for s in [
+            "fatal: Authentication failed for 'https://github.com/x/y.git'",
+            "remote: Permission denied (publickey).",
+            "The requested URL returned error: 403",
+        ] {
+            let e = Error::Clone(s.to_owned());
+            assert!(e.is_terminal(), "{s:?} should be terminal");
+            assert_eq!(e.reason(), Some("auth_failed"), "{s:?}");
+        }
+        // Missing repo → terminal/source_gone.
+        for s in [
+            "remote: Repository not found.",
+            "fatal: repository 'https://github.com/x/gone.git' not found",
+            "The requested URL returned error: 404",
+        ] {
+            assert_eq!(Error::Clone(s.to_owned()).reason(), Some("source_gone"), "{s:?}");
+        }
+        // Transient network → NOT terminal (must back off, never flag broken).
+        for s in [
+            "fatal: unable to access '...': Could not resolve host: github.com",
+            "fatal: unable to access '...': Failed to connect to github.com port 443: Connection timed out",
+            "fatal: unable to access '...': The requested URL returned error: 503",
+        ] {
+            let e = Error::Clone(s.to_owned());
+            assert!(!e.is_terminal(), "{s:?} should retry");
+            assert_eq!(e.reason(), None, "{s:?}");
+        }
     }
 
     #[test]
