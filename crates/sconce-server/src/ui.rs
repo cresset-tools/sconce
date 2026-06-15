@@ -117,6 +117,7 @@ pub fn router(
         .route("/r/{org}/{repo}", get(repo_page))
         .route("/r/{org}/{repo}/settings", get(repo_settings_page).post(save_repo_settings))
         .route("/r/{org}/{repo}/rename", post(rename_repo_action))
+        .route("/r/{org}/{repo}/delete", post(delete_repo_action))
         .route("/r/{org}/{repo}/policy", post(set_policy))
         .route("/r/{org}/{repo}/version", post(version_action))
         .route("/r/{org}/{repo}/token", post(create_token))
@@ -921,6 +922,14 @@ async fn repo_settings_page(
          <code>composer config</code> when convenient.</p>\
          <form class=row method=post action=\"/r/{slug}/rename\">\
          new name <input name=slug placeholder=\"{repo}\" required> <button>Rename</button></form>\
+         <h2>Delete repository</h2>\
+         <p class=muted>Permanently deletes this repository and its packages, versions, \
+         tokens, and upstreams. The name is <strong>retired</strong> (old URLs 404 and the \
+         name can't be reused). This can't be undone.</p>\
+         <form class=row method=post action=\"/r/{slug}/delete\" \
+         onsubmit=\"return confirm('Delete {repo} permanently? This cannot be undone.')\">\
+         type <code>{repo}</code> to confirm <input name=confirm required> \
+         <button>Delete repository</button></form>\
          <p><a href=\"/r/{slug}\">← back to {slug}</a></p>",
         former = former_line(&s, "repo", summary.id).await,
     );
@@ -955,6 +964,31 @@ fn error_card(s: &Ui, user: &CurrentUser, title: &str, msg: &str, back: &str) ->
 
 fn rename_failed(s: &Ui, user: &CurrentUser, back: &str, msg: &str) -> Response {
     error_card(s, user, "Rename failed", msg, back)
+}
+
+#[derive(Deserialize)]
+struct ConfirmForm {
+    confirm: String,
+}
+
+async fn delete_repo_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<ConfirmForm>,
+) -> Result<Response, StatusCode> {
+    let summary = lookup_admin(&s, &user, &org, &repo).await?;
+    if f.confirm.trim() != repo {
+        return Ok(error_card(
+            &s,
+            &user,
+            "Repository not deleted",
+            "The confirmation name didn't match.",
+            &format!("/r/{org}/{repo}/settings"),
+        ));
+    }
+    s.catalog.delete_repo(summary.id).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/o/{org}")).into_response())
 }
 
 async fn rename_repo_action(

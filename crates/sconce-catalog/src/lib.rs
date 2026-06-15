@@ -788,6 +788,38 @@ impl Catalog {
         Ok(())
     }
 
+    /// Permanently delete a repo (cascades packages/versions/tokens/upstreams/
+    /// grants/licenses via FKs) and **retire its slug** so old `composer.lock`
+    /// URLs can't be silently re-pointed at a different repo (a retired slug is
+    /// blocked from re-creation; with no live target it simply 404s). Returns
+    /// whether a repo was deleted.
+    pub async fn delete_repo(&self, repo_id: Uuid) -> Result<bool, sqlx::Error> {
+        let row: Option<(Uuid, String)> =
+            sqlx::query_as("select org_id, slug from repositories where id = $1")
+                .bind(repo_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((org_id, slug)) = row else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into slug_history (entity_type, old_slug, org_id, entity_id) \
+             values ('repo', $1, $2, $3)",
+        )
+        .bind(&slug)
+        .bind(org_id)
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("delete from repositories where id = $1")
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Rename a repo within its org: record the old slug and switch to `new_slug`.
     pub async fn rename_repo(&self, repo_id: Uuid, new_slug: &str) -> Result<(), RenameError> {
         let new_slug = new_slug.trim();
