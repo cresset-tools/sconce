@@ -1704,9 +1704,9 @@ async fn index(
         let org_repos: Vec<_> = repos.iter().filter(|r| r.org_id == o.id).collect();
         if org_repos.is_empty() {
             let cta = if user.can_admin(o.id) {
-                " — <a href=/repos/new>create one</a>"
+                format!(" — <a href=\"/repos/new?org={}\">create one</a>", esc(&o.slug))
             } else {
-                ""
+                String::new()
             };
             let _ = write!(body, "<p class=muted>No repositories yet{cta}.</p>");
             continue;
@@ -1733,10 +1733,17 @@ async fn index(
     Ok(shell(&s, &user, "Repositories", &body))
 }
 
+#[derive(Deserialize)]
+struct NewRepoQuery {
+    /// Pre-select this org in the dropdown (e.g. from an org's "create one" link).
+    org: Option<String>,
+}
+
 /// The "New repository" screen: pick an org you administer + a name.
 async fn new_repo_page(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
+    Query(q): Query<NewRepoQuery>,
 ) -> Result<Html<String>, StatusCode> {
     let orgs = s.catalog.list_organizations().await.map_err(e500)?;
     let admin_orgs: Vec<_> = orgs.iter().filter(|o| user.can_admin(o.id)).collect();
@@ -1755,7 +1762,12 @@ async fn new_repo_page(
     }
     let mut options = String::new();
     for o in &admin_orgs {
-        let _ = write!(options, "<option value=\"{sl}\">{sl}</option>", sl = esc(&o.slug));
+        let sel = if q.org.as_deref() == Some(o.slug.as_str()) {
+            " selected"
+        } else {
+            ""
+        };
+        let _ = write!(options, "<option value=\"{sl}\"{sel}>{sl}</option>", sl = esc(&o.slug));
     }
     Ok(shell(
         &s,
