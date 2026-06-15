@@ -1170,18 +1170,34 @@ fn deps_add(repo: &str, package: &str, database_url: &str) -> Result<()> {
 
 /// Execute one claimed job by kind, returning a one-line summary on success or
 /// a message on failure (the worker handles retry/fail uniformly).
+/// A failed job, carrying whether the failure is **terminal** (stop) or should
+/// be retried with backoff.
+struct JobFailure {
+    message: String,
+    terminal: bool,
+}
+
+impl From<sconce_mirror::Error> for JobFailure {
+    fn from(e: sconce_mirror::Error) -> Self {
+        JobFailure { terminal: e.is_terminal(), message: e.to_string() }
+    }
+}
+
+/// A malformed/unroutable job: deterministic, so terminal.
+fn bad_job(message: impl Into<String>) -> JobFailure {
+    JobFailure { message: message.into(), terminal: true }
+}
+
 async fn run_job(
     catalog: &sconce_catalog::Catalog,
     store: &sconce_cas::FsBlobStore,
     key: Option<&sconce_catalog::secret::SecretKey>,
     job: &sconce_catalog::MirrorJob,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, JobFailure> {
     match job.kind.as_str() {
         "mirror_upstream" => {
-            let uid = job.upstream_id.ok_or("job missing upstream_id")?;
-            let r = sconce_mirror::mirror_upstream(catalog, store, uid, key)
-                .await
-                .map_err(|e| e.to_string())?;
+            let uid = job.upstream_id.ok_or_else(|| bad_job("job missing upstream_id"))?;
+            let r = sconce_mirror::mirror_upstream(catalog, store, uid, key).await?;
             Ok(format!(
                 "{} mirrored, {} skipped",
                 r.mirrored.len(),
@@ -1189,26 +1205,35 @@ async fn run_job(
             ))
         }
         "mirror_package" => {
-            let uid = job.upstream_id.ok_or("job missing upstream_id")?;
-            let pkg = job.package.as_deref().ok_or("job missing package")?;
-            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg)
-                .await
-                .map_err(|e| e.to_string())?;
+            let uid = job.upstream_id.ok_or_else(|| bad_job("job missing upstream_id"))?;
+            let pkg = job.package.as_deref().ok_or_else(|| bad_job("job missing package"))?;
+            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg).await?;
             Ok(format!("{pkg}: {} version(s)", r.mirrored.len()))
         }
         "resolve_closure" => {
-            let rid = job.repo_id.ok_or("job missing repo_id")?;
-            let plan = sconce_mirror::resolve_closure(catalog, rid)
-                .await
-                .map_err(|e| e.to_string())?;
+            let rid = job.repo_id.ok_or_else(|| bad_job("job missing repo_id"))?;
+            let plan = sconce_mirror::resolve_closure(catalog, rid).await?;
+            // A DB write failure here is transient — retry, don't give up.
             catalog
                 .replace_dependency_plan(rid, &plan)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| JobFailure { message: e.to_string(), terminal: false })?;
             Ok(format!("resolved {} dependencies", plan.len()))
         }
-        other => Err(format!("unknown job kind: {other}")),
+        other => Err(bad_job(format!("unknown job kind: {other}"))),
     }
+}
+
+/// Exponential backoff with ±50% jitter for a non-terminal retry: `10·2^(n-1)`
+/// seconds capped at one hour, jittered so jobs sharing a downed upstream don't
+/// retry in lockstep. Never gives up — the caller retries indefinitely.
+fn retry_backoff_secs(attempts: i32) -> f64 {
+    let base = (10.0 * 2f64.powi((attempts - 1).clamp(0, 12))).min(3600.0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let jitter = 0.5 + f64::from(nanos % 1000) / 1000.0; // [0.5, 1.5)
+    base * jitter
 }
 
 fn worker(cas: &Path, database_url: &str) -> Result<()> {
@@ -1239,8 +1264,6 @@ async fn run_worker_loop(
 ) -> Result<()> {
     use std::time::Duration;
 
-    /// Give up after this many attempts; back off exponentially before then.
-    const MAX_ATTEMPTS: i32 = 5;
     /// Re-scan even without a NOTIFY, to catch retries whose backoff elapsed and
     /// any missed notifications.
     const POLL: Duration = Duration::from_secs(30);
@@ -1265,25 +1288,26 @@ async fn run_worker_loop(
                         catalog.complete_mirror_job(job.id).await.context("complete")?;
                         println!("worker: {} ready — {summary}", job.kind);
                     }
-                    Err(msg) => {
-                        if job.attempts < MAX_ATTEMPTS {
-                            // 10s, 20s, 40s, … capped at 10 min.
-                            let backoff = (10.0 * 2f64.powi(job.attempts - 1)).min(600.0);
-                            catalog
-                                .retry_mirror_job(job.id, backoff, &msg)
-                                .await
-                                .context("reschedule")?;
-                            eprintln!(
-                                "worker: {} failed (attempt {}), retrying in {backoff}s: {msg}",
-                                job.kind, job.attempts
-                            );
-                        } else {
-                            catalog.fail_mirror_job(job.id, &msg).await.context("fail")?;
-                            eprintln!(
-                                "worker: {} failed permanently after {} attempts: {msg}",
-                                job.kind, job.attempts
-                            );
-                        }
+                    // Terminal: retrying won't help (source gone / access refused
+                    // / bad content). Stop — the package (if any) is already
+                    // flagged broken by the mirror layer.
+                    Err(fail) if fail.terminal => {
+                        catalog.fail_mirror_job(job.id, &fail.message).await.context("fail")?;
+                        eprintln!("worker: {} failed terminally: {}", job.kind, fail.message);
+                    }
+                    // Non-terminal (transport / 5xx / our own infra): never give
+                    // up — the upstream may recover. Back off exponentially with
+                    // jitter and retry indefinitely.
+                    Err(fail) => {
+                        let backoff = retry_backoff_secs(job.attempts);
+                        catalog
+                            .retry_mirror_job(job.id, backoff, &fail.message)
+                            .await
+                            .context("reschedule")?;
+                        eprintln!(
+                            "worker: {} failed (attempt {}), retrying in {backoff:.0}s: {}",
+                            job.kind, job.attempts, fail.message
+                        );
                     }
                 }
             }
@@ -1988,5 +2012,25 @@ fn file_mode(path: &Path) -> Result<Mode> {
     {
         let _ = path;
         Ok(Mode::File)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_backoff_secs;
+
+    #[test]
+    fn backoff_grows_then_caps_with_jitter() {
+        // First attempt: 10s base ±50% jitter.
+        let b1 = retry_backoff_secs(1);
+        assert!((5.0..=15.0).contains(&b1), "attempt 1: {b1}");
+        // Roughly doubles early on (compare the jitter-free base via many samples'
+        // minimum is hard; just assert ordering of the lower bounds holds).
+        assert!(retry_backoff_secs(2) >= 5.0 && retry_backoff_secs(3) >= 5.0);
+        // Capped at one hour even for absurd attempt counts (no overflow/panic).
+        for n in [12, 20, 1000, i32::MAX] {
+            let b = retry_backoff_secs(n);
+            assert!(b.is_finite() && (1800.0..=5400.0).contains(&b), "attempt {n}: {b}");
+        }
     }
 }

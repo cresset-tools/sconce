@@ -294,27 +294,71 @@ async fn mirror_composer_registry(
     let body = http_get_string(&format!("{base}/packages.json"))?;
     let root: serde_json::Value =
         serde_json::from_str(&body).map_err(|_| Error::BadMetadata { package: "packages.json".to_owned() })?;
-    let names: Vec<String> = root
+    // The full set the registry concretely lists (None for pattern-only
+    // registries that publish `available-package-patterns` instead). We need the
+    // *unfiltered* set to reconcile removals independently of the sync filter.
+    let available: Option<std::collections::HashSet<String>> = root
         .get("available-packages")
         .and_then(serde_json::Value::as_array)
         .map(|a| {
             a.iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter(|n| re.is_match(n))
                 .map(ToOwned::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
+    let names: Vec<String> = available
+        .iter()
+        .flatten()
+        .filter(|n| re.is_match(n))
+        .cloned()
+        .collect();
+
+    // Archived packages are frozen — never re-mirror them (that would un-freeze
+    // version discovery).
+    let archived: std::collections::HashSet<String> = catalog
+        .list_packages(up.repo_id)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?
+        .into_iter()
+        .filter(|p| p.archived)
+        .map(|p| p.name)
+        .collect();
 
     let mut report = Report::default();
     for name in names {
+        if archived.contains(&name) {
+            report.skipped.push((name, "archived".to_owned()));
+            continue;
+        }
         match mirror_one_composer_package(catalog, store, up, &name).await {
             Ok(r) => {
                 report.mirrored.extend(r.mirrored);
                 report.skipped.extend(r.skipped);
             }
-            // Don't let one bad package abort a large registry mirror.
+            // Don't let one bad package abort a large registry mirror. (A terminal
+            // failure already flagged that package broken inside the call.)
             Err(e) => report.skipped.push((name, e.to_string())),
+        }
+    }
+
+    // Reconcile removals: a package we already mirror from this upstream that has
+    // vanished from a concretely-published `available-packages` was yanked
+    // upstream → flag it broken (source_gone). Only when the registry actually
+    // enumerates (never for pattern-only registries, where absence ≠ removal).
+    if let Some(available) = &available {
+        for existing in catalog
+            .upstream_package_names(up.id)
+            .await
+            .map_err(|e| Error::Catalog(Box::new(e)))?
+        {
+            if !available.contains(&existing)
+                && catalog
+                    .mark_package_broken(up.repo_id, &existing, "source_gone")
+                    .await
+                    .map_err(|e| Error::Catalog(Box::new(e)))?
+            {
+                report.skipped.push((existing, "removed upstream".to_owned()));
+            }
         }
     }
     Ok(report)
@@ -338,7 +382,33 @@ async fn load_composer_upstream(
     Ok(up)
 }
 
+/// Mirror one package and **record its lifecycle**: on success clear any broken
+/// flag and stamp `last_success_at`; on a *terminal* failure flag the (existing)
+/// package broken with the classified reason. Non-terminal failures leave the
+/// flag untouched (the worker will back off and retry). Lifecycle bookkeeping is
+/// best-effort — it never overrides the real mirror outcome.
 async fn mirror_one_composer_package(
+    catalog: &Catalog,
+    store: &(impl BlobStore + Sync),
+    up: &sconce_catalog::UpstreamRow,
+    package: &str,
+) -> Result<Report, Error> {
+    let result = mirror_one_composer_package_inner(catalog, store, up, package).await;
+    match &result {
+        Ok(_) => {
+            let _ = catalog.mark_package_synced(up.repo_id, package).await;
+        }
+        // `reason()` is Some exactly for terminal failures.
+        Err(e) => {
+            if let Some(reason) = e.reason() {
+                let _ = catalog.mark_package_broken(up.repo_id, package, reason).await;
+            }
+        }
+    }
+    result
+}
+
+async fn mirror_one_composer_package_inner(
     catalog: &Catalog,
     store: &(impl BlobStore + Sync),
     up: &sconce_catalog::UpstreamRow,
@@ -694,6 +764,15 @@ async fn mirror_checkout(
             normalized: parsed.normalized,
             stability: parsed.stability,
         });
+    }
+
+    // A successful clone+mirror clears any earlier broken flag on the packages it
+    // produced (best-effort; distinct names only).
+    let mut synced: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in &report.mirrored {
+        if synced.insert(m.package.as_str()) {
+            let _ = catalog.mark_package_synced(repo_id, &m.package).await;
+        }
     }
 
     Ok(report)
@@ -1236,6 +1315,78 @@ mod tests {
         let names = catalog.all_package_names(repo_id).await.unwrap();
         assert!(names.len() >= 2, "filter selected several packages: {names:?}");
         assert!(names.iter().all(|n| n.starts_with("mage-os/composer")));
+
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// Lifecycle end-to-end against the real Mage-OS registry: a package we
+    /// mirror that vanishes from `available-packages` is flagged broken on the
+    /// next sync; archiving it stops it being re-flagged. Network + DB; `#[ignore]`.
+    #[tokio::test]
+    #[ignore = "network: mirrors from repo.mage-os.org"]
+    async fn registry_reconcile_flags_removed_then_archive_silences() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let slug = format!("recon{}", std::process::id());
+        catalog.create_org(&slug, None).await.unwrap();
+        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+        let up = catalog
+            .create_upstream(
+                repo_id,
+                "composer",
+                "https://repo.mage-os.org",
+                Visibility::Public,
+                None,
+                None,
+                "basic",
+            )
+            .await
+            .unwrap();
+        catalog
+            .set_upstream_filter(repo_id, up, Some(r"^mage-os/composer"))
+            .await
+            .unwrap();
+
+        // Real sync: a few mage-os/composer* packages land healthy.
+        mirror_upstream(&catalog, &store, up, None).await.unwrap();
+
+        // Simulate a package we mirrored that no longer exists upstream: bind a
+        // ghost name (never in available-packages) to this upstream.
+        let ghost = "mage-os/ghost-removed";
+        let pid = catalog
+            .upsert_package(repo_id, ghost, "composer", None, Visibility::Public)
+            .await
+            .unwrap();
+        catalog.set_package_upstream(pid, up).await.unwrap();
+
+        // Next sync reconciles: the ghost is flagged broken/source_gone; the real
+        // packages stay healthy.
+        mirror_upstream(&catalog, &store, up, None).await.unwrap();
+        let pkgs = catalog.list_packages(repo_id).await.unwrap();
+        let g = pkgs.iter().find(|p| p.name == ghost).unwrap();
+        assert_eq!(g.sync_health, "broken");
+        assert_eq!(g.broken_reason.as_deref(), Some("source_gone"));
+        assert!(
+            pkgs.iter().filter(|p| p.name != ghost).all(|p| p.sync_health == "ok"),
+            "real packages stay healthy"
+        );
+
+        // Archive the ghost → it's no longer reconciled (archived masks it).
+        catalog.archive_package(repo_id, ghost).await.unwrap();
+        mirror_upstream(&catalog, &store, up, None).await.unwrap();
+        let g = catalog
+            .list_packages(repo_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == ghost)
+            .unwrap();
+        assert!(g.archived, "ghost stays archived (frozen), not churned");
 
         std::fs::remove_dir_all(&cas).ok();
     }
