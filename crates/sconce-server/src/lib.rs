@@ -86,7 +86,7 @@ async fn authorize(
     org: &str,
     repo: &str,
     headers: &HeaderMap,
-) -> Result<(Uuid, Access), AppError> {
+) -> Result<(Uuid, Access, sconce_catalog::PolicyOverride), AppError> {
     let repo_id = s
         .catalog
         .resolve_repo(org, repo)
@@ -94,8 +94,8 @@ async fn authorize(
         .ok_or(AppError::NotFound)?;
     let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
 
-    if s.catalog.token_valid(repo_id, &cred).await? {
-        return Ok((repo_id, Access::Full));
+    if let Some(policy) = s.catalog.resolve_token_policy(repo_id, &cred).await? {
+        return Ok((repo_id, Access::Full, policy));
     }
     if let Some(license_id) = s.catalog.resolve_license(repo_id, &cred).await? {
         let entitled = s
@@ -104,7 +104,8 @@ async fn authorize(
             .await?
             .into_iter()
             .collect();
-        return Ok((repo_id, Access::Licensed(entitled)));
+        let policy = s.catalog.license_policy(license_id).await?;
+        return Ok((repo_id, Access::Licensed(entitled), policy));
     }
     Err(AppError::Unauthorized)
 }
@@ -157,7 +158,7 @@ async fn packages_json(
     Path((org, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (repo_id, access) = authorize(&s, &org, &repo, &headers).await?;
+    let (repo_id, access, _policy) = authorize(&s, &org, &repo, &headers).await?;
     let names = match access {
         Access::Full => s.catalog.all_package_names(repo_id).await?,
         Access::Licensed(entitled) => {
@@ -177,7 +178,7 @@ async fn p2(
     Path((org, repo, rest)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (repo_id, access) = authorize(&s, &org, &repo, &headers).await?;
+    let (repo_id, access, policy) = authorize(&s, &org, &repo, &headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -192,9 +193,11 @@ async fn p2(
         return Ok(Json(json!({ "packages": { package: [] } })));
     }
 
-    // Apply the repo's update policy (cooldown / manual approval / holds) so
-    // clients only ever see versions that have cleared the supply-chain gate.
-    let (mode, cooldown_days) = s.catalog.update_policy(repo_id).await?;
+    // Apply the supply-chain gate (cooldown / manual approval / holds) so clients
+    // only ever see versions that have cleared it. The presenting credential's
+    // policy override can tighten — never loosen — the repo default.
+    let (repo_mode, repo_cooldown) = s.catalog.update_policy(repo_id).await?;
+    let (mode, cooldown_days) = policy.effective(&repo_mode, repo_cooldown);
     let versions = s
         .catalog
         .visible_versions(repo_id, package, &mode, cooldown_days)

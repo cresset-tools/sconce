@@ -110,6 +110,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0025_package_lifecycle",
         include_str!("../migrations/0025_package_lifecycle.sql"),
     ),
+    (
+        "0026_credential_policy",
+        include_str!("../migrations/0026_credential_policy.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -377,6 +381,46 @@ pub struct AdminVersion {
     /// `None` when it has no release date). Lets the operator view show a
     /// countdown that matches what serving hides.
     pub cooldown_days_left: Option<i64>,
+}
+
+/// A credential's optional supply-chain policy override (`None` = inherit the
+/// repo). It can only **tighten** the repo default at serve time.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyOverride {
+    pub update_mode: Option<String>,
+    pub cooldown_days: Option<i32>,
+}
+
+impl PolicyOverride {
+    /// The effective `(update_mode, cooldown_days)` for serving a request under
+    /// this credential, given the repo default. **Tighten-only**: a credential
+    /// can make the policy *more* restrictive (later cooldown, manual over auto),
+    /// never weaken it. A bare cooldown override implies `delayed` (a cooldown is
+    /// meaningless under `auto`).
+    #[must_use]
+    pub fn effective(&self, repo_mode: &str, repo_cooldown: i32) -> (String, i32) {
+        let rank = |m: &str| match m {
+            "manual" => 2,
+            "delayed" => 1,
+            _ => 0,
+        };
+        let ovr_cooldown = self.cooldown_days.unwrap_or(0);
+        let ovr_mode = self
+            .update_mode
+            .as_deref()
+            .or(if ovr_cooldown > 0 { Some("delayed") } else { None });
+        let mode = match ovr_mode {
+            Some(m) if rank(m) > rank(repo_mode) => m.to_owned(),
+            _ => repo_mode.to_owned(),
+        };
+        (mode, ovr_cooldown.max(repo_cooldown))
+    }
+
+    /// Whether any override is set (for compact display).
+    #[must_use]
+    pub fn is_some(&self) -> bool {
+        self.update_mode.is_some() || self.cooldown_days.is_some()
+    }
 }
 
 /// A license key in the admin listing (the key itself is never recoverable).
@@ -2124,6 +2168,84 @@ impl Catalog {
         .await
     }
 
+    /// Validate a repo read token **and** return its policy override (a valid
+    /// token with no override yields an empty [`PolicyOverride`]; an invalid /
+    /// expired token yields `None`). Stamps `last_used_at`. Use this in the
+    /// serving auth path so the credential's policy is resolved in one round-trip.
+    pub async fn resolve_token_policy(
+        &self,
+        repo_id: Uuid,
+        token: &str,
+    ) -> Result<Option<PolicyOverride>, sqlx::Error> {
+        let row = sqlx::query(
+            "update tokens set last_used_at = now() \
+             where repo_id = $1 and token_hash = $2 \
+               and (expires_at is null or expires_at > now()) \
+             returning update_mode, cooldown_days",
+        )
+        .bind(repo_id)
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| PolicyOverride {
+            update_mode: r.try_get("update_mode").ok().flatten(),
+            cooldown_days: r.try_get("cooldown_days").ok().flatten(),
+        }))
+    }
+
+    /// A license key's policy override (empty if none set).
+    pub async fn license_policy(&self, license_id: Uuid) -> Result<PolicyOverride, sqlx::Error> {
+        let row = sqlx::query("select update_mode, cooldown_days from license_keys where id = $1")
+            .bind(license_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(PolicyOverride {
+            update_mode: row.try_get("update_mode").ok().flatten(),
+            cooldown_days: row.try_get("cooldown_days").ok().flatten(),
+        })
+    }
+
+    /// Set (or clear, with `None`s) a token's policy override, by repo + label.
+    /// Returns whether a token matched.
+    pub async fn set_token_policy(
+        &self,
+        repo_id: Uuid,
+        label: &str,
+        policy: &PolicyOverride,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update tokens set update_mode = $3, cooldown_days = $4 \
+             where repo_id = $1 and label = $2",
+        )
+        .bind(repo_id)
+        .bind(label)
+        .bind(policy.update_mode.as_deref())
+        .bind(policy.cooldown_days)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Set (or clear) a license key's policy override, by id.
+    pub async fn set_license_policy(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+        policy: &PolicyOverride,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update license_keys set update_mode = $3, cooldown_days = $4 \
+             where id = $1 and repo_id = $2",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .bind(policy.update_mode.as_deref())
+        .bind(policy.cooldown_days)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
     /// The package names a license is entitled to, sorted.
     pub async fn entitled_package_names(
         &self,
@@ -2757,6 +2879,82 @@ mod tests {
             cat.update_policy(repo_id).await.unwrap(),
             ("delayed".to_owned(), 5)
         );
+    }
+
+    #[test]
+    fn policy_override_tightens_only() {
+        let none = PolicyOverride::default();
+        assert_eq!(none.effective("auto", 0), ("auto".to_owned(), 0));
+        assert_eq!(none.effective("delayed", 7), ("delayed".to_owned(), 7));
+
+        // A bare cooldown override implies `delayed` (cooldown is meaningless
+        // under auto) and tightens auto -> delayed/30.
+        let cd30 = PolicyOverride { update_mode: None, cooldown_days: Some(30) };
+        assert_eq!(cd30.effective("auto", 0), ("delayed".to_owned(), 30));
+
+        // mode tighten: auto -> manual.
+        let man = PolicyOverride { update_mode: Some("manual".into()), cooldown_days: None };
+        assert_eq!(man.effective("auto", 0), ("manual".to_owned(), 0));
+
+        // Tighten-only: a looser override can NEVER weaken the repo default.
+        let loose = PolicyOverride { update_mode: Some("auto".into()), cooldown_days: Some(1) };
+        assert_eq!(loose.effective("manual", 14), ("manual".to_owned(), 14));
+
+        // Cooldown takes the max of repo and override.
+        let cd5 = PolicyOverride { update_mode: Some("delayed".into()), cooldown_days: Some(5) };
+        assert_eq!(cd5.effective("delayed", 10), ("delayed".to_owned(), 10));
+    }
+
+    #[tokio::test]
+    async fn per_credential_policy_tightens_serving() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let pkg = cat
+            .upsert_package(repo_id, "acme/lib", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let cj = serde_json::json!({"name": "acme/lib"});
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let day = 86_400;
+        for (v, n, rel) in [("v1.0.0", "1.0.0.0", now - 30 * day), ("v1.1.0", "1.1.0.0", now)] {
+            cat.upsert_package_version(pkg, v, n, "stable", &cj, None, None, None, Some(rel))
+                .await
+                .unwrap();
+        }
+        let p = "acme/lib";
+        // Repo default is `auto`: a plain token sees both versions.
+        let plain = cat.create_token(repo_id, Some("latest"), None).await.unwrap();
+        let pp = cat.resolve_token_policy(repo_id, &plain).await.unwrap().unwrap();
+        let (m, c) = pp.effective("auto", 0);
+        assert_eq!(cat.visible_versions(repo_id, p, &m, c).await.unwrap().len(), 2);
+
+        // A conservative token (delayed/7) on the SAME repo hides the fresh one.
+        let cons = cat.create_token(repo_id, Some("conservative"), None).await.unwrap();
+        assert!(
+            cat.set_token_policy(
+                repo_id,
+                "conservative",
+                &PolicyOverride { update_mode: Some("delayed".into()), cooldown_days: Some(7) },
+            )
+            .await
+            .unwrap()
+        );
+        let cp = cat.resolve_token_policy(repo_id, &cons).await.unwrap().unwrap();
+        let (m2, c2) = cp.effective("auto", 0);
+        assert_eq!((m2.as_str(), c2), ("delayed", 7));
+        let vis = cat.visible_versions(repo_id, p, &m2, c2).await.unwrap();
+        assert_eq!(vis.len(), 1, "conservative credential only sees the aged release");
+        assert_eq!(vis[0].normalized_version, "1.0.0.0");
+
+        // An invalid/expired token resolves to no policy at all.
+        assert!(cat.resolve_token_policy(repo_id, "sconce_bogus").await.unwrap().is_none());
     }
 
     #[tokio::test]
