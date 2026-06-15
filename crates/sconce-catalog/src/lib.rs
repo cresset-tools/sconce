@@ -593,9 +593,22 @@ impl Catalog {
     /// Every version of every package **owned** by a repo, with control state —
     /// the admin view (unlike `visible_versions`, it ignores policy/holds so the
     /// operator can see and act on everything).
+    /// Total package-versions in a repo (for the Packages & versions paginator).
+    pub async fn count_package_versions(&self, repo_id: Uuid) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "select count(*) from package_versions pv \
+             join packages p on p.id = pv.package_id where p.repo_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn admin_package_versions(
         &self,
         repo_id: Uuid,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<AdminVersion>, sqlx::Error> {
         let rows = sqlx::query(
             "select p.name as package, pv.version, pv.normalized_version, pv.stability, \
@@ -610,9 +623,12 @@ impl Catalog {
              join packages p on p.id = pv.package_id \
              join repositories r on r.id = $1 \
              where p.repo_id = $1 \
-             order by p.name, pv.normalized_version",
+             order by p.name, pv.normalized_version \
+             limit $2 offset $3",
         )
         .bind(repo_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -1338,6 +1354,22 @@ impl Catalog {
                     archived: r.try_get("archived")?,
                 })
             })
+            .collect()
+    }
+
+    /// Per-repo count of packages that **need attention**: broken and not yet
+    /// archived. `(repo_id, count)`, only repos with a non-zero count. Drives the
+    /// home/repo "N packages can't sync" roll-up.
+    pub async fn attention_counts(&self) -> Result<Vec<(Uuid, i64)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select repo_id, count(*) as n from packages \
+             where sync_health = 'broken' and archived_at is null \
+             group by repo_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("repo_id")?, r.try_get("n")?)))
             .collect()
     }
 
@@ -2923,7 +2955,7 @@ mod tests {
         // ~7 days to go. (We set this repo's policy so admin_package_versions
         // computes against the real cooldown_days.)
         cat.set_update_policy(repo_id, "delayed", 7).await.unwrap();
-        let av = cat.admin_package_versions(repo_id).await.unwrap();
+        let av = cat.admin_package_versions(repo_id, 1000, 0).await.unwrap();
         let old = av.iter().find(|v| v.normalized_version == "1.0.0.0").unwrap();
         let fresh = av.iter().find(|v| v.normalized_version == "1.1.0.0").unwrap();
         assert_eq!(old.cooldown_days_left, Some(0), "30-day-old is past cooldown");

@@ -312,6 +312,8 @@ background:var(--surface);border-bottom:1px solid var(--border);position:sticky;
 .topbar .sep{color:#cdd2da}.topbar .here{font-weight:600;color:var(--text)}\
 .content{flex:1;padding:24px 30px;min-width:0;max-width:1120px}\
 .content h1:first-child{margin-top:0}\
+.pager{display:flex;align-items:center;gap:12px;font-size:12px;margin:-.4rem 0 1.2rem}\
+.pager a{font-weight:600}\
 ";
 
 /// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
@@ -356,6 +358,26 @@ fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
             here = esc(title),
         ),
     )
+}
+
+/// "Showing X–Y of N {noun}" with prev/next links (hidden when it fits on one
+/// page, per the design). `base` is the page URL; pagination uses `?page=`.
+fn paginator(noun: &str, total: i64, page: i64, per_page: i64, base: &str) -> String {
+    let last_page = ((total + per_page - 1) / per_page).max(1);
+    let page = page.clamp(1, last_page);
+    let from = if total == 0 { 0 } else { (page - 1) * per_page + 1 };
+    let to = (page * per_page).min(total);
+    let mut controls = String::new();
+    if last_page > 1 {
+        if page > 1 {
+            let _ = write!(controls, "<a href=\"{base}?page={}\">&lsaquo; Prev</a>", page - 1);
+        }
+        let _ = write!(controls, "<span class=muted>Page {page} of {last_page}</span>");
+        if page < last_page {
+            let _ = write!(controls, "<a href=\"{base}?page={}\">Next &rsaquo;</a>", page + 1);
+        }
+    }
+    format!("<div class=pager><span class=muted>Showing {from}&ndash;{to} of {total} {noun}</span>{controls}</div>")
 }
 
 /// A 24×24 stroke nav icon.
@@ -1292,6 +1314,14 @@ async fn index(
 ) -> Result<Html<String>, StatusCode> {
     let orgs = s.catalog.list_organizations().await.map_err(e500)?;
     let repos = s.catalog.list_repositories().await.map_err(e500)?;
+    let attention: HashSet<(Uuid, i64)> = s
+        .catalog
+        .attention_counts()
+        .await
+        .map_err(e500)?
+        .into_iter()
+        .collect();
+    let broken_for = |repo_id: Uuid| attention.iter().find(|(id, _)| *id == repo_id).map(|(_, n)| *n);
 
     let mut body = String::from("<h1>Organizations &amp; repositories</h1>");
     let visible: Vec<_> = orgs.iter().filter(|o| user.can(o.id)).collect();
@@ -1320,9 +1350,13 @@ async fn index(
             "<table><tr><th>Repository</th><th>Update mode</th><th>Cooldown (days)</th></tr>",
         );
         for r in org_repos {
+            let att = match broken_for(r.id) {
+                Some(n) => format!(" <span class='badge amber'>⚠ {n} can't sync</span>"),
+                None => String::new(),
+            };
             let _ = write!(
                 body,
-                "<tr><td><a href=\"/r/{o}/{rp}\">{rp}</a></td><td>{mode}</td><td>{cd}</td></tr>",
+                "<tr><td><a href=\"/r/{o}/{rp}\">{rp}</a>{att}</td><td>{mode}</td><td>{cd}</td></tr>",
                 o = esc(&r.org),
                 rp = esc(&r.repo),
                 mode = esc(&r.update_mode),
@@ -1399,15 +1433,27 @@ async fn create_repo(
 // ----- repository detail -----
 
 #[allow(clippy::too_many_lines)]
+#[derive(Deserialize)]
+struct PageQuery {
+    page: Option<i64>,
+}
+
+#[allow(clippy::too_many_lines)] // one big page builder; clearer kept together
 async fn repo_page(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
     Path((org, repo)): Path<(String, String)>,
+    Query(q): Query<PageQuery>,
 ) -> Result<Html<String>, StatusCode> {
+    // Paginate the (potentially long) packages & versions list.
+    const PER_PAGE: i64 = 50;
     let summary = lookup(&s, &user, &org, &repo).await?;
+    let total_versions = s.catalog.count_package_versions(summary.id).await.map_err(e500)?;
+    let last_page = ((total_versions + PER_PAGE - 1) / PER_PAGE).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, last_page);
     let versions = s
         .catalog
-        .admin_package_versions(summary.id)
+        .admin_package_versions(summary.id, PER_PAGE, (page - 1) * PER_PAGE)
         .await
         .map_err(e500)?;
     let tokens = s.catalog.list_tokens(summary.id).await.map_err(e500)?;
@@ -1485,9 +1531,14 @@ async fn repo_page(
             rel = esc(v.released_at.as_deref().unwrap_or("")),
         );
     }
-    if versions.is_empty() {
+    if versions.is_empty() && total_versions == 0 {
         rows = "<tr><td colspan=5 class=muted>No packages yet. Mirror one with <code>sconce mirror</code>.</td></tr>".into();
     }
+    let pager = if total_versions == 0 {
+        String::new()
+    } else {
+        paginator("versions", total_versions, page, PER_PAGE, &format!("/r/{slug}"))
+    };
 
     // Package health: only the actionable ones (broken or archived). Already-
     // mirrored versions keep serving regardless — this is about new versions.
@@ -1524,6 +1575,15 @@ async fn repo_page(
             last = esc(last),
         );
     }
+    // Repo-level needs-attention roll-up, shown up top (links to Package health).
+    let attention_banner = if broken_count > 0 {
+        format!(
+            "<p class=banner>⚠ {broken_count} package(s) can't sync — they keep serving their existing \
+             versions, but won't get new ones until fixed. See <a href=\"#health\">Package health</a>.</p>"
+        )
+    } else {
+        String::new()
+    };
     let health_section = if health_rows.is_empty() {
         String::new()
     } else {
@@ -1533,7 +1593,7 @@ async fn repo_page(
             String::new()
         };
         format!(
-            "<h2>Package health</h2>{note}<table>\
+            "<h2 id=health>Package health</h2>{note}<table>\
              <tr><th>Package</th><th>State</th><th>Last sync</th><th>Actions</th></tr>{health_rows}</table>"
         )
     };
@@ -1782,9 +1842,9 @@ async fn repo_page(
         &user,
         &slug,
         &format!(
-            "<h1>{slug} <a class=muted style=\"font-size:.9rem\" href=\"/r/{slug}/settings\">settings</a></h1>{ro_open}{policy}\
+            "<h1>{slug} <a class=muted style=\"font-size:.9rem\" href=\"/r/{slug}/settings\">settings</a></h1>{attention_banner}{ro_open}{policy}\
              <h2>Packages &amp; versions</h2><table>\
-             <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>\
+             <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}\
              {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{install}{ro_close}"
         ),
     ))
