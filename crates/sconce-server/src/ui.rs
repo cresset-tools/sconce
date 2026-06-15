@@ -102,6 +102,8 @@ pub fn router(
         .route("/orgs", post(create_org))
         .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
         .route("/o/{org}/rename", post(rename_org_action))
+        .route("/o/{org}/oidc", post(save_oidc))
+        .route("/o/{org}/scim-token", post(gen_scim_token))
         .route("/repos", post(create_repo))
         .route("/r/{org}/{repo}", get(repo_page))
         .route("/r/{org}/{repo}/settings", get(repo_settings_page).post(save_repo_settings))
@@ -552,6 +554,7 @@ async fn org_settings_page(
 ) -> Result<Html<String>, StatusCode> {
     let summary = lookup_org(&s, &user, &org).await?;
     let cfg = s.catalog.org_settings(summary.id).await.map_err(e500)?;
+    let oidc = s.catalog.oidc_connection_for_org(summary.id).await.map_err(e500)?;
     let slug = esc(&org);
     let raw_checked = if cfg.allow_raw_tokens { " checked" } else { "" };
     let max_ttl = cfg
@@ -568,6 +571,7 @@ async fn org_settings_page(
          <p>Max token expiry (days), blank = no limit: \
          <input name=max_token_ttl_days type=number min=1 value=\"{max_ttl}\" style=\"width:7em\"></p>\
          <button>Save settings</button></form>\
+         {oidc_section}{scim_section}\
          <h2>Rename organization</h2>{former}\
          <p class=muted>Old URLs keep working via redirect, so existing \
          <code>composer.lock</code> files don't break. The old slug is \
@@ -576,8 +580,141 @@ async fn org_settings_page(
          new slug <input name=slug placeholder=\"{slug}\" required> <button>Rename</button></form>\
          <p><a href=\"/\">← back</a></p>",
         former = former_line(&s, "org", summary.id).await,
+        oidc_section = oidc_section(&slug, oidc.as_ref()),
+        scim_section = scim_section(&slug),
     );
     Ok(shell(&s, &user, &format!("{org} settings"), &body))
+}
+
+/// C4 — the SSO/OIDC connection form (per-org). The client secret is write-only:
+/// it's never rendered back; leaving it blank on save keeps the stored one.
+fn oidc_section(slug: &str, c: Option<&sconce_catalog::OidcConnection>) -> String {
+    let v = |x: &str| esc(x);
+    let issuer = c.map_or(String::new(), |c| v(&c.issuer_url));
+    let client_id = c.map_or(String::new(), |c| v(&c.client_id));
+    let redirect = c.map_or(String::new(), |c| v(&c.redirect_url));
+    let scopes = c.map_or_else(|| "openid email profile".to_owned(), |c| v(&c.scopes));
+    let allowed = c
+        .and_then(|c| c.allowed_domains.as_ref())
+        .map_or(String::new(), |d| esc(&d.join(", ")));
+    let admin = c
+        .and_then(|c| c.admin_domains.as_ref())
+        .map_or(String::new(), |d| esc(&d.join(", ")));
+    let status = if c.is_some() {
+        "<span class='badge ok'>configured</span>"
+    } else {
+        "<span class='badge slate'>not set</span>"
+    };
+    format!(
+        "<h2>SSO — OIDC {status}</h2>\
+         <p class=muted>Users who sign in via this connection are provisioned into <code>{slug}</code>. \
+         The client secret is write-only — leave it blank to keep the current one.</p>\
+         <form class=row method=post action=\"/o/{slug}/oidc\">\
+         <p>Issuer URL <input name=issuer type=url value=\"{issuer}\" placeholder=\"https://idp.example.com\" required style=\"width:24em\"></p>\
+         <p>Client ID <input name=client_id value=\"{client_id}\" required style=\"width:18em\"></p>\
+         <p>Client secret <input name=client_secret type=password placeholder=\"(unchanged)\" style=\"width:18em\"></p>\
+         <p>Redirect URL <input name=redirect_url type=url value=\"{redirect}\" placeholder=\"https://dashboard/auth/callback\" required style=\"width:24em\"></p>\
+         <p>Scopes <input name=scopes value=\"{scopes}\" style=\"width:18em\"></p>\
+         <p>Allowed email domains (comma-sep, blank = any) <input name=allowed_domains value=\"{allowed}\" style=\"width:18em\"></p>\
+         <p>Admin email domains (comma-sep) <input name=admin_domains value=\"{admin}\" style=\"width:18em\"></p>\
+         <button>Save SSO connection</button></form>"
+    )
+}
+
+/// C5 — SCIM provisioning: the endpoint + a generate/rotate-token action.
+fn scim_section(slug: &str) -> String {
+    format!(
+        "<h2>SCIM provisioning</h2>\
+         <p class=muted>Point your IdP's SCIM connector here so offboarded users are deactivated \
+         (their sessions revoked) automatically. Endpoint: \
+         <code>&lt;dashboard-url&gt;/scim/v2/Users</code> — bearer auth with the token below.</p>\
+         <form class=row method=post action=\"/o/{slug}/scim-token\">\
+         <button>Generate / rotate SCIM token</button></form>"
+    )
+}
+
+#[derive(Deserialize)]
+struct OidcForm {
+    issuer: String,
+    client_id: String,
+    client_secret: Option<String>,
+    redirect_url: String,
+    scopes: String,
+    allowed_domains: Option<String>,
+    admin_domains: Option<String>,
+}
+
+/// Split a comma-separated domain list, trimming blanks. `None`/empty → `None`.
+fn split_domains(x: Option<&str>) -> Option<Vec<String>> {
+    let v: Vec<String> = x?
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+async fn save_oidc(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path(org): Path<String>,
+    Form(f): Form<OidcForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    // Write-only secret: a blank field keeps the stored one (set_oidc_connection
+    // replaces the row, so we must re-supply it).
+    let client_secret = match f.client_secret.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        Some(sec) => Some(sec.as_bytes().to_vec()),
+        None => s
+            .catalog
+            .oidc_connection_for_org(summary.id)
+            .await
+            .map_err(e500)?
+            .and_then(|c| c.client_secret),
+    };
+    let conn = sconce_catalog::OidcConnection {
+        id: Uuid::nil(),
+        org_slug: Some(org.clone()),
+        issuer_url: f.issuer.trim().to_owned(),
+        client_id: f.client_id.trim().to_owned(),
+        client_secret,
+        redirect_url: f.redirect_url.trim().to_owned(),
+        scopes: f.scopes.trim().to_owned(),
+        allowed_domains: split_domains(f.allowed_domains.as_deref()),
+        admin_domains: split_domains(f.admin_domains.as_deref()),
+    };
+    s.catalog.set_oidc_connection(Some(&org), &conn).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/o/{org}/settings")))
+}
+
+/// Generate (or rotate) the org's SCIM bearer token and show it once.
+async fn gen_scim_token(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path(org): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    lookup_org_admin(&s, &user, &org).await?;
+    let token = s
+        .catalog
+        .create_scim_token(&org)
+        .await
+        .map_err(e500)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(shell(
+        &s,
+        &user,
+        "SCIM token",
+        &format!(
+            "<h1>SCIM token</h1>\
+             <p class=banner>Store it now — it won't be shown again.</p>\
+             <pre>{}</pre>\
+             <p class=muted>Use it as the bearer token in your IdP's SCIM connector. Endpoint: \
+             <code>&lt;dashboard-url&gt;/scim/v2/Users</code></p>\
+             <p><a href=\"/o/{org}/settings\">← back to settings</a></p>",
+            esc(&token)
+        ),
+    ))
 }
 
 async fn rename_org_action(

@@ -1200,6 +1200,18 @@ impl Catalog {
         row.as_ref().map(Self::oidc_from_row).transpose()
     }
 
+    /// The OIDC connection scoped to a specific org (`org_id = $1`), if any.
+    pub async fn oidc_connection_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Option<OidcConnection>, sqlx::Error> {
+        let row = sqlx::query(&format!("{} where c.org_id = $1", Self::OIDC_SELECT))
+            .bind(org_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(Self::oidc_from_row).transpose()
+    }
+
     /// An OIDC connection by id.
     pub async fn oidc_connection_by_id(
         &self,
