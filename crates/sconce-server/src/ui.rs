@@ -97,6 +97,7 @@ pub fn router(
         )
         .route("/logout", post(logout))
         .route("/users", get(users_page).post(create_user))
+        .route("/activity", get(activity_page))
         .route("/users/grant", post(grant_tenant))
         .route("/orgs", post(create_org))
         .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
@@ -372,12 +373,14 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
 <path d=\"M4 7.5l8 4.5 8-4.5\"></path><path d=\"M12 12v9\"></path>";
     const MEMBERS: &str = "<circle cx=9 cy=8 r=3.2></circle><path d=\"M3 20a6 6 0 0 1 12 0\"></path>\
 <path d=\"M16 5.5a3 3 0 0 1 0 5.5\"></path><path d=\"M21 20a6 6 0 0 0-4-5.6\"></path>";
+    const ACTIVITY: &str = "<path d=\"M3 12h4l2.5 7 4-14 2.5 7h5\"></path>";
     let on_members = title == "Users";
+    let on_activity = title == "Activity";
     let cls = |on: bool| if on { " class=active" } else { "" };
 
     let mut nav = format!(
         "<a href=/{c}>{ic}<span>Repositories</span></a>",
-        c = cls(!on_members),
+        c = cls(!on_members && !on_activity),
         ic = nav_icon(REPOS),
     );
     // Members lives in multi-tenant and is superadmin-managed.
@@ -389,6 +392,12 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
             ic = nav_icon(MEMBERS),
         );
     }
+    let _ = write!(
+        nav,
+        "<div class=grp>SYSTEM</div><a href=/activity{c}>{ic}<span>Activity</span></a>",
+        c = cls(on_activity),
+        ic = nav_icon(ACTIVITY),
+    );
 
     let sub = if s.single_tenant { "Single-tenant" } else { "Hosted" };
     // Single-tenant is all-access; otherwise admin if they manage any tenant.
@@ -1160,6 +1169,69 @@ async fn users_page(
              tenant <input name=tenant placeholder=org-slug required> \
              <select name=role><option value=member>member</option><option value=admin>admin</option></select> \
              <button>Grant</button></form>"
+        ),
+    ))
+}
+
+/// G1 — the "is it done yet?" surface: recent mirror jobs and their state.
+async fn activity_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Html<String>, StatusCode> {
+    // Single-tenant / superadmin see everything; a tenant member sees their orgs.
+    let scoped: Vec<Uuid> = user.tenants.iter().copied().collect();
+    let org_ids = if s.single_tenant || user.is_superadmin {
+        None
+    } else {
+        Some(scoped.as_slice())
+    };
+    let jobs = s.catalog.recent_jobs(100, org_ids).await.map_err(e500)?;
+
+    let mut rows = String::new();
+    for j in &jobs {
+        // Status as a tone badge; a backing-off pending job reads as "retrying",
+        // a terminal failure as red (with its error) — matching the lifecycle ladder.
+        let badge = match j.status.as_str() {
+            "ready" => "<span class='badge ok'>ready</span>".to_owned(),
+            "running" => "<span class='badge blue'>running</span>".to_owned(),
+            "failed" => "<span class='badge held'>failed</span>".to_owned(),
+            _ if j.attempts > 1 => {
+                format!("<span class='badge amber'>retrying · attempt {}</span>", j.attempts)
+            }
+            _ => "<span class='badge slate'>queued</span>".to_owned(),
+        };
+        let kind = match j.kind.as_str() {
+            "mirror_upstream" => "upstream sync",
+            "mirror_package" => "package mirror",
+            "resolve_closure" => "dependency resolve",
+            other => other,
+        };
+        let repo = j.repo.as_deref().unwrap_or("—");
+        let err = match (&j.last_error, j.status.as_str()) {
+            (Some(e), "failed") => format!("<div class=muted style=\"font-size:11.5px\">{}</div>", esc(e)),
+            _ => String::new(),
+        };
+        let _ = write!(
+            rows,
+            "<tr><td>{badge}</td><td>{kind}</td><td class=mono>{target}{err}</td><td class=mono>{repo}</td>\
+             <td class=muted>{updated}</td></tr>",
+            target = esc(&j.target),
+            repo = esc(repo),
+            updated = esc(&j.updated),
+        );
+    }
+    if jobs.is_empty() {
+        rows = "<tr><td colspan=5 class=muted>No background jobs yet. Sync an upstream to see activity here.</td></tr>".into();
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "Activity",
+        &format!(
+            "<h1>Activity</h1>\
+             <p class=muted>Background mirror jobs — newest first. Pending jobs that keep failing back off and retry; \
+             a terminal failure stops and (for a package) flags it broken.</p>\
+             <table><tr><th>Status</th><th>Job</th><th>Target</th><th>Repo</th><th>Updated</th></tr>{rows}</table>"
         ),
     ))
 }

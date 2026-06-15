@@ -216,6 +216,21 @@ pub struct PackageStatus {
     pub archived: bool,
 }
 
+/// A mirror job for the Activity view: what it targets, which repo it belongs
+/// to, and its current state. The "is it done yet?" surface.
+#[derive(Debug, Clone)]
+pub struct JobActivity {
+    pub kind: String,
+    pub status: String,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    /// Human label for the job's target (package name / upstream base / closure).
+    pub target: String,
+    /// `org/repo` the job belongs to, if resolvable.
+    pub repo: Option<String>,
+    pub updated: String,
+}
+
 /// A claimed job handed to the worker. `kind` selects which fields are set:
 /// `mirror_upstream`→`upstream_id`; `mirror_package`→`upstream_id`+`package`;
 /// `resolve_closure`→`repo_id`.
@@ -1884,6 +1899,47 @@ impl Catalog {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Recent mirror jobs for the Activity view, newest first. `org_ids = None`
+    /// returns all (single-tenant / superadmin); `Some(ids)` scopes to those
+    /// orgs (a tenant member only sees their own orgs' activity).
+    pub async fn recent_jobs(
+        &self,
+        limit: i64,
+        org_ids: Option<&[Uuid]>,
+    ) -> Result<Vec<JobActivity>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select j.kind, j.status, j.attempts, j.last_error, \
+                    coalesce(j.package, u.base, 'dependency closure') as target, \
+                    o.slug as org, r.slug as repo, \
+                    to_char(j.updated_at, 'YYYY-MM-DD HH24:MI') as updated \
+             from mirror_jobs j \
+             left join upstreams u on u.id = j.upstream_id \
+             left join repositories r on r.id = coalesce(j.repo_id, u.repo_id) \
+             left join organizations o on o.id = r.org_id \
+             where ($2::uuid[] is null or r.org_id = any($2)) \
+             order by j.updated_at desc limit $1",
+        )
+        .bind(limit)
+        .bind(org_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let org: Option<String> = r.try_get("org")?;
+                let repo: Option<String> = r.try_get("repo")?;
+                Ok(JobActivity {
+                    kind: r.try_get("kind")?,
+                    status: r.try_get("status")?,
+                    attempts: r.try_get("attempts")?,
+                    last_error: r.try_get("last_error")?,
+                    target: r.try_get("target")?,
+                    repo: org.zip(repo).map(|(o, r)| format!("{o}/{r}")),
+                    updated: r.try_get("updated")?,
+                })
+            })
+            .collect()
     }
 
     // ----- dependency plan -----
