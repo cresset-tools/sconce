@@ -381,6 +381,18 @@ pub struct RepoLocation {
     pub moved: bool,
 }
 
+/// A repository row for the org overview: counts + last-sync, for the C1 table.
+#[derive(Debug, Clone)]
+pub struct RepoOverview {
+    pub slug: String,
+    pub allow_private_packages: bool,
+    pub update_mode: String,
+    pub packages: i64,
+    pub broken: i64,
+    /// Newest successful sync across the repo's packages (text), if any.
+    pub last_sync: Option<String>,
+}
+
 /// A repository in the admin listing.
 #[derive(Debug, Clone)]
 pub struct RepoSummary {
@@ -858,6 +870,36 @@ impl Catalog {
                     id: row.try_get("id")?,
                     update_mode: row.try_get("update_mode")?,
                     cooldown_days: row.try_get("cooldown_days")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Repos in an org with per-repo counts + last sync — the C1 org overview.
+    pub async fn org_repo_overview(&self, org_id: Uuid) -> Result<Vec<RepoOverview>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select r.slug as slug, r.allow_private_packages as allow_private_packages, \
+                    r.update_mode as update_mode, \
+                    count(p.id) as packages, \
+                    count(p.id) filter (where p.sync_health = 'broken' and p.archived_at is null) as broken, \
+                    to_char(max(p.last_success_at), 'YYYY-MM-DD HH24:MI') as last_sync \
+             from repositories r left join packages p on p.repo_id = r.id \
+             where r.org_id = $1 \
+             group by r.id, r.slug, r.allow_private_packages, r.update_mode \
+             order by r.slug",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RepoOverview {
+                    slug: row.try_get("slug")?,
+                    allow_private_packages: row.try_get("allow_private_packages")?,
+                    update_mode: row.try_get("update_mode")?,
+                    packages: row.try_get("packages")?,
+                    broken: row.try_get("broken")?,
+                    last_sync: row.try_get("last_sync")?,
                 })
             })
             .collect()

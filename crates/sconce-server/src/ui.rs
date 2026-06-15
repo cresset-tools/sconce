@@ -107,6 +107,7 @@ pub fn router(
         .route("/orgs", post(create_org))
         .route("/orgs/new", get(new_org_page))
         .route("/repos/new", get(new_repo_page))
+        .route("/o/{org}", get(org_overview_page))
         .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
         .route("/o/{org}/rename", post(rename_org_action))
         .route("/o/{org}/oidc", post(save_oidc))
@@ -567,6 +568,64 @@ async fn lookup_org_admin(
     } else {
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+/// C1 — the org overview: its repositories with visibility, package count, and
+/// last sync, plus create/settings entry points.
+async fn org_overview_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path(org): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let summary = lookup_org(&s, &user, &org).await?;
+    let repos = s.catalog.org_repo_overview(summary.id).await.map_err(e500)?;
+    let slug = esc(&org);
+    let can_admin = user.can_admin(summary.id);
+
+    let mut rows = String::new();
+    for r in &repos {
+        let vis = if r.allow_private_packages {
+            "<span class='badge slate'>private</span>"
+        } else {
+            "<span class='badge blue'>public-only</span>"
+        };
+        let broken = if r.broken > 0 {
+            format!(" <span class='badge amber'>⚠ {}</span>", r.broken)
+        } else {
+            String::new()
+        };
+        let _ = write!(
+            rows,
+            "<tr><td><a href=\"/r/{slug}/{rp}\">{rp}</a>{broken}</td><td>{vis}</td>\
+             <td>{pk}</td><td class=muted>{last}</td><td>{mode}</td></tr>",
+            rp = esc(&r.slug),
+            pk = r.packages,
+            last = esc(r.last_sync.as_deref().unwrap_or("never")),
+            mode = esc(&r.update_mode),
+        );
+    }
+    if repos.is_empty() {
+        let cta = if can_admin {
+            format!(" — <a href=\"/repos/new?org={slug}\">create one</a>")
+        } else {
+            String::new()
+        };
+        rows = format!("<tr><td colspan=5 class=muted>No repositories yet{cta}.</td></tr>");
+    }
+
+    let actions = if can_admin {
+        format!(
+            "<a href=\"/o/{slug}/settings\"><button>Settings</button></a> \
+             <a href=\"/repos/new?org={slug}\"><button class=primary>+ New repository</button></a>"
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<div class=toolbar><h1>{slug}</h1><div>{actions}</div></div>\
+         <table><tr><th>Repository</th><th>Visibility</th><th>Packages</th><th>Last sync</th><th>Update mode</th></tr>{rows}</table>"
+    );
+    Ok(shell(&s, &user, &org, &body))
 }
 
 async fn org_settings_page(
@@ -1681,7 +1740,7 @@ async fn index(
         ""
     };
     let new_repo_btn = if can_create_repo {
-        "<a href=/repos/new><button class=primary>＋ New repository</button></a>"
+        "<a href=/repos/new><button class=primary>+ New repository</button></a>"
     } else {
         ""
     };
@@ -1703,9 +1762,9 @@ async fn index(
             .unwrap_or_default();
         let _ = write!(
             body,
-            "<h2>{}{label} <a class=muted style=\"font-size:.8rem\" href=\"/o/{}/settings\">settings</a></h2>",
-            esc(&o.slug),
-            esc(&o.slug),
+            "<h2><a href=\"/o/{sl}\">{sl}</a>{label} \
+             <a class=muted style=\"font-size:.8rem\" href=\"/o/{sl}/settings\">settings</a></h2>",
+            sl = esc(&o.slug),
         );
         let org_repos: Vec<_> = repos.iter().filter(|r| r.org_id == o.id).collect();
         if org_repos.is_empty() {
