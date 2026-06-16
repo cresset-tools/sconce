@@ -136,6 +136,8 @@ pub fn router(
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
         .route("/r/{org}/{repo}/grant/policy", post(set_grant_policy_action))
+        .route("/r/{org}/{repo}/autogrant", post(add_autogrant))
+        .route("/r/{org}/{repo}/autogrant/remove", post(remove_autogrant))
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
         .route("/r/{org}/{repo}/upstream/remove", post(remove_upstream))
         .route("/r/{org}/{repo}/upstream/sync", post(sync_upstream))
@@ -2437,6 +2439,8 @@ async fn repo_page(
     let tokens = s.catalog.list_tokens(summary.id).await.map_err(e500)?;
     let licenses = s.catalog.list_licenses(summary.id).await.map_err(e500)?;
     let grants = s.catalog.list_grants(summary.id).await.map_err(e500)?;
+    let grant_rules = s.catalog.list_grant_rules(summary.id).await.map_err(e500)?;
+    let org_sets = s.catalog.list_package_sets(summary.org_id).await.map_err(e500)?;
     let upstreams = s.catalog.list_upstreams(summary.id).await.map_err(e500)?;
     let ci_policies = s.catalog.ci_policies(summary.id).await.map_err(e500)?;
     let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
@@ -2669,6 +2673,44 @@ async fn repo_page(
          <form class=row method=post action=\"/r/{slug}/grant\">grant <input name=package placeholder=\"vendor/name\" required> \
          from <input name=from placeholder=\"org/repo\" required> <button>Grant</button></form>"
     );
+
+    // Autogrant: subscribe this repo to a package set — every package the set
+    // resolves to (now and later) flows in. The agency "house bundle".
+    let mut rule_rows = String::new();
+    for (rid, set_id, set_name) in &grant_rules {
+        let n = s.catalog.resolve_set(*set_id).await.map_err(e500)?.len();
+        let _ = write!(
+            rule_rows,
+            "<tr><td>{name}</td><td>{n} package(s)</td><td>\
+             <form class=inline method=post action=\"/r/{slug}/autogrant/remove\" \
+             onsubmit=\"return confirm('Un-subscribe from this set?')\">\
+             <input type=hidden name=id value=\"{rid}\"><button>Un-subscribe</button></form></td></tr>",
+            name = esc(set_name),
+        );
+    }
+    if grant_rules.is_empty() {
+        rule_rows = "<tr><td colspan=3 class=muted>not subscribed to any set</td></tr>".into();
+    }
+    let mut set_opts = String::new();
+    for st in &org_sets {
+        let _ = write!(set_opts, "<option value=\"{}\">{}</option>", st.id, esc(&st.name));
+    }
+    let autogrant_section = if org_sets.is_empty() {
+        format!(
+            "<h2>Autogrant</h2><p class=muted>Subscribe to a package set to auto-grant its packages here. \
+             No sets yet — create one under <a href=\"/o/{org}/sets\">Package sets</a>.</p>",
+            org = esc(&org),
+        )
+    } else {
+        format!(
+            "<h2>Autogrant</h2>\
+             <p class=muted>Subscribe to a package set — every package it resolves to is granted here, \
+             auto-growing as the set grows.</p>\
+             <table><tr><th>Set</th><th>Brings in</th><th></th></tr>{rule_rows}</table>\
+             <form class=row method=post action=\"/r/{slug}/autogrant\">\
+             subscribe to <select name=set_id>{set_opts}</select> <button>Subscribe</button></form>"
+        )
+    };
 
     let up_rows = upstreams.iter().fold(String::new(), |mut acc, u| {
         use std::fmt::Write as _;
@@ -2990,7 +3032,7 @@ composer config --auth http-basic.{host} token \"$TOKEN\"</pre>"
              {ro_open}{policy}\
              <h2>Packages &amp; versions</h2>{filter_bar}<table>\
              <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}\
-             {health_section}{upstreams_section}{deps_section}{grants_section}{licenses_section}{tokens_section}{ci_section}{ro_close}"
+             {health_section}{upstreams_section}{deps_section}{grants_section}{autogrant_section}{licenses_section}{tokens_section}{ci_section}{ro_close}"
         ),
     ))
 }
@@ -3264,6 +3306,41 @@ struct GrantPolicyForm {
     package: String,
     mode: String,
     cooldown_days: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AutograntForm {
+    set_id: String,
+}
+
+async fn add_autogrant(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<AutograntForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_admin(&s, &user, &org, &repo).await?;
+    let set_id = f.set_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // The set must belong to this repo's org.
+    match s.catalog.package_set(set_id).await.map_err(e500)? {
+        Some((_, set_org)) if set_org == summary.org_id => {
+            s.catalog.add_grant_rule(summary.id, set_id).await.map_err(e500)?;
+            Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn remove_autogrant(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<IdForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_admin(&s, &user, &org, &repo).await?;
+    let rule_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog.remove_grant_rule(summary.id, rule_id).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 
 async fn set_grant_policy_action(

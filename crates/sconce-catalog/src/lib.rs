@@ -130,6 +130,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0030_grant_policy",
         include_str!("../migrations/0030_grant_policy.sql"),
     ),
+    (
+        "0031_grant_rules",
+        include_str!("../migrations/0031_grant_rules.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -611,6 +615,18 @@ const VERSION_FILTER: &str = " and ($2::text is null or p.name ilike '%' || $2 |
                     or ( r.update_mode = 'delayed' \
                          and ( pv.released_at is null \
                                or pv.released_at + make_interval(days => r.cooldown_days) > now() ) ) )))";
+
+/// SQL `exists(...)` testing whether package `p` is granted into repo `$1` via an
+/// **autogrant rule** (a subscribed package set). References `p.id`/`p.repo_id`/
+/// `p.name`; inlined into the serving read path so rule-grants auto-grow.
+const GRANT_RULE_EXISTS: &str = "exists ( \
+    select 1 from repository_grant_rules gr \
+    join package_sets ps on ps.id = gr.set_id \
+    where gr.target_repo_id = $1 \
+      and ( p.id in (select package_id from package_set_members m where m.set_id = gr.set_id) \
+            or ( p.repo_id in (select rr.id from repositories rr where rr.org_id = ps.org_id) \
+                 and exists (select 1 from package_set_rules sr \
+                             where sr.set_id = gr.set_id and p.name like replace(sr.glob, '*', '%')) ) ) )";
 
 impl Catalog {
     /// Connect to Postgres at `database_url` (e.g.
@@ -1191,6 +1207,55 @@ impl Catalog {
         .execute(&self.pool)
         .await?;
         Ok(n.rows_affected() > 0)
+    }
+
+    // ----- autogrant rules (subscribe a repo to a package set) -----
+
+    /// Subscribe `target_repo_id` to a package set — every package the set
+    /// resolves to (now and later) is granted into the repo. Idempotent.
+    pub async fn add_grant_rule(
+        &self,
+        target_repo_id: Uuid,
+        set_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into repository_grant_rules (target_repo_id, set_id) values ($1, $2) \
+             on conflict do nothing",
+        )
+        .bind(target_repo_id)
+        .bind(set_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove an autogrant rule (un-subscribe), scoped to the target repo.
+    pub async fn remove_grant_rule(
+        &self,
+        target_repo_id: Uuid,
+        rule_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from repository_grant_rules where id = $1 and target_repo_id = $2")
+            .bind(rule_id)
+            .bind(target_repo_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A repo's autogrant rules: `(rule_id, set_id, set_name)`.
+    pub async fn list_grant_rules(
+        &self,
+        target_repo_id: Uuid,
+    ) -> Result<Vec<(Uuid, Uuid, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "select gr.id, ps.id, ps.name from repository_grant_rules gr \
+             join package_sets ps on ps.id = gr.set_id \
+             where gr.target_repo_id = $1 order by ps.name",
+        )
+        .bind(target_repo_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     // ----- accounts (admin UI) -----
@@ -3178,19 +3243,16 @@ impl Catalog {
     pub async fn all_package_names(&self, repo_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
         // A public-only repo (allow_private_packages = false) hides private
         // packages — both its own and granted ones.
-        let rows = sqlx::query(
-            "select p.name from packages p \
+        let rows = sqlx::query(&format!(
+            "select distinct p.name from packages p \
              join repositories r on r.id = $1 \
-             where p.repo_id = $1 \
-               and (r.allow_private_packages or p.visibility = 'public') \
-             union \
-             select p.name from packages p \
-             join repository_grants g on g.package_id = p.id \
-             join repositories r on r.id = $1 \
-             where g.repo_id = $1 \
-               and (r.allow_private_packages or p.visibility = 'public') \
-             order by name",
-        )
+             where (r.allow_private_packages or p.visibility = 'public') \
+               and ( p.repo_id = $1 \
+                     or exists (select 1 from repository_grants g \
+                                where g.repo_id = $1 and g.package_id = p.id) \
+                     or {GRANT_RULE_EXISTS} ) \
+             order by p.name"
+        ))
         .bind(repo_id)
         .fetch_all(&self.pool)
         .await?;
@@ -3240,7 +3302,7 @@ impl Catalog {
         bound_until_unix: Option<i64>,
         bound_major: Option<i32>,
     ) -> Result<Vec<PackageVersion>, sqlx::Error> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "select pv.version, pv.normalized_version, pv.stability, pv.composer_json, \
                     pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
              from package_versions pv \
@@ -3249,7 +3311,8 @@ impl Catalog {
              where p.name = $2 \
                and ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
-                                where g.repo_id = $1 and g.package_id = p.id) ) \
+                                where g.repo_id = $1 and g.package_id = p.id) \
+                     or {GRANT_RULE_EXISTS} ) \
                and (r.allow_private_packages or p.visibility = 'public') \
                and pv.yanked_at is null \
                and pv.held_at is null \
@@ -3264,8 +3327,8 @@ impl Catalog {
                               - make_interval(days => pv.grace_days) <= to_timestamp($5::double precision) ) ) \
                and ( $6::int is null \
                      or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 ) \
-             order by pv.normalized_version",
-        )
+             order by pv.normalized_version"
+        ))
         .bind(repo_id)
         .bind(name)
         .bind(mode)
@@ -4709,5 +4772,46 @@ mod tests {
             norm(cat.visible_versions(repo_id, p, "auto", 0, None, Some(2)).await.unwrap()),
             ["1.0.0.0", "2.0.0.0"]
         );
+    }
+
+    #[tokio::test]
+    async fn autogrant_rule_serves_set_packages() {
+        let Some((cat, src_repo)) = repo().await else {
+            return;
+        };
+        let (org_id, org_slug): (Uuid, String) =
+            sqlx::query_as("select o.id, o.slug from repositories r join organizations o on o.id = r.org_id where r.id = $1")
+                .bind(src_repo)
+                .fetch_one(&cat.pool)
+                .await
+                .unwrap();
+        let client = cat.create_repo(&org_slug, "client").await.unwrap();
+
+        // A package in the source repo + a version.
+        let pkg = cat.upsert_package(src_repo, "acme/x", "git", None, Visibility::Public).await.unwrap();
+        let cj = serde_json::json!({"name": "acme/x"});
+        cat.upsert_package_version(pkg, "1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None)
+            .await
+            .unwrap();
+
+        // A set with a glob rule, subscribed by the client repo.
+        let set = cat.create_package_set(org_id, "Bundle").await.unwrap();
+        cat.add_set_rule(set, "acme/*").await.unwrap();
+        assert!(!cat.all_package_names(client).await.unwrap().contains(&"acme/x".to_owned()));
+        cat.add_grant_rule(client, set).await.unwrap();
+
+        // The client now serves the set's package (and its versions), virtually.
+        assert!(cat.all_package_names(client).await.unwrap().contains(&"acme/x".to_owned()));
+        assert_eq!(cat.visible_versions(client, "acme/x", "auto", 0, None, None).await.unwrap().len(), 1);
+        assert_eq!(cat.list_grant_rules(client).await.unwrap().len(), 1);
+
+        // Auto-grow: a new acme/* package flows in without re-config.
+        cat.upsert_package(src_repo, "acme/y", "git", None, Visibility::Public).await.unwrap();
+        assert!(cat.all_package_names(client).await.unwrap().contains(&"acme/y".to_owned()));
+
+        // Un-subscribe removes the inherited access.
+        let rid = cat.list_grant_rules(client).await.unwrap()[0].0;
+        cat.remove_grant_rule(client, rid).await.unwrap();
+        assert!(!cat.all_package_names(client).await.unwrap().contains(&"acme/x".to_owned()));
     }
 }
