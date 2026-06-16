@@ -112,6 +112,13 @@ pub fn router(
         .route("/o/{org}", get(org_overview_page))
         .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
         .route("/o/{org}/rename", post(rename_org_action))
+        .route("/o/{org}/sets", get(sets_page).post(create_set))
+        .route("/o/{org}/sets/{id}", get(set_editor_page))
+        .route("/o/{org}/sets/{id}/delete", post(delete_set))
+        .route("/o/{org}/sets/{id}/member", post(add_set_member))
+        .route("/o/{org}/sets/{id}/member/remove", post(remove_set_member))
+        .route("/o/{org}/sets/{id}/rule", post(add_set_rule))
+        .route("/o/{org}/sets/{id}/rule/remove", post(remove_set_rule))
         .route("/o/{org}/oidc", post(save_oidc))
         .route("/o/{org}/scim-token", post(gen_scim_token))
         .route("/repos", post(create_repo))
@@ -645,7 +652,8 @@ async fn org_overview_page(
 
     let actions = if can_admin {
         format!(
-            "<a href=\"/o/{slug}/settings\"><button>Settings</button></a> \
+            "<a href=\"/o/{slug}/sets\"><button>Package sets</button></a> \
+             <a href=\"/o/{slug}/settings\"><button>Settings</button></a> \
              <a href=\"/repos/new?org={slug}\"><button class=primary>+ New repository</button></a>"
         )
     } else {
@@ -826,6 +834,237 @@ async fn gen_scim_token(
             esc(&token)
         ),
     ))
+}
+
+// ----- package sets (F6) -----
+
+#[derive(Deserialize)]
+struct NameForm {
+    name: String,
+}
+#[derive(Deserialize)]
+struct PackageNameForm {
+    package: String,
+}
+#[derive(Deserialize)]
+struct GlobForm {
+    glob: String,
+}
+#[derive(Deserialize)]
+struct IdForm {
+    id: String,
+}
+
+/// Resolve a set within an org, 404/403-ing if it doesn't belong here.
+async fn lookup_set(
+    s: &Ui,
+    org_id: Uuid,
+    id: &str,
+) -> Result<(Uuid, String), StatusCode> {
+    let set_id = id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (name, set_org) = s.catalog.package_set(set_id).await.map_err(e500)?.ok_or(StatusCode::NOT_FOUND)?;
+    if set_org != org_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok((set_id, name))
+}
+
+async fn sets_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path(org): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let summary = lookup_org(&s, &user, &org).await?;
+    let sets = s.catalog.list_package_sets(summary.id).await.map_err(e500)?;
+    let slug = esc(&org);
+    let mut rows = String::new();
+    for st in &sets {
+        let n = s.catalog.resolve_set(st.id).await.map_err(e500)?.len();
+        let _ = write!(
+            rows,
+            "<tr><td><a href=\"/o/{slug}/sets/{id}\">{name}</a></td><td>{n} package(s)</td></tr>",
+            id = st.id,
+            name = esc(&st.name),
+        );
+    }
+    if sets.is_empty() {
+        rows = "<tr><td colspan=2 class=muted>No package sets yet.</td></tr>".into();
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "Package sets",
+        &format!(
+            "<div class=toolbar><h1>Package sets</h1><a href=\"/o/{slug}\"><button>← {slug}</button></a></div>\
+             <p class=muted>A named group of packages — explicit members plus glob rules (<code>vendor/*</code>, \
+             auto-including matching packages added later). Reused by license entitlements and grants.</p>\
+             <table><tr><th>Set</th><th>Packages</th></tr>{rows}</table>\
+             <form class=row method=post action=\"/o/{slug}/sets\">\
+             name <input name=name placeholder=\"e.g. Pro edition\" required> <button>Create set</button></form>"
+        ),
+    ))
+}
+
+async fn create_set(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path(org): Path<String>,
+    Form(f): Form<NameForm>,
+) -> Result<Response, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    match s.catalog.create_package_set(summary.id, &f.name).await {
+        Ok(_) => Ok(Redirect::to(&format!("/o/{org}/sets")).into_response()),
+        Err(_) => Ok(error_card(
+            &s,
+            &user,
+            "Couldn't create set",
+            "A set with that name already exists.",
+            &format!("/o/{org}/sets"),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn set_editor_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Html<String>, StatusCode> {
+    let summary = lookup_org(&s, &user, &org).await?;
+    let (set_id, name) = lookup_set(&s, summary.id, &id).await?;
+    let slug = esc(&org);
+    let members = s.catalog.set_members(set_id).await.map_err(e500)?;
+    let rules = s.catalog.set_rules(set_id).await.map_err(e500)?;
+    let resolved = s.catalog.resolve_set(set_id).await.map_err(e500)?;
+
+    let mut member_rows = String::new();
+    for (pid, pname) in &members {
+        let _ = write!(
+            member_rows,
+            "<tr><td class=mono>{n}</td><td>\
+             <form class=inline method=post action=\"/o/{slug}/sets/{set_id}/member/remove\">\
+             <input type=hidden name=id value=\"{pid}\"><button>Remove</button></form></td></tr>",
+            n = esc(pname),
+        );
+    }
+    if members.is_empty() {
+        member_rows = "<tr><td colspan=2 class=muted>none</td></tr>".into();
+    }
+    let mut rule_rows = String::new();
+    for (rid, glob) in &rules {
+        let _ = write!(
+            rule_rows,
+            "<tr><td class=mono>{g}</td><td>\
+             <form class=inline method=post action=\"/o/{slug}/sets/{set_id}/rule/remove\">\
+             <input type=hidden name=id value=\"{rid}\"><button>Remove</button></form></td></tr>",
+            g = esc(glob),
+        );
+    }
+    if rules.is_empty() {
+        rule_rows = "<tr><td colspan=2 class=muted>none</td></tr>".into();
+    }
+    let mut preview = String::new();
+    for n in &resolved {
+        let _ = write!(preview, "<span class='badge slate'>{}</span> ", esc(n));
+    }
+
+    Ok(shell(
+        &s,
+        &user,
+        &name,
+        &format!(
+            "<div class=toolbar><h1>{setname}</h1>\
+             <form class=inline method=post action=\"/o/{slug}/sets/{set_id}/delete\" \
+             onsubmit=\"return confirm('Delete this set?')\"><button>Delete set</button></form></div>\
+             <p class=muted><a href=\"/o/{slug}/sets\">← all sets</a></p>\
+             <h2>Explicit members</h2>\
+             <table><tr><th>Package</th><th></th></tr>{member_rows}</table>\
+             <form class=row method=post action=\"/o/{slug}/sets/{set_id}/member\">\
+             add package <input name=package placeholder=\"vendor/name\" required> <button>Add</button></form>\
+             <h2>Glob rules</h2>\
+             <table><tr><th>Pattern</th><th></th></tr>{rule_rows}</table>\
+             <form class=row method=post action=\"/o/{slug}/sets/{set_id}/rule\">\
+             add rule <input name=glob placeholder=\"vendor/*\" required> <button>Add</button></form>\
+             <h2>Resolved membership <span class=muted>({n})</span></h2>\
+             <p class=muted>Explicit members ∪ packages matching the rules — auto-grows as matching packages are added.</p>\
+             <p>{preview}</p>",
+            setname = esc(&name),
+            n = resolved.len(),
+            preview = if preview.is_empty() { "<span class=muted>empty</span>".to_owned() } else { preview },
+        ),
+    ))
+}
+
+async fn delete_set(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
+    s.catalog.delete_package_set(summary.id, set_id).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/o/{org}/sets")))
+}
+
+async fn add_set_member(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, id)): Path<(String, String)>,
+    Form(f): Form<PackageNameForm>,
+) -> Result<Response, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
+    match s.catalog.find_package_in_org(summary.id, f.package.trim()).await.map_err(e500)? {
+        Some(pid) => {
+            s.catalog.add_set_member(set_id, pid).await.map_err(e500)?;
+            Ok(Redirect::to(&format!("/o/{org}/sets/{id}")).into_response())
+        }
+        None => Ok(error_card(
+            &s,
+            &user,
+            "Package not found",
+            "No package with that name in this organization.",
+            &format!("/o/{org}/sets/{id}"),
+        )),
+    }
+}
+
+async fn remove_set_member(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, id)): Path<(String, String)>,
+    Form(f): Form<IdForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
+    let pid = f.id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog.remove_set_member(set_id, pid).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/o/{org}/sets/{id}")))
+}
+
+async fn add_set_rule(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, id)): Path<(String, String)>,
+    Form(f): Form<GlobForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
+    s.catalog.add_set_rule(set_id, f.glob.trim()).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/o/{org}/sets/{id}")))
+}
+
+async fn remove_set_rule(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, id)): Path<(String, String)>,
+    Form(f): Form<IdForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_org_admin(&s, &user, &org).await?;
+    lookup_set(&s, summary.id, &id).await?;
+    let rid = f.id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog.remove_set_rule(rid).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/o/{org}/sets/{id}")))
 }
 
 async fn rename_org_action(

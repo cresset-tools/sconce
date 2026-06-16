@@ -118,6 +118,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0027_slug_history",
         include_str!("../migrations/0027_slug_history.sql"),
     ),
+    (
+        "0028_package_sets",
+        include_str!("../migrations/0028_package_sets.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -426,6 +430,13 @@ pub struct TenantMembership {
     pub slug: String,
     pub role: String,
     pub active: bool,
+}
+
+/// A package set (named, org-scoped group of packages) in a listing.
+#[derive(Debug, Clone)]
+pub struct PackageSet {
+    pub id: Uuid,
+    pub name: String,
 }
 
 /// A user in the superadmin listing.
@@ -1879,6 +1890,147 @@ impl Catalog {
         rows.iter()
             .map(|r| Ok((r.try_get("repo_id")?, r.try_get("n")?)))
             .collect()
+    }
+
+    // ----- package sets (shared collection primitive) -----
+
+    /// Package sets in an org (id + name), sorted.
+    pub async fn list_package_sets(&self, org_id: Uuid) -> Result<Vec<PackageSet>, sqlx::Error> {
+        let rows = sqlx::query("select id, name from package_sets where org_id = $1 order by name")
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(PackageSet {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Create a package set in an org. Errors on a duplicate name (unique).
+    pub async fn create_package_set(&self, org_id: Uuid, name: &str) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar("insert into package_sets (org_id, name) values ($1, $2) returning id")
+            .bind(org_id)
+            .bind(name.trim())
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Delete a package set (cascades members + rules).
+    pub async fn delete_package_set(&self, org_id: Uuid, set_id: Uuid) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query("delete from package_sets where id = $1 and org_id = $2")
+            .bind(set_id)
+            .bind(org_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// A set's `(id, name, org_id)`, if it exists.
+    pub async fn package_set(&self, set_id: Uuid) -> Result<Option<(String, Uuid)>, sqlx::Error> {
+        sqlx::query_as("select name, org_id from package_sets where id = $1")
+            .bind(set_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Explicit members of a set: `(package_id, name)`, sorted by name.
+    pub async fn set_members(&self, set_id: Uuid) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "select p.id, p.name from package_set_members m join packages p on p.id = m.package_id \
+             where m.set_id = $1 order by p.name",
+        )
+        .bind(set_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Glob rules of a set: `(rule_id, glob)`.
+    pub async fn set_rules(&self, set_id: Uuid) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        sqlx::query_as("select id, glob from package_set_rules where set_id = $1 order by glob")
+            .bind(set_id)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Resolve a set to its package **names**: explicit members ∪ packages in the
+    /// set's org whose name matches a glob rule (`*` → SQL `%`). Auto-grows as
+    /// matching packages are added.
+    pub async fn resolve_set(&self, set_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select distinct p.name from packages p \
+             where p.id in (select package_id from package_set_members where set_id = $1) \
+                or ( p.repo_id in (select id from repositories \
+                                   where org_id = (select org_id from package_sets where id = $1)) \
+                     and exists (select 1 from package_set_rules sr \
+                                 where sr.set_id = $1 and p.name like replace(sr.glob, '*', '%')) ) \
+             order by p.name",
+        )
+        .bind(set_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| r.try_get("name")).collect()
+    }
+
+    /// Find a package id by name within an org (any of its repos) — for adding an
+    /// explicit member by name. `None` if no such package.
+    pub async fn find_package_in_org(
+        &self,
+        org_id: Uuid,
+        name: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "select p.id from packages p join repositories r on r.id = p.repo_id \
+             where r.org_id = $1 and p.name = $2 limit 1",
+        )
+        .bind(org_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Add an explicit member to a set (idempotent).
+    pub async fn add_set_member(&self, set_id: Uuid, package_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into package_set_members (set_id, package_id) values ($1, $2) \
+             on conflict do nothing",
+        )
+        .bind(set_id)
+        .bind(package_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove an explicit member from a set.
+    pub async fn remove_set_member(&self, set_id: Uuid, package_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from package_set_members where set_id = $1 and package_id = $2")
+            .bind(set_id)
+            .bind(package_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Add a glob rule to a set, returning its id.
+    pub async fn add_set_rule(&self, set_id: Uuid, glob: &str) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar("insert into package_set_rules (set_id, glob) values ($1, $2) returning id")
+            .bind(set_id)
+            .bind(glob.trim())
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Remove a glob rule by id.
+    pub async fn remove_set_rule(&self, rule_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from package_set_rules where id = $1")
+            .bind(rule_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Record a successful sync of a package: stamp `last_success_at` and **clear
@@ -4341,5 +4493,41 @@ mod tests {
 
         // Unknown slug → no location.
         assert!(cat.resolve_repo_canonical("nope-org", "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn package_sets_resolve_explicit_and_glob() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id: Uuid = sqlx::query_scalar("select org_id from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap();
+        for n in ["acme/a", "acme/b", "other/c"] {
+            cat.upsert_package(repo_id, n, "git", None, Visibility::Public).await.unwrap();
+        }
+        let set = cat.create_package_set(org_id, "Pro").await.unwrap();
+
+        // explicit member + glob rule.
+        let cid = cat.find_package_in_org(org_id, "other/c").await.unwrap().unwrap();
+        cat.add_set_member(set, cid).await.unwrap();
+        cat.add_set_rule(set, "acme/*").await.unwrap();
+        assert_eq!(
+            cat.resolve_set(set).await.unwrap(),
+            vec!["acme/a", "acme/b", "other/c"]
+        );
+
+        // Auto-grow: a new acme/* package joins the set without re-config.
+        cat.upsert_package(repo_id, "acme/d", "git", None, Visibility::Public).await.unwrap();
+        assert!(cat.resolve_set(set).await.unwrap().contains(&"acme/d".to_owned()));
+
+        // Listing, members, rules, delete.
+        assert_eq!(cat.list_package_sets(org_id).await.unwrap().len(), 1);
+        assert_eq!(cat.set_members(set).await.unwrap().len(), 1);
+        assert_eq!(cat.set_rules(set).await.unwrap().len(), 1);
+        assert!(cat.delete_package_set(org_id, set).await.unwrap());
+        assert!(cat.list_package_sets(org_id).await.unwrap().is_empty());
     }
 }
