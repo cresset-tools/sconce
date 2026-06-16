@@ -135,6 +135,7 @@ pub fn router(
         .route("/r/{org}/{repo}/license/bound", post(set_license_bound_action))
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
+        .route("/r/{org}/{repo}/grant/policy", post(set_grant_policy_action))
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
         .route("/r/{org}/{repo}/upstream/remove", post(remove_upstream))
         .route("/r/{org}/{repo}/upstream/sync", post(sync_upstream))
@@ -2636,23 +2637,37 @@ async fn repo_page(
 
     let mut grant_rows = String::new();
     for g in &grants {
+        let gm = g.policy.update_mode.as_deref().unwrap_or("");
+        let gopt = |v: &str, text: &str| {
+            let sel = if v == gm { " selected" } else { "" };
+            format!("<option value=\"{v}\"{sel}>{text}</option>")
+        };
         let _ = write!(
             grant_rows,
-            "<li>{pkg} <span class=muted>from {o}/{r}</span></li>",
+            "<tr><td>{pkg}</td><td class=muted>{o}/{r}</td><td>\
+             <form class=inline method=post action=\"/r/{slug}/grant/policy\">\
+             <input type=hidden name=package value=\"{pkg}\">\
+             <select name=mode>{inherit}{auto}{manual}{delayed}</select>\
+             <input name=cooldown_days type=number min=0 placeholder=cooldown style=\"width:5em\" value=\"{cd}\">\
+             <button>Set</button></form></td></tr>",
             pkg = esc(&g.package),
             o = esc(&g.source_org),
             r = esc(&g.source_repo),
+            inherit = gopt("", "inherit"),
+            auto = gopt("auto", "auto"),
+            manual = gopt("manual", "manual"),
+            delayed = gopt("delayed", "delayed"),
+            cd = g.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
         );
     }
+    if grants.is_empty() {
+        grant_rows = "<tr><td colspan=3 class=muted>none</td></tr>".into();
+    }
     let grants_section = format!(
-        "<h2>Granted packages</h2><ul>{rows}</ul>\
+        "<h2>Granted packages</h2>\
+         <table><tr><th>Package</th><th>From</th><th>Policy</th></tr>{grant_rows}</table>\
          <form class=row method=post action=\"/r/{slug}/grant\">grant <input name=package placeholder=\"vendor/name\" required> \
-         from <input name=from placeholder=\"org/repo\" required> <button>Grant</button></form>",
-        rows = if grant_rows.is_empty() {
-            "<li class=muted>none</li>".into()
-        } else {
-            grant_rows
-        },
+         from <input name=from placeholder=\"org/repo\" required> <button>Grant</button></form>"
     );
 
     let up_rows = upstreams.iter().fold(String::new(), |mut acc, u| {
@@ -3242,6 +3257,37 @@ async fn remove_ci(
 struct GrantForm {
     package: String,
     from: String,
+}
+
+#[derive(Deserialize)]
+struct GrantPolicyForm {
+    package: String,
+    mode: String,
+    cooldown_days: Option<String>,
+}
+
+async fn set_grant_policy_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<GrantPolicyForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let update_mode = match f.mode.as_str() {
+        "auto" | "manual" | "delayed" => Some(f.mode.clone()),
+        "" => None,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let cooldown_days = match f.cooldown_days.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
+    };
+    let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
+    s.catalog
+        .set_grant_policy(repo_id, f.package.trim(), &policy)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 
 async fn create_grant(

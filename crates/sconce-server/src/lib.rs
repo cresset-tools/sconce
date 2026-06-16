@@ -224,6 +224,13 @@ async fn p2(
     // perpetual-fallback bound additionally caps which versions it may install.
     let (repo_mode, repo_cooldown) = s.catalog.update_policy(loc.repo_id).await?;
     let (mode, cooldown_days) = policy.effective(&repo_mode, repo_cooldown);
+    // A granted package can carry its own (tighter) policy — fold it in after the
+    // credential's, before serving.
+    let (mode, cooldown_days) = s
+        .catalog
+        .grant_policy(loc.repo_id, package)
+        .await?
+        .effective(&mode, cooldown_days);
     let versions = s
         .catalog
         .visible_versions(

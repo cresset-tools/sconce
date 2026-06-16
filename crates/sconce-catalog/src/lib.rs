@@ -126,6 +126,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0029_update_bound",
         include_str!("../migrations/0029_update_bound.sql"),
     ),
+    (
+        "0030_grant_policy",
+        include_str!("../migrations/0030_grant_policy.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -572,6 +576,8 @@ pub struct GrantSummary {
     pub package: String,
     pub source_org: String,
     pub source_repo: String,
+    /// Grant-scoped supply-chain policy override (empty = inherit the repo).
+    pub policy: PolicyOverride,
 }
 
 /// A package version as stored in the catalog.
@@ -1117,7 +1123,8 @@ impl Catalog {
     /// Packages granted into a repository (with where they're owned).
     pub async fn list_grants(&self, repo_id: Uuid) -> Result<Vec<GrantSummary>, sqlx::Error> {
         let rows = sqlx::query(
-            "select p.name as package, o.slug as source_org, r.slug as source_repo \
+            "select p.name as package, o.slug as source_org, r.slug as source_repo, \
+                    g.update_mode as update_mode, g.cooldown_days as cooldown_days \
              from repository_grants g \
              join packages p on p.id = g.package_id \
              join repositories r on r.id = p.repo_id \
@@ -1133,9 +1140,57 @@ impl Catalog {
                     package: row.try_get("package")?,
                     source_org: row.try_get("source_org")?,
                     source_repo: row.try_get("source_repo")?,
+                    policy: PolicyOverride {
+                        update_mode: row.try_get("update_mode").ok().flatten(),
+                        cooldown_days: row.try_get("cooldown_days").ok().flatten(),
+                    },
                 })
             })
             .collect()
+    }
+
+    /// The grant-scoped policy for a package served into `repo_id` via a grant
+    /// (empty if owned, ungranted, or no override). Folded into serving after the
+    /// credential policy, tighten-only.
+    pub async fn grant_policy(
+        &self,
+        repo_id: Uuid,
+        package: &str,
+    ) -> Result<PolicyOverride, sqlx::Error> {
+        let row = sqlx::query(
+            "select g.update_mode, g.cooldown_days from repository_grants g \
+             join packages p on p.id = g.package_id \
+             where g.repo_id = $1 and p.name = $2 limit 1",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map_or_else(PolicyOverride::default, |r| PolicyOverride {
+            update_mode: r.try_get("update_mode").ok().flatten(),
+            cooldown_days: r.try_get("cooldown_days").ok().flatten(),
+        }))
+    }
+
+    /// Set (or clear) the grant-scoped policy for a granted package, by repo +
+    /// package name. Returns whether a grant matched.
+    pub async fn set_grant_policy(
+        &self,
+        repo_id: Uuid,
+        package: &str,
+        policy: &PolicyOverride,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update repository_grants g set update_mode = $3, cooldown_days = $4 \
+             from packages p where p.id = g.package_id and g.repo_id = $1 and p.name = $2",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .bind(policy.update_mode.as_deref())
+        .bind(policy.cooldown_days)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
     }
 
     // ----- accounts (admin UI) -----
