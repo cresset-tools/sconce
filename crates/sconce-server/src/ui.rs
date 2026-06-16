@@ -133,6 +133,8 @@ pub fn router(
         .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
         .route("/r/{org}/{repo}/license/policy", post(set_license_policy))
         .route("/r/{org}/{repo}/license/bound", post(set_license_bound_action))
+        .route("/r/{org}/{repo}/license/set", post(entitle_license_set))
+        .route("/r/{org}/{repo}/license/set/remove", post(remove_license_set))
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
         .route("/r/{org}/{repo}/grant/policy", post(set_grant_policy_action))
@@ -298,6 +300,8 @@ font-size:11.5px;font-weight:600;line-height:1;white-space:nowrap;background:#f3
 .badge.slate{background:#eef1f6;color:#3f4756;border-color:#dfe4ec}\
 .badge.blue{background:#e9f0fc;color:#1f54ad;border-color:#d3e1f7}\
 .badge.violet{background:#f0edfd;color:#4b3fc4;border-color:#e1dbf8}\
+button.linkbtn{padding:0;border:0;background:none;color:inherit;font-weight:700;line-height:1;cursor:pointer;opacity:.6}\
+button.linkbtn:hover{opacity:1;background:none}\
 button{font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;color:var(--text2);background:var(--surface);\
 border:1px solid var(--border);border-radius:7px;padding:.32rem .62rem;transition:background .12s,border-color .12s}\
 button:hover{background:#f6f7f9;border-color:#dcdfe6}\
@@ -2823,9 +2827,41 @@ async fn repo_page(
             let sel = if v == m { " selected" } else { "" };
             format!("<option value=\"{v}\"{sel}>{text}</option>")
         };
+        // Entitled-set badges (by reference, auto-growing) each with a remove
+        // form, plus a dropdown to entitle another of the org's sets.
+        let mut set_cell = String::new();
+        for (sid, sname) in &l.sets {
+            let _ = write!(
+                set_cell,
+                "<span class=badge>{name} \
+                 <form class=inline method=post action=\"/r/{slug}/license/set/remove\">\
+                 <input type=hidden name=id value=\"{id}\">\
+                 <input type=hidden name=set_id value=\"{sid}\">\
+                 <button class=linkbtn title=\"Revoke set\">\u{00d7}</button></form></span> ",
+                name = esc(sname),
+                id = l.id,
+            );
+        }
+        if org_sets.is_empty() {
+            if l.sets.is_empty() {
+                set_cell.push_str("<span class=muted>—</span>");
+            }
+        } else {
+            let opts = org_sets.iter().fold(String::new(), |mut acc, st| {
+                let _ = write!(acc, "<option value=\"{}\">{}</option>", st.id, esc(&st.name));
+                acc
+            });
+            let _ = write!(
+                set_cell,
+                "<form class=inline method=post action=\"/r/{slug}/license/set\">\
+                 <input type=hidden name=id value=\"{id}\">\
+                 <select name=set_id>{opts}</select> <button>Add set</button></form>",
+                id = l.id,
+            );
+        }
         let _ = write!(
             lic_rows,
-            "<tr><td>{buyer}</td><td>{status}</td><td>{pkgs}</td><td>\
+            "<tr><td>{buyer}</td><td>{status}</td><td>{pkgs}</td><td>{set_cell}</td><td>\
              <form class=inline method=post action=\"/r/{slug}/license/policy\">\
              <input type=hidden name=id value=\"{id}\">\
              <select name=mode>{inherit}{auto}{manual}{delayed}</select>\
@@ -2850,13 +2886,14 @@ async fn repo_page(
         );
     }
     if licenses.is_empty() {
-        lic_rows = "<tr><td colspan=5 class=muted>none</td></tr>".into();
+        lic_rows = "<tr><td colspan=6 class=muted>none</td></tr>".into();
     }
     let licenses_section = format!(
         "<h2>License keys</h2>\
          <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs \
-         (a date = \u{201c}updates until\u{201d}, or \u{2264} a major version) — it keeps everything in-window forever.</p>\
-         <table><tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Policy</th><th>Update bound</th></tr>{lic_rows}</table>\
+         (a date = \u{201c}updates until\u{201d}, or \u{2264} a major version) — it keeps everything in-window forever. \
+         Entitling a key to a <strong>set</strong> unlocks every package it resolves to, by reference (auto-grows).</p>\
+         <table><tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Sets</th><th>Policy</th><th>Update bound</th></tr>{lic_rows}</table>\
          <form class=row method=post action=\"/r/{slug}/license\">buyer <input name=buyer> \
          packages <input name=packages placeholder=\"vendor/a vendor/b\" required> <button>Issue license</button></form>"
     );
@@ -3795,6 +3832,46 @@ async fn set_license_policy(
     let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
     s.catalog
         .set_license_policy(repo_id, license_id, &policy)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct LicenseSetForm {
+    id: String,
+    set_id: String,
+}
+
+async fn entitle_license_set(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<LicenseSetForm>,
+) -> Result<Redirect, StatusCode> {
+    let summary = lookup_admin(&s, &user, &org, &repo).await?;
+    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let set_id = f.set_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // The set must belong to the repo's org (no cross-tenant entitlement).
+    match s.catalog.package_set(set_id).await.map_err(e500)? {
+        Some((_, org_id)) if org_id == summary.org_id => {}
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    s.catalog.entitle_set(license_id, set_id).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+async fn remove_license_set(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<LicenseSetForm>,
+) -> Result<Redirect, StatusCode> {
+    lookup_admin(&s, &user, &org, &repo).await?;
+    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let set_id = f.set_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog
+        .remove_set_entitlement(license_id, set_id)
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))

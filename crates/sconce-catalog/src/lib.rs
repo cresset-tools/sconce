@@ -134,6 +134,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0031_grant_rules",
         include_str!("../migrations/0031_grant_rules.sql"),
     ),
+    (
+        "0032_set_entitlements",
+        include_str!("../migrations/0032_set_entitlements.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -549,6 +553,8 @@ pub struct LicenseSummary {
     pub buyer: Option<String>,
     pub status: String,
     pub packages: Vec<String>,
+    /// Entitled package sets as `(set_id, name)` — unlock by reference, auto-grow.
+    pub sets: Vec<(Uuid, String)>,
     /// Per-credential supply-chain policy override (empty = inherits the repo).
     pub policy: PolicyOverride,
     /// Perpetual-fallback update bound (empty = unbounded).
@@ -1103,10 +1109,13 @@ impl Catalog {
                     to_char(l.update_until, 'YYYY-MM-DD') as bound_until, \
                     extract(epoch from l.update_until)::bigint as bound_until_unix, \
                     l.version_cap_major as bound_major, \
-                    coalesce(array_agg(p.name) filter (where p.name is not null), '{}') as packages \
+                    coalesce(array_agg(distinct p.name) filter (where p.name is not null), '{}') as packages, \
+                    coalesce(array_agg(distinct ps.id::text || '|' || ps.name) filter (where ps.id is not null), '{}') as sets \
              from license_keys l \
              left join entitlements e on e.license_key_id = l.id \
              left join packages p on p.id = e.package_id \
+             left join license_set_entitlements lse on lse.license_key_id = l.id \
+             left join package_sets ps on ps.id = lse.set_id \
              where l.repo_id = $1 \
              group by l.id, l.buyer_ref, l.status, l.update_mode, l.cooldown_days, \
                       l.update_until, l.version_cap_major, l.created_at \
@@ -1122,6 +1131,15 @@ impl Catalog {
                     buyer: row.try_get("buyer")?,
                     status: row.try_get("status")?,
                     packages: row.try_get("packages")?,
+                    sets: {
+                        let raw: Vec<String> = row.try_get("sets")?;
+                        raw.iter()
+                            .filter_map(|s| {
+                                let (id, name) = s.split_once('|')?;
+                                Some((id.parse().ok()?, name.to_owned()))
+                            })
+                            .collect()
+                    },
                     policy: PolicyOverride {
                         update_mode: row.try_get("update_mode").ok().flatten(),
                         cooldown_days: row.try_get("cooldown_days").ok().flatten(),
@@ -3201,12 +3219,70 @@ impl Catalog {
         let rows = sqlx::query(
             "select p.name from entitlements e \
              join packages p on p.id = e.package_id \
-             where e.license_key_id = $1 order by p.name",
+             where e.license_key_id = $1 \
+             union \
+             select p.name from license_set_entitlements lse \
+             join package_sets ps on ps.id = lse.set_id \
+             join packages p on ( \
+                 p.id in (select package_id from package_set_members where set_id = lse.set_id) \
+                 or ( p.repo_id in (select id from repositories where org_id = ps.org_id) \
+                      and exists (select 1 from package_set_rules sr \
+                                  where sr.set_id = lse.set_id \
+                                    and p.name like replace(sr.glob, '*', '%')) ) ) \
+             where lse.license_key_id = $1 \
+             order by name",
         )
         .bind(license_id)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(|r| r.try_get("name")).collect()
+    }
+
+    /// Entitle a license to an entire **package set** (a SKU/edition). The license
+    /// unlocks every package the set resolves to, by reference — auto-growing as
+    /// the set grows. Idempotent.
+    pub async fn entitle_set(&self, license_id: Uuid, set_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into license_set_entitlements (license_key_id, set_id) values ($1, $2) \
+             on conflict do nothing",
+        )
+        .bind(license_id)
+        .bind(set_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Revoke a set entitlement from a license.
+    pub async fn remove_set_entitlement(
+        &self,
+        license_id: Uuid,
+        set_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("delete from license_set_entitlements where license_key_id = $1 and set_id = $2")
+            .bind(license_id)
+            .bind(set_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Sets a license is entitled to, as `(set_id, name)` pairs.
+    pub async fn entitled_sets(
+        &self,
+        license_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select ps.id, ps.name from license_set_entitlements lse \
+             join package_sets ps on ps.id = lse.set_id \
+             where lse.license_key_id = $1 order by ps.name",
+        )
+        .bind(license_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get("id")?, r.try_get("name")?)))
+            .collect()
     }
 
     /// Grant `package` (owned by `source_repo`) into `target_repo`, so the target
@@ -4725,6 +4801,50 @@ mod tests {
         assert_eq!(cat.set_rules(set).await.unwrap().len(), 1);
         assert!(cat.delete_package_set(org_id, set).await.unwrap());
         assert!(cat.list_package_sets(org_id).await.unwrap().is_empty());
+    }
+
+    /// A license entitled to a package **set** unlocks every package the set
+    /// resolves to (explicit + glob), auto-growing, alongside any per-package
+    /// entitlements. Listing surfaces the set; removal revokes it.
+    #[tokio::test]
+    async fn license_set_entitlements_resolve_and_grow() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id: Uuid = sqlx::query_scalar("select org_id from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap();
+        for n in ["acme/a", "acme/b", "solo/x"] {
+            cat.upsert_package(repo_id, n, "git", None, Visibility::Private).await.unwrap();
+        }
+        let set = cat.create_package_set(org_id, "Edition").await.unwrap();
+        cat.add_set_rule(set, "acme/*").await.unwrap();
+
+        let (_key, lic) = cat.create_license_key(repo_id, Some("buyer")).await.unwrap();
+        // A direct package entitlement plus a set entitlement coexist.
+        assert!(cat.entitle_package(lic, repo_id, "solo/x").await.unwrap());
+        cat.entitle_set(lic, set).await.unwrap();
+
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a", "acme/b", "solo/x"]
+        );
+
+        // Auto-grow: a new acme/* package is unlocked without touching the license.
+        cat.upsert_package(repo_id, "acme/c", "git", None, Visibility::Private).await.unwrap();
+        assert!(cat.entitled_package_names(lic).await.unwrap().contains(&"acme/c".to_owned()));
+
+        // Listing surfaces the entitled set.
+        let listed = &cat.list_licenses(repo_id).await.unwrap()[0];
+        assert_eq!(listed.sets.len(), 1);
+        assert_eq!(listed.sets[0].1, "Edition");
+        assert_eq!(cat.entitled_sets(lic).await.unwrap()[0].1, "Edition");
+
+        // Revoke the set: only the direct entitlement remains.
+        cat.remove_set_entitlement(lic, set).await.unwrap();
+        assert_eq!(cat.entitled_package_names(lic).await.unwrap(), vec!["solo/x"]);
     }
 
     #[tokio::test]
