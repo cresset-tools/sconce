@@ -105,11 +105,12 @@ async fn authorize(
     s: &AppState,
     repo_id: Uuid,
     headers: &HeaderMap,
-) -> Result<(Access, sconce_catalog::PolicyOverride), AppError> {
+) -> Result<(Access, sconce_catalog::PolicyOverride, sconce_catalog::LicenseBound), AppError> {
     let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
 
     if let Some(policy) = s.catalog.resolve_token_policy(repo_id, &cred).await? {
-        return Ok((Access::Full, policy));
+        // A repo token has no perpetual-fallback bound (unbounded).
+        return Ok((Access::Full, policy, sconce_catalog::LicenseBound::default()));
     }
     if let Some(license_id) = s.catalog.resolve_license(repo_id, &cred).await? {
         let entitled = s
@@ -119,7 +120,8 @@ async fn authorize(
             .into_iter()
             .collect();
         let policy = s.catalog.license_policy(license_id).await?;
-        return Ok((Access::Licensed(entitled), policy));
+        let bound = s.catalog.license_bound(license_id).await?;
+        return Ok((Access::Licensed(entitled), policy, bound));
     }
     Err(AppError::Unauthorized)
 }
@@ -176,7 +178,7 @@ async fn packages_json(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, _policy) = authorize(&s, loc.repo_id, &headers).await?;
+    let (access, _policy, _bound) = authorize(&s, loc.repo_id, &headers).await?;
     let names = match access {
         Access::Full => s.catalog.all_package_names(loc.repo_id).await?,
         Access::Licensed(entitled) => {
@@ -201,7 +203,7 @@ async fn p2(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, policy) = authorize(&s, loc.repo_id, &headers).await?;
+    let (access, policy, bound) = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -218,12 +220,20 @@ async fn p2(
 
     // Apply the supply-chain gate (cooldown / manual approval / holds) so clients
     // only ever see versions that have cleared it. The presenting credential's
-    // policy override can tighten — never loosen — the repo default.
+    // policy override can tighten — never loosen — the repo default. A license's
+    // perpetual-fallback bound additionally caps which versions it may install.
     let (repo_mode, repo_cooldown) = s.catalog.update_policy(loc.repo_id).await?;
     let (mode, cooldown_days) = policy.effective(&repo_mode, repo_cooldown);
     let versions = s
         .catalog
-        .visible_versions(loc.repo_id, package, &mode, cooldown_days)
+        .visible_versions(
+            loc.repo_id,
+            package,
+            &mode,
+            cooldown_days,
+            bound.until_unix,
+            bound.major,
+        )
         .await?;
     Ok(Json(sconce_metadata::render_package(
         package,
@@ -242,7 +252,7 @@ async fn dist(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    authorize(&s, loc.repo_id, &headers).await?;
+    let _ = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
     let file = rest.rsplit('/').next().ok_or(AppError::NotFound)?;

@@ -132,6 +132,7 @@ pub fn router(
         .route("/r/{org}/{repo}/token/revoke", post(revoke_token))
         .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
         .route("/r/{org}/{repo}/license/policy", post(set_license_policy))
+        .route("/r/{org}/{repo}/license/bound", post(set_license_bound_action))
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
@@ -2772,6 +2773,11 @@ async fn repo_page(
              <input type=hidden name=id value=\"{id}\">\
              <select name=mode>{inherit}{auto}{manual}{delayed}</select>\
              <input name=cooldown_days type=number min=0 placeholder=cooldown style=\"width:5em\" value=\"{cd}\">\
+             <button>Set</button></form></td><td>\
+             <form class=inline method=post action=\"/r/{slug}/license/bound\">\
+             <input type=hidden name=id value=\"{id}\">\
+             until <input name=until type=date value=\"{until}\" style=\"width:9em\"> \
+             or \u{2264} major <input name=major type=number min=0 placeholder=any style=\"width:4em\" value=\"{major}\"> \
              <button>Set</button></form></td></tr>",
             buyer = esc(l.buyer.as_deref().unwrap_or("—")),
             status = esc(&l.status),
@@ -2782,13 +2788,18 @@ async fn repo_page(
             manual = mode_opt("manual", "manual"),
             delayed = mode_opt("delayed", "delayed"),
             cd = l.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
+            until = l.bound.until.as_deref().unwrap_or(""),
+            major = l.bound.major.map_or_else(String::new, |m| m.to_string()),
         );
     }
     if licenses.is_empty() {
-        lic_rows = "<tr><td colspan=4 class=muted>none</td></tr>".into();
+        lic_rows = "<tr><td colspan=5 class=muted>none</td></tr>".into();
     }
     let licenses_section = format!(
-        "<h2>License keys</h2><table><tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Policy</th></tr>{lic_rows}</table>\
+        "<h2>License keys</h2>\
+         <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs \
+         (a date = \u{201c}updates until\u{201d}, or \u{2264} a major version) — it keeps everything in-window forever.</p>\
+         <table><tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Policy</th><th>Update bound</th></tr>{lic_rows}</table>\
          <form class=row method=post action=\"/r/{slug}/license\">buyer <input name=buyer> \
          packages <input name=packages placeholder=\"vendor/a vendor/b\" required> <button>Issue license</button></form>"
     );
@@ -3602,6 +3613,33 @@ async fn set_token_policy(
     let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
     s.catalog
         .set_token_policy(repo_id, &f.label, &policy)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct LicenseBoundForm {
+    id: String,
+    until: Option<String>,
+    major: Option<String>,
+}
+
+async fn set_license_bound_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<LicenseBoundForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let until = f.until.as_deref().map(str::trim).filter(|x| !x.is_empty());
+    let major = match f.major.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        None => None,
+        Some(m) => Some(m.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
+    };
+    s.catalog
+        .set_license_bound(repo_id, license_id, until, major)
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))

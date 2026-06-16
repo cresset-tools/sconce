@@ -122,6 +122,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0028_package_sets",
         include_str!("../migrations/0028_package_sets.sql"),
     ),
+    (
+        "0029_update_bound",
+        include_str!("../migrations/0029_update_bound.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -432,6 +436,16 @@ pub struct TenantMembership {
     pub active: bool,
 }
 
+/// A license's perpetual-fallback update bound (both `None` = unbounded). `until`
+/// is the display date; `until_unix` feeds the serving clause; `major` is the max
+/// allowed major version.
+#[derive(Debug, Clone, Default)]
+pub struct LicenseBound {
+    pub until: Option<String>,
+    pub until_unix: Option<i64>,
+    pub major: Option<i32>,
+}
+
 /// A package set (named, org-scoped group of packages) in a listing.
 #[derive(Debug, Clone)]
 pub struct PackageSet {
@@ -529,6 +543,8 @@ pub struct LicenseSummary {
     pub packages: Vec<String>,
     /// Per-credential supply-chain policy override (empty = inherits the repo).
     pub policy: PolicyOverride,
+    /// Perpetual-fallback update bound (empty = unbounded).
+    pub bound: LicenseBound,
 }
 
 /// A read token in the admin listing (the token itself is never recoverable).
@@ -1062,12 +1078,16 @@ impl Catalog {
         let rows = sqlx::query(
             "select l.id as id, l.buyer_ref as buyer, l.status as status, \
                     l.update_mode as update_mode, l.cooldown_days as cooldown_days, \
+                    to_char(l.update_until, 'YYYY-MM-DD') as bound_until, \
+                    extract(epoch from l.update_until)::bigint as bound_until_unix, \
+                    l.version_cap_major as bound_major, \
                     coalesce(array_agg(p.name) filter (where p.name is not null), '{}') as packages \
              from license_keys l \
              left join entitlements e on e.license_key_id = l.id \
              left join packages p on p.id = e.package_id \
              where l.repo_id = $1 \
-             group by l.id, l.buyer_ref, l.status, l.update_mode, l.cooldown_days, l.created_at \
+             group by l.id, l.buyer_ref, l.status, l.update_mode, l.cooldown_days, \
+                      l.update_until, l.version_cap_major, l.created_at \
              order by l.created_at",
         )
         .bind(repo_id)
@@ -1083,6 +1103,11 @@ impl Catalog {
                     policy: PolicyOverride {
                         update_mode: row.try_get("update_mode").ok().flatten(),
                         cooldown_days: row.try_get("cooldown_days").ok().flatten(),
+                    },
+                    bound: LicenseBound {
+                        until: row.try_get("bound_until").ok().flatten(),
+                        until_unix: row.try_get("bound_until_unix").ok().flatten(),
+                        major: row.try_get("bound_major").ok().flatten(),
                     },
                 })
             })
@@ -2967,6 +2992,46 @@ impl Catalog {
         })
     }
 
+    /// A license's perpetual-fallback update bound (empty = unbounded).
+    pub async fn license_bound(&self, license_id: Uuid) -> Result<LicenseBound, sqlx::Error> {
+        let row = sqlx::query(
+            "select to_char(update_until, 'YYYY-MM-DD') as until, \
+                    extract(epoch from update_until)::bigint as until_unix, \
+                    version_cap_major as major \
+             from license_keys where id = $1",
+        )
+        .bind(license_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(LicenseBound {
+            until: row.try_get("until").ok().flatten(),
+            until_unix: row.try_get("until_unix").ok().flatten(),
+            major: row.try_get("major").ok().flatten(),
+        })
+    }
+
+    /// Set (or clear) a license's update bound: `until` is a `YYYY-MM-DD` date
+    /// (time bound) and/or `major` a max major version (version bound).
+    pub async fn set_license_bound(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+        until: Option<&str>,
+        major: Option<i32>,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update license_keys set update_until = $3::timestamptz, version_cap_major = $4 \
+             where id = $1 and repo_id = $2",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .bind(until)
+        .bind(major)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
     /// Set (or clear, with `None`s) a token's policy override, by repo + label.
     /// Returns whether a token matched.
     pub async fn set_token_policy(
@@ -3108,12 +3173,17 @@ impl Catalog {
     ///
     /// Taking the policy as parameters (rather than reading the singleton here)
     /// keeps this pure and testable without mutating shared global state.
+    #[allow(clippy::too_many_arguments)]
     pub async fn visible_versions(
         &self,
         repo_id: Uuid,
         name: &str,
         mode: &str,
         cooldown_days: i32,
+        // Perpetual-fallback license bound (both `None` = unbounded). `$5` =
+        // update-until (unix seconds), `$6` = max allowed major version.
+        bound_until_unix: Option<i64>,
+        bound_major: Option<i32>,
     ) -> Result<Vec<PackageVersion>, sqlx::Error> {
         let rows = sqlx::query(
             "select pv.version, pv.normalized_version, pv.stability, pv.composer_json, \
@@ -3133,12 +3203,20 @@ impl Catalog {
                      or ( $3 = 'delayed' \
                           and pv.released_at is not null \
                           and pv.released_at + make_interval(days => $4) <= now() ) ) \
+               and ( $5::bigint is null \
+                     or ( coalesce(pv.entitlement_date, pv.released_at) is not null \
+                          and coalesce(pv.entitlement_date, pv.released_at) \
+                              - make_interval(days => pv.grace_days) <= to_timestamp($5::double precision) ) ) \
+               and ( $6::int is null \
+                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 ) \
              order by pv.normalized_version",
         )
         .bind(repo_id)
         .bind(name)
         .bind(mode)
         .bind(cooldown_days)
+        .bind(bound_until_unix)
+        .bind(bound_major)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_version).collect()
@@ -3573,12 +3651,12 @@ mod tests {
         let p = "acme/lib";
 
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
             ["1.0.0.0", "1.1.0.0"]
         );
         assert_eq!(
             norm(
-                cat.visible_versions(repo_id, p, "delayed", 7)
+                cat.visible_versions(repo_id, p, "delayed", 7, None, None)
                     .await
                     .unwrap()
             ),
@@ -3588,25 +3666,25 @@ mod tests {
         assert!(cat.approve_version(repo_id, p, "1.1.0.0").await.unwrap());
         assert_eq!(
             norm(
-                cat.visible_versions(repo_id, p, "delayed", 7)
+                cat.visible_versions(repo_id, p, "delayed", 7, None, None)
                     .await
                     .unwrap()
             ),
             ["1.0.0.0", "1.1.0.0"]
         );
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "manual", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "manual", 0, None, None).await.unwrap()),
             ["1.1.0.0"]
         );
 
         assert!(cat.hold_version(repo_id, p, "1.0.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
             ["1.1.0.0"]
         );
         assert!(cat.unhold_version(repo_id, p, "1.0.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
             ["1.0.0.0", "1.1.0.0"]
         );
 
@@ -3614,7 +3692,7 @@ mod tests {
         // prior approval doesn't override a yank. Un-yank reinstates it.
         assert!(cat.yank_version(repo_id, p, "1.1.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0).await.unwrap()),
+            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
             ["1.0.0.0"]
         );
         assert!(cat.unyank_version(repo_id, p, "1.1.0.0").await.unwrap());
@@ -3704,7 +3782,7 @@ mod tests {
         let plain = cat.create_token(repo_id, Some("latest"), None).await.unwrap();
         let pp = cat.resolve_token_policy(repo_id, &plain).await.unwrap().unwrap();
         let (m, c) = pp.effective("auto", 0);
-        assert_eq!(cat.visible_versions(repo_id, p, &m, c).await.unwrap().len(), 2);
+        assert_eq!(cat.visible_versions(repo_id, p, &m, c, None, None).await.unwrap().len(), 2);
 
         // A conservative token (delayed/7) on the SAME repo hides the fresh one.
         let cons = cat.create_token(repo_id, Some("conservative"), None).await.unwrap();
@@ -3720,7 +3798,7 @@ mod tests {
         let cp = cat.resolve_token_policy(repo_id, &cons).await.unwrap().unwrap();
         let (m2, c2) = cp.effective("auto", 0);
         assert_eq!((m2.as_str(), c2), ("delayed", 7));
-        let vis = cat.visible_versions(repo_id, p, &m2, c2).await.unwrap();
+        let vis = cat.visible_versions(repo_id, p, &m2, c2, None, None).await.unwrap();
         assert_eq!(vis.len(), 1, "conservative credential only sees the aged release");
         assert_eq!(vis[0].normalized_version, "1.0.0.0");
 
@@ -4259,7 +4337,7 @@ mod tests {
         // The existing private package is now hidden from both serve paths.
         assert!(cat.all_package_names(repo_id).await.unwrap().is_empty());
         assert!(
-            cat.visible_versions(repo_id, "acme/lib", "auto", 0)
+            cat.visible_versions(repo_id, "acme/lib", "auto", 0, None, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -4280,7 +4358,7 @@ mod tests {
         ver(&cat, pubp, "sym/console").await;
         assert_eq!(cat.all_package_names(repo_id).await.unwrap(), ["sym/console"]);
         assert_eq!(
-            cat.visible_versions(repo_id, "sym/console", "auto", 0)
+            cat.visible_versions(repo_id, "sym/console", "auto", 0, None, None)
                 .await
                 .unwrap()
                 .len(),
@@ -4345,7 +4423,7 @@ mod tests {
 
         // Invisible in the client before the grant.
         assert!(
-            cat.visible_versions(client, "vendor/pub", "auto", 0)
+            cat.visible_versions(client, "vendor/pub", "auto", 0, None, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -4358,7 +4436,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            cat.visible_versions(client, "vendor/pub", "auto", 0)
+            cat.visible_versions(client, "vendor/pub", "auto", 0, None, None)
                 .await
                 .unwrap()
                 .len(),
@@ -4529,5 +4607,52 @@ mod tests {
         assert_eq!(cat.set_rules(set).await.unwrap().len(), 1);
         assert!(cat.delete_package_set(org_id, set).await.unwrap());
         assert!(cat.list_package_sets(org_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn license_bound_caps_versions() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let pkg = cat
+            .upsert_package(repo_id, "acme/lib", "git", None, Visibility::Public)
+            .await
+            .unwrap();
+        let cj = serde_json::json!({"name": "acme/lib"});
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let day = 86_400;
+        for (v, n, rel) in [
+            ("1.0.0", "1.0.0.0", now - 400 * day),
+            ("2.0.0", "2.0.0.0", now - 30 * day),
+            ("3.0.0", "3.0.0.0", now),
+        ] {
+            cat.upsert_package_version(pkg, v, n, "stable", &cj, None, None, None, Some(rel))
+                .await
+                .unwrap();
+        }
+        let p = "acme/lib";
+        let norm = |vs: Vec<PackageVersion>| -> Vec<String> {
+            vs.into_iter().map(|v| v.normalized_version).collect()
+        };
+
+        // Unbounded: all three.
+        assert_eq!(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap().len(), 3);
+        // Time bound: a license whose window ended 60 days ago keeps only the
+        // version released within it (perpetual fallback).
+        assert_eq!(
+            norm(cat.visible_versions(repo_id, p, "auto", 0, Some(now - 60 * day), None).await.unwrap()),
+            ["1.0.0.0"]
+        );
+        // Version bound: "this major and below" (<= 2) excludes the 3.x line.
+        assert_eq!(
+            norm(cat.visible_versions(repo_id, p, "auto", 0, None, Some(2)).await.unwrap()),
+            ["1.0.0.0", "2.0.0.0"]
+        );
     }
 }
