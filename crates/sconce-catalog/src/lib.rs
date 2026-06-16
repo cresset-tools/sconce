@@ -216,6 +216,8 @@ pub struct UpstreamSummary {
     pub visibility: String,
     pub label: Option<String>,
     pub has_credential: bool,
+    /// How the credential authenticates: `basic`|`github`|`gitlab`|`bearer`.
+    pub credential_type: String,
     /// Composer-only: regex scoping which packages a sync mirrors (`None` = all).
     pub package_filter: Option<String>,
     /// Status of the most recent mirror job, if any (`pending`/`running`/
@@ -223,6 +225,9 @@ pub struct UpstreamSummary {
     pub job_status: Option<String>,
     /// Error from the most recent job, if it failed.
     pub job_error: Option<String>,
+    /// Age in seconds of the most recent job (for a relative "6m"/"2h"/"1d"
+    /// last-sync label); `None` if never synced.
+    pub last_sync_age: Option<i64>,
 }
 
 /// A package with its lifecycle state, for the operator view. `sync_health` is
@@ -2524,11 +2529,12 @@ impl Catalog {
     pub async fn list_upstreams(&self, repo_id: Uuid) -> Result<Vec<UpstreamSummary>, sqlx::Error> {
         let rows = sqlx::query(
             "select u.id, u.kind, u.base, u.visibility, u.label, \
-                    (u.credential is not null) as has_credential, u.package_filter, \
-                    j.status as job_status, j.last_error as job_error \
+                    (u.credential is not null) as has_credential, u.credential_type, u.package_filter, \
+                    j.status as job_status, j.last_error as job_error, \
+                    extract(epoch from (now() - j.created_at))::bigint as last_sync_age \
              from upstreams u \
              left join lateral ( \
-                 select status, last_error from mirror_jobs m \
+                 select status, last_error, created_at from mirror_jobs m \
                  where m.upstream_id = u.id order by m.created_at desc limit 1 \
              ) j on true \
              where u.repo_id = $1 order by u.created_at",
@@ -2545,9 +2551,11 @@ impl Catalog {
                     visibility: r.try_get("visibility")?,
                     label: r.try_get("label")?,
                     has_credential: r.try_get("has_credential")?,
+                    credential_type: r.try_get("credential_type")?,
                     package_filter: r.try_get("package_filter")?,
                     job_status: r.try_get("job_status")?,
                     job_error: r.try_get("job_error")?,
+                    last_sync_age: r.try_get("last_sync_age").ok().flatten(),
                 })
             })
             .collect()

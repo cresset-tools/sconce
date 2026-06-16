@@ -143,6 +143,7 @@ pub fn router(
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
         .route("/r/{org}/{repo}/upstream/remove", post(remove_upstream))
         .route("/r/{org}/{repo}/upstream/sync", post(sync_upstream))
+        .route("/r/{org}/{repo}/upstream/sync-all", post(sync_all_upstreams))
         .route("/r/{org}/{repo}/deps/resolve", post(resolve_deps))
         .route("/r/{org}/{repo}/deps/add", post(add_dep))
         .route("/r/{org}/{repo}/package/archive", post(package_archive))
@@ -376,6 +377,107 @@ margin:0 0 1.4rem;box-shadow:0 1px 2px rgba(20,23,28,.04)}\
 .stat{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:14px 20px;min-width:120px}\
 .stat .n{font-size:24px;font-weight:650;line-height:1.1}\
 .stat .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:3px}\
+/* repository detail: header buttons, tab bar, overview grid */\
+.rhead{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:14px}\
+.rhead h1{margin:0;font-size:22px;font-family:var(--mono);letter-spacing:-.01em}\
+.rhead h1 .vd{color:#aab0bb}\
+.rhead .sub{margin:8px 0 0;font-size:13px;color:var(--muted)}\
+.rhead .acts{display:flex;gap:9px;flex:none}\
+.rhead .acts a{text-decoration:none}\
+.btn{display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;border-radius:8px;\
+font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;border:1px solid var(--border);\
+background:var(--surface);color:var(--text2)}\
+.btn.primary{background:var(--accent);border-color:var(--accent-press);color:#fff;box-shadow:0 1px 2px rgba(74,63,196,.28)}\
+.tabnav{display:none}\
+.tabbar{display:flex;gap:2px;flex-wrap:wrap;border-bottom:1px solid var(--border);margin-bottom:22px}\
+.tabbar label{font-size:13px;font-weight:500;color:var(--muted);padding:10px 13px;margin-bottom:-1px;cursor:pointer;\
+border-bottom:2px solid transparent;display:flex;align-items:center;gap:6px;white-space:nowrap}\
+.tabbar label:hover{color:var(--text2)}\
+.tabbar label .cnt{background:#fbf1d9;color:#8a5a00;font-size:10px;font-weight:700;border-radius:5px;padding:1px 5px;font-family:var(--mono)}\
+.tabpanel{display:none}\
+.tabpanel>h2:first-child{margin-top:0}\
+#rt-overview:checked~.tabbar label[for=rt-overview],\
+#rt-packages:checked~.tabbar label[for=rt-packages],\
+#rt-approvals:checked~.tabbar label[for=rt-approvals],\
+#rt-upstreams:checked~.tabbar label[for=rt-upstreams],\
+#rt-deps:checked~.tabbar label[for=rt-deps],\
+#rt-policy:checked~.tabbar label[for=rt-policy],\
+#rt-tokens:checked~.tabbar label[for=rt-tokens],\
+#rt-ci:checked~.tabbar label[for=rt-ci]{color:var(--text);font-weight:600;border-bottom-color:var(--accent)}\
+#rt-overview:checked~.tabpanel.t-overview,\
+#rt-packages:checked~.tabpanel.t-packages,\
+#rt-approvals:checked~.tabpanel.t-approvals,\
+#rt-upstreams:checked~.tabpanel.t-upstreams,\
+#rt-deps:checked~.tabpanel.t-deps,\
+#rt-policy:checked~.tabpanel.t-policy,\
+#rt-tokens:checked~.tabpanel.t-tokens,\
+#rt-ci:checked~.tabpanel.t-ci{display:block}\
+.ovgrid{display:grid;grid-template-columns:1.45fr 1fr;gap:20px;align-items:start}\
+@media(max-width:900px){.ovgrid{grid-template-columns:1fr}}\
+.term{background:#14161b;border-radius:12px;padding:10px 18px;box-shadow:0 6px 20px rgba(16,18,26,.18)}\
+.term .ln{display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid #232730}\
+.term .ln:last-child{border-bottom:0}\
+.term .pr{color:#4b5563;font-family:var(--mono);font-size:12px;user-select:none}\
+.term code{flex:1;font-family:var(--mono);font-size:12px;line-height:1.55;color:#d7dae0;white-space:pre-wrap;word-break:break-all;background:none;border:0;padding:0}\
+.term code .cmd{color:#b3a8ff}.term code .url{color:#8fd3a8}.term code .tok{color:#f0b86e}\
+.scard{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px}\
+.scard+.scard{margin-top:14px}\
+.scard .ttl{font-size:13px;font-weight:600;margin-bottom:13px}\
+.scard .srow{display:flex;align-items:center;justify-content:space-between;padding:2px 0;font-size:12.5px;color:var(--text2)}\
+.scard .srow+.srow{margin-top:9px}\
+.scard .srow .n{font-family:var(--mono);font-size:14px;font-weight:600}\
+.scard .rv{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}\
+.scard .rv:last-child{border-bottom:0}\
+.scard .rv code{font-size:12px;font-family:var(--mono);background:none;border:0;padding:0;color:#2a2f39}\
+/* Upstreams (full-page design): section heading + toolbar (search, kind/failing\
+   filter chips, sync-all) + white grid table + labeled-grid add form. */\
+.uphd { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin: 0 0 16px }\
+.uphd h2 { margin: 0; font-size: 16px; font-weight: 600 }\
+.uphd p { margin: 6px 0 0; font-size: 12.5px; color: var(--muted) }\
+.uphd a.btn { text-decoration: none; flex: none }\
+.uptool { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; flex-wrap: wrap }\
+.uptool .search { display: flex; align-items: center; gap: 8px; height: 34px; width: 300px; padding: 0 11px; background: var(--surface); border: 1px solid #e3e5ea; border-radius: 8px }\
+.uptool .search svg { color: #9aa1ad; flex: none }\
+.uptool .search input { border: 0; outline: 0; background: none; width: 100%; font-size: 12.5px; font-family: var(--mono); color: var(--text) }\
+.uptool .chips { display: flex; gap: 6px; margin-left: 4px; flex-wrap: wrap }\
+.uptool .chip { height: 30px; display: inline-flex; align-items: center; gap: 5px; padding: 0 11px; background: var(--surface); color: #5a6475; border: 1px solid #e3e5ea; border-radius: 7px; font-size: 12px; font-weight: 500; cursor: pointer; user-select: none }\
+.uptool .chip .c { font-family: var(--mono); margin-left: 2px; color: #aab0bb }\
+.uptool .chip.on { background: #f1effc; color: #4b3fc4; border-color: #e0dcf8; font-weight: 600 }\
+.uptool .chip.on .c { color: #4b3fc4; opacity: .7 }\
+.uptool .chip .fdot { width: 6px; height: 6px; border-radius: 50%; background: #d83a2c }\
+.uptool .synca { margin-left: auto }\
+.uptool .synca .btn { height: 30px; padding: 0 12px; font-size: 12px }\
+.uptbl { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden }\
+.uptbl .uhead, .uptbl .urow { display: grid; grid-template-columns: 1.5fr 2.4fr .9fr .8fr 1fr 96px; gap: 12px; align-items: center; padding: 12px 16px }\
+.uptbl .uhead { font-size: 11px; font-weight: 600; letter-spacing: .03em; color: #a2a9b4; border-bottom: 1px solid var(--soft) }\
+.uptbl .urow { font-size: 12.5px; border-top: 1px solid #f5f6f8 }\
+.uptbl .urow:first-of-type { border-top: 0 }\
+.uptbl .kind { display: flex; align-items: center; gap: 7px; font-weight: 500; color: var(--text2) }\
+.uptbl .url code { background: none; border: 0; padding: 0; font-size: 12px; color: #2a2f39; word-break: break-all }\
+.uptbl .match { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 2px }\
+.uptbl .match b { color: var(--accent); font-weight: 600 }\
+.uptbl .err { font-size: 11px; color: #c0362c; font-family: var(--mono); margin-top: 2px }\
+.uptbl .dash { color: #cdd2da }\
+.uptbl .last { display: flex; align-items: center; gap: 6px; color: #9aa1ad }\
+.uptbl .ract { display: flex; gap: 10px; justify-content: flex-end }\
+.uptbl .ract form { display: inline }\
+.uptbl .ract button { padding: 0; border: 0; background: none; font-size: 11.5px; font-weight: 600; cursor: pointer }\
+.uptbl .ract .sync { color: var(--accent) }\
+.uptbl .ract .busy { color: #aab0bb }\
+.uptbl .ract .rm { color: #aab0bb }\
+.uptbl .ract .rm:hover { color: #a82c20 }\
+.uptbl .upcount { padding: 10px 16px; border-top: 1px solid #f3f4f6; font-size: 12px; color: var(--muted) }\
+.upnomatch { padding: 13px 16px; font-size: 12.5px; color: var(--muted) }\
+.upform { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; margin-top: 16px; padding: 18px 20px }\
+.upform .ttl { font-size: 12.5px; font-weight: 600; margin-bottom: 14px; color: #2a2f39 }\
+.upform .g1 { display: grid; grid-template-columns: 130px 1fr 140px; gap: 12px; margin-bottom: 12px }\
+.upform .g2 { display: grid; grid-template-columns: 170px 1fr; gap: 12px; align-items: end }\
+.upform .fl { display: block; font-size: 11px; font-weight: 600; color: #6b7280; margin-bottom: 5px }\
+.upform .fl .hint { color: #aab0bb; font-weight: 500 }\
+.upform input, .upform select { width: 100%; height: 36px; border: 1px solid #dcdfe6; border-radius: 8px; padding: 0 11px; font-size: 12.5px; font-family: inherit; color: #2a2f39; background: var(--surface) }\
+.upform input { font-family: var(--mono) }\
+.upform .credline { display: flex; gap: 8px }\
+.upform .credline button { flex: none; height: 36px }\
 ";
 
 /// The hexagon-package brand glyph (from the design's `AppShell`), white-stroked
@@ -384,21 +486,45 @@ const MARK_SVG: &str = "<svg width=16 height=16 viewBox=\"0 0 24 24\" fill=none 
 stroke-linecap=round stroke-linejoin=round><path d=\"M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z\"></path>\
 <path d=\"M4 7.5l8 4.5 8-4.5\"></path><path d=\"M12 12v9\"></path></svg>";
 
+/// Upstream-kind glyphs (from the design's D4 row): a git-graph node for `git`,
+/// a box for `composer`.
+const GIT_ICON: &str = "<svg width=14 height=14 viewBox=\"0 0 24 24\" fill=none stroke=#5a6475 stroke-width=1.8 \
+stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=6 r=2.5></circle><circle cx=6 cy=18 r=2.5></circle>\
+<circle cx=18 cy=18 r=2.5></circle><path d=\"M12 8.5v4M12 12.5a6 6 0 0 1-6 3M12 12.5a6 6 0 0 0 6 3\"></path></svg>";
+const BOX_ICON: &str = "<svg width=14 height=14 viewBox=\"0 0 24 24\" fill=none stroke=#5a6475 stroke-width=1.8 \
+stroke-linecap=round stroke-linejoin=round><path d=\"M21 8l-9-5-9 5 9 5 9-5z\"></path><path d=\"M3 8v8l9 5 9-5V8\"></path></svg>";
+
 /// Full HTML scaffold shared by every page. Fonts + stylesheet live in `STYLE`;
 /// the Geist woff2 are vendored and served from `/assets/fonts` (no CDN).
 fn doc(title: &str, inner: &str) -> Html<String> {
+    doc_js(title, inner, "")
+}
+
+/// Like [`doc`], but appends a single page `<script>` block at the very bottom of
+/// `<body>` (per the repo's frontend convention: one script block, vanilla JS).
+fn doc_js(title: &str, inner: &str, script: &str) -> Html<String> {
+    let script_block = if script.is_empty() {
+        String::new()
+    } else {
+        format!("<script>{script}</script>")
+    };
     Html(format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · Bougie Repo</title>\
-         <style>{STYLE}</style></head><body>{inner}</body></html>"
+         <style>{STYLE}</style></head><body>{inner}{script_block}</body></html>"
     ))
 }
 
 /// An authenticated app page, wrapped in the sidebar `AppShell` (left nav + top
 /// breadcrumb bar + content).
 fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
-    doc(
+    shell_js(s, user, title, body, "")
+}
+
+/// Like [`shell`], but with one page `<script>` block at the bottom of `<body>`.
+fn shell_js(s: &Ui, user: &CurrentUser, title: &str, body: &str, script: &str) -> Html<String> {
+    doc_js(
         title,
         &format!(
             "<div class=layout>{sidebar}<div class=col>\
@@ -408,6 +534,7 @@ fn shell(s: &Ui, user: &CurrentUser, title: &str, body: &str) -> Html<String> {
             sidebar = sidebar(s, user, title),
             here = esc(title),
         ),
+        script,
     )
 }
 
@@ -437,6 +564,23 @@ fn paginator(noun: &str, total: i64, page: i64, per_page: i64, base: &str, extra
         }
     }
     format!("<div class=pager><span class=muted>Showing {from}&ndash;{to} of {total} {noun}</span>{controls}</div>")
+}
+
+/// A compact relative-time label ("just now", "6m", "2h", "3d", "5w") from an
+/// age in seconds — for the upstreams last-sync column.
+fn ago(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        "just now".to_owned()
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3_600)
+    } else if s < 604_800 {
+        format!("{}d", s / 86_400)
+    } else {
+        format!("{}w", s / 604_800)
+    }
 }
 
 /// A 24×24 stroke nav icon.
@@ -2428,6 +2572,8 @@ async fn repo_page(
         .state
         .as_deref()
         .filter(|x| matches!(*x, "held" | "yanked" | "approved" | "pending"));
+    // When the user is searching/filtering packages, open on the Packages tab.
+    let filtering = name_q.is_some() || state_q.is_some() || q.page.is_some();
     let total_versions = s
         .catalog
         .count_package_versions(summary.id, name_q, state_q)
@@ -2624,7 +2770,8 @@ async fn repo_page(
     let attention_banner = if broken_count > 0 {
         format!(
             "<p class=banner>⚠ {broken_count} package(s) can't sync — they keep serving their existing \
-             versions, but won't get new ones until fixed. See <a href=\"#health\">Package health</a>.</p>"
+             versions, but won't get new ones until fixed. See the \
+             <label for=rt-approvals style=\"color:inherit;cursor:pointer;font-weight:700;text-decoration:underline\">Approvals</label> tab.</p>"
         )
     } else {
         String::new()
@@ -2716,69 +2863,150 @@ async fn repo_page(
         )
     };
 
-    let up_rows = upstreams.iter().fold(String::new(), |mut acc, u| {
-        use std::fmt::Write as _;
-        let label = u.label.as_deref().map_or(String::new(), esc);
-        let cred = if u.has_credential { "auth" } else { "—" };
-        // Show the latest job status; on failure, surface the error on hover.
-        let status = match (u.job_status.as_deref(), u.job_error.as_deref()) {
-            (None, _) => "<span class=muted>never synced</span>".to_owned(),
-            (Some("failed"), err) => format!(
-                "<span style=\"color:#a12\" title=\"{}\">failed</span>",
-                esc(err.unwrap_or(""))
-            ),
-            (Some(s), _) => esc(s),
+    // Filter-chip counts (whole list; client-side search/filter narrows the view).
+    let git_count = upstreams.iter().filter(|u| u.kind == "git").count();
+    let composer_count = upstreams.iter().filter(|u| u.kind == "composer").count();
+    let failing_count = upstreams.iter().filter(|u| u.job_status.as_deref() == Some("failed")).count();
+    let up_total = upstreams.len();
+
+    let mut up_rows = String::new();
+    for u in &upstreams {
+        let kind_icon = if u.kind == "composer" { BOX_ICON } else { GIT_ICON };
+        let failed = u.job_status.as_deref() == Some("failed");
+        // URL cell: composer shows its match regex; a failed sync shows the error.
+        let mut sub = String::new();
+        if let Some(p) = u.package_filter.as_deref() {
+            let _ = write!(sub, "<div class=match>match <b>{}</b></div>", esc(p));
+        }
+        if failed {
+            let _ = write!(
+                sub,
+                "<div class=err>{}</div>",
+                esc(u.job_error.as_deref().unwrap_or("sync failed"))
+            );
+        }
+        let vis_badge = if u.visibility == "public" {
+            "<span class='badge ok'>public</span>"
+        } else {
+            "<span class='badge slate'>private</span>"
         };
-        let base_cell = match u.package_filter.as_deref() {
-            Some(p) => format!("{}<br><span class=muted>match {}</span>", esc(&u.base), esc(p)),
-            None => esc(&u.base),
+        // CRED: credential type for private upstreams; em-dash for public/unauthed.
+        let cred_cell = if u.has_credential {
+            format!("<span class='badge slate mono'>{}</span>", esc(&u.credential_type))
+        } else {
+            "<span class=dash>—</span>".to_owned()
         };
+        // LAST SYNC: status badge + relative age; matches what serving sees.
+        let when = u.last_sync_age.map_or(String::new(), ago);
+        let last_cell = match u.job_status.as_deref() {
+            None => "<span class='badge slate'>never synced</span>".to_owned(),
+            Some("failed") => "<span class='badge held'>failed</span>".to_owned(),
+            Some("running" | "pending") => "<span class='badge blue'>running</span>".to_owned(),
+            Some("ready") => format!("<span class='badge ok'>ready</span> {when}"),
+            Some(s) => format!("<span class='badge slate'>{}</span> {when}", esc(s)),
+        };
+        // Actions: a running sync is busy; a failed one retries; otherwise sync.
+        let running = matches!(u.job_status.as_deref(), Some("running" | "pending"));
+        let act = if running {
+            "<span class=busy>Syncing…</span>".to_owned()
+        } else {
+            let label = if failed { "Retry" } else { "Sync" };
+            format!(
+                "<form method=post action=\"/r/{slug}/upstream/sync\"><input type=hidden name=id value=\"{id}\"><button class=sync>{label}</button></form>",
+                id = u.id,
+            )
+        };
+        // data-* attributes drive the client-side search + filter chips.
         let _ = write!(
-            acc,
-            "<tr><td>{kind}</td><td>{vis}</td><td>{base_cell}</td><td>{label}</td><td>{cred}</td>\
-             <td>{status}</td>\
-             <td><form class=inline method=post action=\"/r/{slug}/upstream/sync\">\
-             <input type=hidden name=id value=\"{id}\"><button>Sync</button></form> \
-             <form class=inline method=post action=\"/r/{slug}/upstream/remove\" \
-             onsubmit=\"return confirm('Remove this upstream?')\">\
-             <input type=hidden name=id value=\"{id}\"><button>Remove</button></form></td></tr>",
+            up_rows,
+            "<div class=urow data-kind={kind} data-fail={fail} data-text=\"{text}\">\
+               <span class=kind>{kind_icon}{kind}</span>\
+               <span class=url><code>{base}</code>{sub}</span>\
+               <span>{vis_badge}</span>\
+               <span>{cred_cell}</span>\
+               <span class=last>{last_cell}</span>\
+               <span class=ract>{act}\
+                 <form method=post action=\"/r/{slug}/upstream/remove\" data-confirm=\"Remove this upstream?\"><input type=hidden name=id value=\"{id}\"><button class=rm>Remove</button></form>\
+               </span>\
+             </div>",
             kind = esc(&u.kind),
-            vis = esc(&u.visibility),
+            fail = i32::from(failed),
+            text = esc(&u.base.to_lowercase()),
+            base = esc(&u.base),
             id = u.id,
         );
-        acc
-    });
-    let up_rows = if up_rows.is_empty() {
-        "<tr><td colspan=7 class=muted>none</td></tr>".to_owned()
-    } else {
-        up_rows
-    };
+    }
+
     let cred_note = if s.secret_key.is_some() {
-        "Credential is stored encrypted."
+        "Credential is stored encrypted (write-only)."
     } else {
         "Set SCONCE_SECRET_KEY to store a credential; without it only public/unauthed upstreams work."
     };
+    let table_or_empty = if upstreams.is_empty() {
+        "<div class=upnomatch>No upstreams yet — add one below to start mirroring.</div>".to_owned()
+    } else {
+        format!(
+            "<div class=uhead><span>KIND</span><span>URL</span><span>VISIBILITY</span><span>CRED</span><span>LAST SYNC</span><span></span></div>\
+             {up_rows}\
+             <div class=upnomatch id=up-nomatch style=\"display:none\">No upstreams match.</div>\
+             <div class=upcount>Showing <span id=up-shown>{up_total}</span> of {up_total} upstreams</div>"
+        )
+    };
     let upstreams_section = format!(
-        "<h2>Upstreams</h2>\
-         <table><tr><th>Kind</th><th>Visibility</th><th>URL</th><th>Label</th><th>Cred</th><th>Status</th><th></th></tr>{up_rows}</table>\
-         <form class=row method=post action=\"/r/{slug}/upstream\">\
-         <select name=kind><option value=git>git</option><option value=composer>composer</option></select> \
-         <select name=visibility id=upvis \
-           onchange=\"document.getElementById('credfields').style.display=this.value=='private'?'':'none'\">\
-           <option value=public>public</option><option value=private>private</option></select> \
-         url <input name=base placeholder=\"https://host/org/repo.git\" required> \
-         label <input name=label> \
-         match <input name=package_filter placeholder=\"^vendor/ (composer)\"> \
-         <span id=credfields style=\"display:none\">\
-           <select name=credential_type>\
-             <option value=basic>basic (user:token)</option>\
-             <option value=github>github token</option>\
-             <option value=gitlab>gitlab token</option>\
-             <option value=bearer>bearer header</option></select> \
-           credential <input name=credential placeholder=\"token or user:pass\">\
-         </span> \
-         <button>Add upstream</button></form>\
-         <p class=muted>{cred_note} Credentials apply to private upstreams only.</p>"
+        "<div class=uphd>\
+           <div><h2>Upstreams</h2>\
+             <p>Sources that feed packages into this repository · git &amp; composer · synced on a schedule and on demand</p></div>\
+           <a class='btn primary' href=\"#up-add\">+ Add upstream</a>\
+         </div>\
+         <div class=uptool>\
+           <label class=search>\
+             <svg width=15 height=15 viewBox=\"0 0 24 24\" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round><circle cx=11 cy=11 r=7></circle><path d=\"M21 21l-3.6-3.6\"></path></svg>\
+             <input id=up-search type=search placeholder=\"Search upstreams…\" autocomplete=off>\
+           </label>\
+           <div class=chips id=up-chips>\
+             <span class='chip on' data-filter=all>All <span class=c>{up_total}</span></span>\
+             <span class=chip data-filter=git>{GIT_ICON}git <span class=c>{git_count}</span></span>\
+             <span class=chip data-filter=composer>{BOX_ICON}composer <span class=c>{composer_count}</span></span>\
+             <span class=chip data-filter=failing><span class=fdot></span>Failing <span class=c>{failing_count}</span></span>\
+           </div>\
+           <form class=synca method=post action=\"/r/{slug}/upstream/sync-all\">\
+             <button class=btn type=submit>\
+               <svg width=13 height=13 viewBox=\"0 0 24 24\" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d=\"M21 12a9 9 0 0 1-15 6.7L3 16M3 12a9 9 0 0 1 15-6.7L21 8\"></path></svg>\
+               Sync all</button>\
+           </form>\
+         </div>\
+         <div class=uptbl>{table_or_empty}</div>\
+         <div class=upform id=up-add>\
+           <div class=ttl>Add upstream</div>\
+           <form method=post action=\"/r/{slug}/upstream\">\
+             <div class=g1>\
+               <div><label class=fl>Kind</label><select name=kind id=upkind>\
+                 <option value=git>git</option><option value=composer>composer</option></select></div>\
+               <div><label class=fl>URL</label><input name=base placeholder=\"git@host:org/repo.git\" required></div>\
+               <div><label class=fl>Visibility</label><select name=visibility id=upvis>\
+                 <option value=public>public</option><option value=private>private</option></select></div>\
+             </div>\
+             <div class=g1>\
+               <div><label class=fl>Label <span class=hint>· optional</span></label><input name=label style=font-family:inherit></div>\
+               <div><label class=fl>Match <span class=hint>· composer regex</span></label><input name=package_filter placeholder=\"^vendor/\"></div>\
+               <div></div>\
+             </div>\
+             <div class=g2 id=credrow style=\"display:none\">\
+               <div><label class=fl>Credential type</label><select name=credential_type id=cred-type>\
+                 <option value=basic>basic (user + token)</option>\
+                 <option value=github>github token</option>\
+                 <option value=gitlab>gitlab token</option>\
+                 <option value=bearer>bearer header</option></select></div>\
+               <div><label class=fl>Credential <span class=hint>· write-only, stored encrypted</span></label>\
+                 <div class=credline>\
+                   <input name=cred_user id=cred-user placeholder=username autocomplete=off style=\"display:none;max-width:170px\">\
+                   <input name=credential id=cred-token type=password placeholder=token>\
+                   <button class=primary>Add</button></div></div>\
+             </div>\
+             <div class=g2 id=addrow><div></div><div style=\"display:flex;justify-content:flex-end\"><button class=primary>Add upstream</button></div></div>\
+           </form>\
+           <p class=muted style=\"margin:.7rem 0 0\">{cred_note} Credentials apply to private upstreams only.</p>\
+         </div>"
     );
 
     let dep_rows = dep_plan.iter().fold(String::new(), |mut acc, d| {
@@ -2949,14 +3177,79 @@ async fn repo_page(
         );
         acc
     });
-    // Overview hero: the copy-paste install instructions (the brief's hero).
+    // Overview tab: the install hero (dark terminal, the brief's hero) on the
+    // left, a supply-chain summary + recent-versions card on the right.
+    let ov_base = s.public_base_url.trim_end_matches('/');
+    let ov_host = ov_base.split_once("://").map_or(ov_base, |(_, r)| r).split('/').next().unwrap_or(ov_base);
+    let example_pkg = packages.first().map_or_else(|| "<package>".to_owned(), |p| esc(&p.name));
     let install_hero = format!(
-        "<div class=hero><h2>Install</h2>\
-         <pre>composer config repositories.{r} composer {base}/{slug}\ncomposer require &lt;package&gt;</pre>\
-         <p class=muted style=\"margin:.6rem 0 0\">Authenticate with a token (under <a href=\"#tokens\">Tokens</a>); \
-         it's the http-basic <em>password</em>.</p></div>",
+        "<div><h3 style=\"margin:0 0 11px;font-size:15px;font-weight:600\">Install in &lt;5 minutes</h3>\
+         <div class=term>\
+         <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config repositories.{r} composer <span class=url>{base}/{slug}</span></code></div>\
+         <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config --auth http-basic.{host} token <span class=tok>&lt;YOUR_TOKEN&gt;</span></code></div>\
+         <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> require {ex}</code></div>\
+         </div>\
+         <p class=muted style=\"margin:.7rem 0 0;font-size:11.5px\">The token is the http-basic <em>password</em> — the username is ignored. \
+         Mint one under the <label for=rt-tokens style=\"color:var(--accent);cursor:pointer;font-weight:600\">Tokens</label> tab.</p></div>",
         r = esc(&repo),
-        base = esc(s.public_base_url.trim_end_matches('/')),
+        base = esc(ov_base),
+        host = esc(ov_host),
+        ex = example_pkg,
+    );
+
+    // Supply-chain summary counts (whole repo, not just this page).
+    let pending_count = s.catalog.count_package_versions(summary.id, None, Some("pending")).await.map_err(e500)?;
+    let held_count = s.catalog.count_package_versions(summary.id, None, Some("held")).await.map_err(e500)?;
+    let approvals_count = pending_count + held_count;
+    let attention_row = if broken_count > 0 {
+        format!(
+            "<div style=\"margin-top:13px;display:flex;align-items:center;gap:9px;background:#fbf3e1;border:1px solid #efdca6;border-radius:9px;padding:9px 11px\">\
+             <span style=\"flex:1;font-size:12px;color:#8a5a00;font-weight:600\">\u{26a0} {broken_count} package(s) can't sync</span>\
+             <label for=rt-approvals style=\"font-size:11.5px;font-weight:600;color:#8a5a00;cursor:pointer;white-space:nowrap\">Review \u{2192}</label></div>"
+        )
+    } else {
+        String::new()
+    };
+    let supply_card = format!(
+        "<div class=scard><div class=ttl>Supply chain</div>\
+         <div class=srow><span style=\"display:flex;align-items:center;gap:8px\"><span class='badge amber'>pending</span>awaiting approval</span><span class=n style=\"color:#8a5a00\">{pending_count}</span></div>\
+         <div class=srow><span style=\"display:flex;align-items:center;gap:8px\"><span class='badge held'>held</span>security hold</span><span class=n style=\"color:#a82c20\">{held_count}</span></div>\
+         {attention_row}\
+         <label for=rt-approvals class=btn style=\"width:100%;justify-content:center;margin-top:14px\">Open approval queue</label></div>"
+    );
+    // Recent versions (top of the current listing) with the same state badge.
+    let mut recent_rows = String::new();
+    for v in versions.iter().take(4) {
+        let badge = if v.yanked {
+            "<span class='badge held'>yanked</span>".to_owned()
+        } else if v.held {
+            "<span class='badge held'>held</span>".to_owned()
+        } else if v.approved {
+            "<span class='badge ok'>approved</span>".to_owned()
+        } else {
+            match summary.update_mode.as_str() {
+                "manual" => "<span class='badge amber'>pending</span>".to_owned(),
+                "delayed" => match v.cooldown_days_left {
+                    None => "<span class='badge amber'>pending</span>".to_owned(),
+                    Some(0) => "<span class='badge ok'>live</span>".to_owned(),
+                    Some(n) => format!("<span class='badge blue'>cooldown · {n}d</span>"),
+                },
+                _ => "<span class='badge ok'>live</span>".to_owned(),
+            }
+        };
+        let _ = write!(
+            recent_rows,
+            "<div class=rv><code>{pkg} <span style=color:#aab0bb>{ver}</span></code>{badge}</div>",
+            pkg = esc(&v.package),
+            ver = esc(&v.version),
+        );
+    }
+    if recent_rows.is_empty() {
+        recent_rows = "<div class=rv><span class=muted style=font-size:12px>No versions yet.</span></div>".into();
+    }
+    let recent_card = format!("<div class=scard><div class=ttl>Recent versions</div>{recent_rows}</div>");
+    let overview_panel = format!(
+        "{attention_banner}<div class=ovgrid>{install_hero}<div>{supply_card}{recent_card}</div></div>"
     );
     let tokens_section = format!(
         "<h2 id=tokens>Tokens</h2>\
@@ -3053,26 +3346,205 @@ composer config --auth http-basic.{host} token \"$TOKEN\"</pre>"
     } else {
         String::new()
     };
-    let summary = format!(
-        "{} package(s) · {total_versions} version(s){broken_note}",
-        packages.len()
-    );
+    // Header subtitle: package count + the repo's update policy in plain words.
+    let policy_phrase = match summary.update_mode.as_str() {
+        "delayed" => format!("delayed updates with a {}-day cooldown", summary.cooldown_days),
+        "manual" => "manual approval required".to_owned(),
+        _ => "automatic updates".to_owned(),
+    };
+    let sub = format!("{} package(s) · {total_versions} version(s) · {policy_phrase}{broken_note}", packages.len());
 
-    Ok(shell(
+    // Tab panels. Overview is the hero; the rest hold the existing sections.
+    let packages_panel = format!(
+        "<h2 style=margin-top:0>Packages &amp; versions</h2>{filter_bar}<table>\
+         <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}"
+    );
+    let approvals_panel = if health_section.is_empty() {
+        "<h2 style=margin-top:0>Approvals</h2>\
+         <p class=muted>Pending, cooldown and held versions are approved or held inline in the \
+         <label for=rt-packages style=\"color:var(--accent);cursor:pointer;font-weight:600\">Packages</label> tab — \
+         filter by state there. Nothing needs attention right now.</p>".to_owned()
+    } else {
+        format!(
+            "<h2 style=margin-top:0>Approvals</h2>\
+             <p class=muted>Approve or hold individual versions inline in the \
+             <label for=rt-packages style=\"color:var(--accent);cursor:pointer;font-weight:600\">Packages</label> tab. \
+             Below are packages whose <em>sync</em> needs attention.</p>{health_section}"
+        )
+    };
+    let policy_panel = format!("{policy}{grants_section}{autogrant_section}");
+    let tokens_panel = format!("{tokens_section}{licenses_section}");
+
+    let approvals_cnt = if approvals_count > 0 {
+        format!("<span class=cnt>{approvals_count}</span>")
+    } else {
+        String::new()
+    };
+
+    Ok(shell_js(
         &s,
         &user,
         &slug,
         &format!(
-            "<div class=repohead><h1>{slug}</h1> {vis_badge} {sync_badge} \
-             <a class=muted style=\"font-size:.85rem\" href=\"/r/{slug}/settings\">settings</a></div>\
-             {attention_banner}<p class=summary>{summary}</p>{install_hero}\
-             {ro_open}{policy}\
-             <h2>Packages &amp; versions</h2>{filter_bar}<table>\
-             <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>{rows}</table>{pager}\
-             {health_section}{upstreams_section}{deps_section}{grants_section}{autogrant_section}{licenses_section}{tokens_section}{ci_section}{ro_close}"
+            "<div class=rhead>\
+               <div>\
+                 <div style=\"display:flex;align-items:center;gap:11px;flex-wrap:wrap\">\
+                   <h1><span class=vd>{org_esc}/</span>{repo_esc}</h1> {vis_badge} {sync_badge}\
+                 </div>\
+                 <p class=sub>{sub}</p>\
+               </div>\
+               <div class=acts>\
+                 <a class=btn href=\"/r/{slug}/settings\">Settings</a>\
+                 <label class=\"btn primary\" for=rt-overview>Install</label>\
+               </div>\
+             </div>\
+             {ro_open}\
+             <input type=radio name=rt id=rt-overview class=tabnav{ov_checked}>\
+             <input type=radio name=rt id=rt-packages class=tabnav{pk_checked}>\
+             <input type=radio name=rt id=rt-approvals class=tabnav>\
+             <input type=radio name=rt id=rt-upstreams class=tabnav>\
+             <input type=radio name=rt id=rt-deps class=tabnav>\
+             <input type=radio name=rt id=rt-policy class=tabnav>\
+             <input type=radio name=rt id=rt-tokens class=tabnav>\
+             <input type=radio name=rt id=rt-ci class=tabnav>\
+             <div class=tabbar>\
+               <label for=rt-overview>Overview</label>\
+               <label for=rt-packages>Packages</label>\
+               <label for=rt-approvals>Approvals{approvals_cnt}</label>\
+               <label for=rt-upstreams>Upstreams</label>\
+               <label for=rt-deps>Dependencies</label>\
+               <label for=rt-policy>Policy</label>\
+               <label for=rt-tokens>Tokens</label>\
+               <label for=rt-ci>CI access</label>\
+             </div>\
+             <div class=\"tabpanel t-overview\">{overview_panel}</div>\
+             <div class=\"tabpanel t-packages\">{packages_panel}</div>\
+             <div class=\"tabpanel t-approvals\">{approvals_panel}</div>\
+             <div class=\"tabpanel t-upstreams\">{upstreams_section}</div>\
+             <div class=\"tabpanel t-deps\">{deps_section}</div>\
+             <div class=\"tabpanel t-policy\">{policy_panel}</div>\
+             <div class=\"tabpanel t-tokens\">{tokens_panel}</div>\
+             <div class=\"tabpanel t-ci\">{ci_section}</div>\
+             {ro_close}",
+            org_esc = esc(&org),
+            repo_esc = esc(&repo),
+            ov_checked = if filtering { "" } else { " checked" },
+            pk_checked = if filtering { " checked" } else { "" },
         ),
+        REPO_PAGE_JS,
     ))
 }
+
+/// All repo-page client behavior, in one vanilla `<script>` block (per the repo's
+/// frontend convention): remembered tab, the upstreams add-form credential reveal,
+/// and the upstreams search + filter chips. Pure DOM, no dependencies.
+const REPO_PAGE_JS: &str = r"
+// Confirm-guarded form submits (any form with a data-confirm message).
+for (const form of document.querySelectorAll('form[data-confirm]')) {
+  form.addEventListener('submit', (e) => {
+    if (!confirm(form.dataset.confirm)) e.preventDefault();
+  });
+}
+
+// Remember which repo tab you're on (across reloads and post-action redirects).
+// A package search/filter in the URL still forces the Packages tab.
+{
+  const KEY = 'sconceRepoTab';
+  const tabs = ['rt-overview', 'rt-packages', 'rt-approvals', 'rt-upstreams',
+                'rt-deps', 'rt-policy', 'rt-tokens', 'rt-ci'];
+
+  for (const id of tabs) {
+    const radio = document.getElementById(id);
+    radio?.addEventListener('change', () => {
+      if (radio.checked) {
+        try { localStorage.setItem(KEY, id); } catch {}
+      }
+    });
+  }
+
+  if (!/[?&](q|state|page)=/.test(location.search)) {
+    let saved = null;
+    try { saved = localStorage.getItem(KEY); } catch {}
+    if (saved && tabs.includes(saved)) {
+      const radio = document.getElementById(saved);
+      if (radio) radio.checked = true;
+    }
+  }
+}
+
+// Upstreams add-form: reveal the credential fields only for a private source.
+{
+  const vis = document.getElementById('upvis');
+  if (vis) {
+    const credRow = document.getElementById('credrow');
+    const addRow = document.getElementById('addrow');
+    const sync = () => {
+      const isPrivate = vis.value === 'private';
+      credRow.style.display = isPrivate ? 'grid' : 'none';
+      addRow.style.display = isPrivate ? 'none' : 'grid';
+    };
+    vis.addEventListener('change', sync);
+    sync();
+  }
+}
+
+// Upstreams add-form: basic auth takes a username + token (two boxes); the other
+// credential types take a single token.
+{
+  const credType = document.getElementById('cred-type');
+  const credUser = document.getElementById('cred-user');
+  const credToken = document.getElementById('cred-token');
+  if (credType && credUser && credToken) {
+    const sync = () => {
+      const isBasic = credType.value === 'basic';
+      credUser.style.display = isBasic ? 'block' : 'none';
+      credToken.placeholder = isBasic ? 'password' : 'token';
+    };
+    credType.addEventListener('change', sync);
+    sync();
+  }
+}
+
+// Upstreams toolbar: live search over the URL text + kind/failing filter chips.
+{
+  const search = document.getElementById('up-search');
+  const chips = document.getElementById('up-chips');
+  if (search && chips) {
+    const rows = [...document.querySelectorAll('.uptbl .urow')];
+    const shown = document.getElementById('up-shown');
+    const noMatch = document.getElementById('up-nomatch');
+    let filter = 'all';
+
+    const matchesFilter = (row) => {
+      if (filter === 'all') return true;
+      if (filter === 'failing') return row.dataset.fail === '1';
+      return row.dataset.kind === filter;
+    };
+
+    const apply = () => {
+      const query = search.value.trim().toLowerCase();
+      let visible = 0;
+      for (const row of rows) {
+        const ok = matchesFilter(row) && (query === '' || row.dataset.text.includes(query));
+        row.style.display = ok ? 'grid' : 'none';
+        if (ok) visible++;
+      }
+      if (shown) shown.textContent = visible;
+      if (noMatch) noMatch.style.display = visible === 0 ? 'block' : 'none';
+    };
+
+    search.addEventListener('input', apply);
+    for (const chip of chips.querySelectorAll('.chip')) {
+      chip.addEventListener('click', () => {
+        for (const c of chips.querySelectorAll('.chip')) c.classList.remove('on');
+        chip.classList.add('on');
+        filter = chip.dataset.filter;
+        apply();
+      });
+    }
+  }
+}
+";
 
 // ----- repo actions (access already enforced by `lookup`) -----
 
@@ -3427,6 +3899,9 @@ struct UpstreamForm {
     base: String,
     label: Option<String>,
     credential: Option<String>,
+    /// For `basic` auth the username is entered separately (two boxes) and folded
+    /// into the stored `user:token` credential here.
+    cred_user: Option<String>,
     credential_type: Option<String>,
     package_filter: Option<String>,
 }
@@ -3470,15 +3945,22 @@ async fn create_upstream(
         .into_response());
     }
     let label = f.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+    // For basic auth the username comes from a separate box; fold it into the
+    // stored `user:token` form (unless the token already contains a `user:`).
+    let token = f.credential.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let cred_user = f.cred_user.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let combined = match (credential_type, cred_user, token) {
+        ("basic", Some(user), Some(tok)) if !tok.contains(':') => {
+            Some(format!("{user}:{tok}"))
+        }
+        _ => token.map(str::to_owned),
+    };
     // Public upstreams carry no credential — ignore any submitted one (so no key
     // is needed for a public upstream even if the field leaked a value).
     let credential = if matches!(visibility, sconce_catalog::Visibility::Public) {
         None
     } else {
-        f.credential
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
+        combined.as_deref()
     };
 
     // Encrypt the credential if one was given; needs the key.
@@ -3561,6 +4043,19 @@ async fn sync_upstream(
         return Err(StatusCode::NOT_FOUND);
     }
     s.catalog.enqueue_mirror_job(id).await.map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+/// Enqueue a mirror job for every upstream in the repo (the toolbar "Sync all").
+async fn sync_all_upstreams(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    for u in s.catalog.list_upstreams(repo_id).await.map_err(e500)? {
+        s.catalog.enqueue_mirror_job(u.id).await.map_err(e500)?;
+    }
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 
