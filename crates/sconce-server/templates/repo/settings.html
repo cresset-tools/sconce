@@ -1,0 +1,42 @@
+<h1>{{ org }}/{{ repo }} — settings</h1>
+<p class=muted>Org baseline: raw tokens {{ org_raw }}, max TTL {{ org_ttl }}.
+  A repo can only <em>tighten</em> the org policy, never loosen it.</p>
+<form class=row method=post action="/r/{{ org }}/{{ repo }}/settings">
+  <p>Raw tokens: <select name=allow_raw_tokens>
+    <option value=inherit{% if raw_mode == "inherit" %} selected{% endif %}>Inherit from org</option>
+    <option value=allow{% if raw_mode == "allow" %} selected{% endif %}>Allow</option>
+    <option value=deny{% if raw_mode == "deny" %} selected{% endif %}>Disable</option>
+  </select></p>
+  <p>Max token expiry (days), blank = inherit:
+    <input name=max_token_ttl_days type=number min=1 value="{{ repo_ttl }}" style="width:7em"></p>
+  <p>
+    <label><input type=checkbox name=allow_private_packages value=1{% if private %} checked{% endif %}>
+    Allow private packages</label><br>
+    <span class=muted>When off, this repo is public-only — private packages can't be
+    added and any already present aren't served.</span>
+  </p>
+  <button>Save settings</button>
+</form>
+<p><strong>Effective now:</strong> raw tokens {{ eff_raw }}, max TTL {{ eff_ttl }}.</p>
+
+<h2>Rename repository</h2>
+{% if !former.is_empty() %}
+  <p class=muted>Formerly (still redirecting):
+    {% for f in former %}<code>{{ f }}</code>{% if !loop.last %}, {% endif %}{% endfor %}</p>
+{% endif %}
+<p class=muted>Old URLs keep working via redirect, so existing
+  <code>composer.lock</code> files don't break. The old name is
+  <strong>permanently retired</strong> and can't be reused. Update your
+  <code>composer config</code> when convenient.</p>
+<form class=row method=post action="/r/{{ org }}/{{ repo }}/rename">
+  new name <input name=slug placeholder="{{ repo }}" required> <button>Rename</button></form>
+
+<h2>Delete repository</h2>
+<p class=muted>Permanently deletes this repository and its packages, versions,
+  tokens, and upstreams. The name is <strong>retired</strong> (old URLs 404 and the
+  name can't be reused). This can't be undone.</p>
+<form class=row method=post action="/r/{{ org }}/{{ repo }}/delete"
+      onsubmit="return confirm('Delete {{ repo }} permanently? This cannot be undone.')">
+  type <code>{{ repo }}</code> to confirm <input name=confirm required>
+  <button>Delete repository</button></form>
+<p><a href="/r/{{ org }}/{{ repo }}">← back to {{ org }}/{{ repo }}</a></p>

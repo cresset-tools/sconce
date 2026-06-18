@@ -75,6 +75,11 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
 axum = "0.8"
 base64 = "0.22"
+# Compile-time, type-checked, auto-escaping HTML templates for the admin UI.
+# `askama_web` (axum feature) provides `#[derive(WebTemplate)]` → `IntoResponse`,
+# replacing the removed `askama_axum` integration crate.
+askama = "0.16"
+askama_web = { version = "0.16", features = ["axum-0.8"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

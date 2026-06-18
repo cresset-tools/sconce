@@ -1,0 +1,38 @@
+<div class=rtoolbar>
+  <div>
+    <h1>Repositories</h1>
+    <p class=sub>{{ count }} {% if count == 1 %}repository{% else %}repositories{% endif %} you can access</p>
+  </div>
+  <div>
+    {% if can_new_repo %}
+      <a href=/repos/new><button class=primary><svg width=15 height=15 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.2 stroke-linecap=round><path d="M12 5v14M5 12h14"></path></svg> Create repository</button></a>
+    {% endif %}
+  </div>
+</div>
+<form class=rfilter method=get action=/repositories>
+  <input name=q value="{{ q }}" placeholder="Filter repositories…">
+  <select name=vis>
+    <option value=""{% if vis == "" %} selected{% endif %}>All visibility</option>
+    <option value=private{% if vis == "private" %} selected{% endif %}>Private</option>
+    <option value=public{% if vis == "public" %} selected{% endif %}>Public</option>
+  </select>
+  <button type=submit>Filter</button>
+</form>
+{% if repos.is_empty() %}
+  <div class=repotbl><div class=rtempty>No repositories match.</div></div>
+{% else %}
+  <div class=repotbl>
+    <div class=rthead><span>REPOSITORY</span><span>VISIBILITY</span><span>UPDATE MODE</span><span class=rt-r>PKGS</span><span class=rt-r>PENDING</span><span class=rt-r>LAST SYNC</span><span></span></div>
+    {% for r in repos %}
+      <a class=rtrow href="/r/{{ r.org }}/{{ r.slug }}">
+        <span class=rname>{{ r.slug }}</span>
+        <span>{% if r.private %}<span class="badge slate">private</span>{% else %}<span class="badge ok">public</span>{% endif %}</span>
+        <span class=mode>{{ r.mode }}</span>
+        <span class="rt-r mono">{{ r.packages }}</span>
+        <span class=rt-r>{% if r.pending > 0 %}<span class="badge amber mono">{{ r.pending }}</span>{% else %}<span class=rt-dash>—</span>{% endif %}</span>
+        <span class=rtsync>{% if r.never %}<span class=badge>never</span>{% else %}<span class="badge {{ r.sync_tone }}">{{ r.sync_label }}</span> {{ r.when }}{% endif %}</span>
+        <span class=rtchev>&rsaquo;</span>
+      </a>
+    {% endfor %}
+  </div>
+{% endif %}

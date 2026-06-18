@@ -1,0 +1,49 @@
+<div class=toolbar>
+  <h1>{{ name }}</h1>
+  <form class=inline method=post action="/o/{{ org }}/sets/{{ set_id }}/delete"
+        onsubmit="return confirm('Delete this set?')"><button>Delete set</button></form>
+</div>
+<p class=muted><a href="/o/{{ org }}/sets">← all sets</a></p>
+
+<h2>Explicit members</h2>
+<table>
+  <tr><th>Package</th><th></th></tr>
+  {% for m in members %}
+    <tr>
+      <td class=mono>{{ m.name }}</td>
+      <td>
+        <form class=inline method=post action="/o/{{ org }}/sets/{{ set_id }}/member/remove">
+          <input type=hidden name=id value="{{ m.id }}"><button>Remove</button></form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan=2 class=muted>none</td></tr>
+  {% endfor %}
+</table>
+<form class=row method=post action="/o/{{ org }}/sets/{{ set_id }}/member">
+  add package <input name=package placeholder="vendor/name" required> <button>Add</button></form>
+
+<h2>Glob rules</h2>
+<table>
+  <tr><th>Pattern</th><th></th></tr>
+  {% for r in rules %}
+    <tr>
+      <td class=mono>{{ r.glob }}</td>
+      <td>
+        <form class=inline method=post action="/o/{{ org }}/sets/{{ set_id }}/rule/remove">
+          <input type=hidden name=id value="{{ r.id }}"><button>Remove</button></form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan=2 class=muted>none</td></tr>
+  {% endfor %}
+</table>
+<form class=row method=post action="/o/{{ org }}/sets/{{ set_id }}/rule">
+  add rule <input name=glob placeholder="vendor/*" required> <button>Add</button></form>
+
+<h2>Resolved membership <span class=muted>({{ resolved.len() }})</span></h2>
+<p class=muted>Explicit members ∪ packages matching the rules — auto-grows as matching packages are added.</p>
+<p>
+  {% if resolved.is_empty() %}<span class=muted>empty</span>
+  {% else %}{% for n in resolved %}<span class="badge slate">{{ n }}</span> {% endfor %}{% endif %}
+</p>

@@ -1,0 +1,13 @@
+<h1>Token created</h1>
+<p>Store it now — it won't be shown again.</p>
+<pre>{{ tok }}</pre>
+<h2>Install in Composer</h2>
+<p>Add the repository, store the token (the token is the password — the username is
+  ignored), then require a package:</p>
+<pre>composer config repositories.{{ repo }} composer {{ base }}/{{ org }}/{{ repo }}
+composer config --auth http-basic.{{ host }} token {{ tok }}
+composer require &lt;vendor/package&gt;</pre>
+<p class=muted>The auth line writes to <code>auth.json</code>. Use
+  <code>--global</code> to reuse the token across projects, or set the
+  <code>COMPOSER_AUTH</code> env var in CI instead of committing it.</p>
+<p><a href="/r/{{ org }}/{{ repo }}">← back to {{ org }}/{{ repo }}</a></p>

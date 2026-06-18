@@ -1,0 +1,17 @@
+<h1>New repository</h1>
+{% if orgs.is_empty() %}
+  {% if is_superadmin %}<p><a href=/orgs/new>Create an organization</a> first.</p>
+  {% else %}<p class=muted>You don't administer any organization yet — ask an org admin.</p>{% endif %}
+  <p><a href=/>← back</a></p>
+{% else %}
+  <p class=muted>A repository serves a Composer registry — mirror packages into it, gate
+    versions by policy, and hand out install tokens.</p>
+  <form class=row method=post action=/repos>
+    <p>Organization <select name=org required>
+      {% for o in orgs %}<option value="{{ o }}"{% if o.as_str() == selected.as_str() %} selected{% endif %}>{{ o }}</option>{% endfor %}
+    </select></p>
+    <p>Repository name <input name=repo placeholder="e.g. web" required></p>
+    <button class=primary>Create repository</button>
+  </form>
+  <p><a href=/>← cancel</a></p>
+{% endif %}

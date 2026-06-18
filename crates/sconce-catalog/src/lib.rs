@@ -422,6 +422,24 @@ pub struct RepoOverview {
     pub last_sync: Option<String>,
 }
 
+/// A repository on the home dashboard: overview data plus its owning org, so
+/// the whole dashboard can be built from one query (no per-org round-trips).
+#[derive(Debug, Clone)]
+pub struct HomeRepo {
+    pub org_id: Uuid,
+    pub slug: String,
+    pub allow_private_packages: bool,
+    pub update_mode: String,
+    pub cooldown_days: i32,
+    pub packages: i64,
+    pub broken: i64,
+    /// Versions awaiting approval under the repo's policy (manual mode, or still
+    /// inside the `delayed` cooldown window).
+    pub pending: i64,
+    /// Newest successful sync across the repo's packages (text), if any.
+    pub last_sync: Option<String>,
+}
+
 /// A repository in the admin listing.
 #[derive(Debug, Clone)]
 pub struct RepoSummary {
@@ -1017,6 +1035,55 @@ impl Catalog {
                     update_mode: row.try_get("update_mode")?,
                     packages: row.try_get("packages")?,
                     broken: row.try_get("broken")?,
+                    last_sync: row.try_get("last_sync")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Repos with overview data (visibility, package + broken counts, last sync)
+    /// across the given orgs — `None` = all orgs. Powers the home dashboard in a
+    /// single query. Ordered by org then slug so the UI can group in one pass.
+    pub async fn home_repo_overview(
+        &self,
+        org_ids: Option<&[Uuid]>,
+    ) -> Result<Vec<HomeRepo>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select r.org_id as org_id, r.slug as slug, \
+                    r.allow_private_packages as allow_private_packages, \
+                    r.update_mode as update_mode, r.cooldown_days as cooldown_days, \
+                    count(distinct p.id) as packages, \
+                    count(distinct p.id) filter \
+                        (where p.sync_health = 'broken' and p.archived_at is null) as broken, \
+                    count(pv.id) filter (where pv.held_at is null and pv.yanked_at is null \
+                        and pv.approved_at is null \
+                        and ( r.update_mode = 'manual' \
+                              or ( r.update_mode = 'delayed' \
+                                   and ( pv.released_at is null \
+                                         or pv.released_at + make_interval(days => r.cooldown_days) > now() ) ) )) \
+                        as pending, \
+                    to_char(max(p.last_success_at), 'YYYY-MM-DD HH24:MI') as last_sync \
+             from repositories r \
+             left join packages p on p.repo_id = r.id \
+             left join package_versions pv on pv.package_id = p.id \
+             where ($1::uuid[] is null or r.org_id = any($1)) \
+             group by r.id, r.org_id, r.slug, r.allow_private_packages, r.update_mode, r.cooldown_days \
+             order by r.org_id, r.slug",
+        )
+        .bind(org_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(HomeRepo {
+                    org_id: row.try_get("org_id")?,
+                    slug: row.try_get("slug")?,
+                    allow_private_packages: row.try_get("allow_private_packages")?,
+                    update_mode: row.try_get("update_mode")?,
+                    cooldown_days: row.try_get("cooldown_days")?,
+                    packages: row.try_get("packages")?,
+                    broken: row.try_get("broken")?,
+                    pending: row.try_get("pending")?,
                     last_sync: row.try_get("last_sync")?,
                 })
             })

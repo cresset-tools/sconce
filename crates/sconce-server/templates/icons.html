@@ -1,0 +1,32 @@
+{# Shared inline SVG glyphs, as macros. Import with
+   {% import "icons.html" as icons %} then {% call icons::check() %}. #}
+{% macro mark() %}<svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M4 7.5l8 4.5 8-4.5"></path><path d="M12 12v9"></path></svg>{% endmacro %}
+
+{% macro org_hex() %}<svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M4 7.5l8 4.5 8-4.5"></path></svg>{% endmacro %}
+
+{% macro hex_gray() %}<svg width=22 height=22 viewBox="0 0 24 24" fill=none stroke=#aab0bb stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M4 7.5l8 4.5 8-4.5"></path></svg>{% endmacro %}
+
+{% macro warn() %}<svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=#8a5a00 stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M12 4l9 16H3L12 4z"></path><path d="M12 10v4M12 17h0"></path></svg>{% endmacro %}
+
+{% macro check() %}<svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=#1f9d57 stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>{% endmacro %}
+
+{% macro x() %}<svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=#c0362c stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M6 6l12 12M18 6L6 18"></path></svg>{% endmacro %}
+
+{% macro dot() %}<span style="width:7px;height:7px;border-radius:50%;background:#9aa1ad"></span>{% endmacro %}
+
+{% macro git() %}<svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=#5a6475 stroke-width=1.8 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=6 r=2.5></circle><circle cx=6 cy=18 r=2.5></circle><circle cx=18 cy=18 r=2.5></circle><path d="M12 8.5v4M12 12.5a6 6 0 0 1-6 3M12 12.5a6 6 0 0 0 6 3"></path></svg>{% endmacro %}
+
+{% macro box_icon() %}<svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=#5a6475 stroke-width=1.8 stroke-linecap=round stroke-linejoin=round><path d="M21 8l-9-5-9 5 9 5 9-5z"></path><path d="M3 8v8l9 5 9-5V8"></path></svg>{% endmacro %}
+
+{# 24×24 stroke nav glyphs for the sidebar. #}
+{% macro nav_home() %}<svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M3 10.5L12 3l9 7.5"></path><path d="M5 9.5V20h14V9.5"></path></svg>{% endmacro %}
+
+{% macro nav_repos() %}<svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M4 7.5l8 4.5 8-4.5"></path><path d="M12 12v9"></path></svg>{% endmacro %}
+
+{% macro nav_members() %}<svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><circle cx=9 cy=8 r=3.2></circle><path d="M3 20a6 6 0 0 1 12 0"></path><path d="M16 5.5a3 3 0 0 1 0 5.5"></path><path d="M21 20a6 6 0 0 0-4-5.6"></path></svg>{% endmacro %}
+
+{% macro nav_activity() %}<svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M3 12h4l2.5 7 4-14 2.5 7h5"></path></svg>{% endmacro %}
+
+{% macro nav_console() %}<svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M12 3l8 3v6c0 4.6-3.3 7.8-8 9-4.7-1.2-8-4.4-8-9V6l8-3z"></path><path d="M9 12l2 2 4-4"></path></svg>{% endmacro %}
+
+{% macro avatar() %}<svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=8 r=4></circle><path d="M4 21a8 8 0 0 1 16 0"></path></svg>{% endmacro %}

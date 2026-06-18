@@ -1,0 +1,48 @@
+<h1>{{ org }} — settings</h1>
+<form class=row method=post action="/o/{{ org }}/settings">
+  <p>
+    <label><input type=checkbox name=allow_raw_tokens value=1{% if allow_raw_tokens %} checked{% endif %}>
+    Allow raw repo tokens</label><br>
+    <span class=muted>When off, tokens can't be created here — the org relies on
+    SSO/CI-derived credentials that can be deprovisioned.</span>
+  </p>
+  <p>Max token expiry (days), blank = no limit:
+    <input name=max_token_ttl_days type=number min=1 value="{{ max_ttl }}" style="width:7em"></p>
+  <button>Save settings</button>
+</form>
+
+<h2>SSO — OIDC
+  {% if oidc_configured %}<span class="badge ok">configured</span>
+  {% else %}<span class="badge slate">not set</span>{% endif %}
+</h2>
+<p class=muted>Users who sign in via this connection are provisioned into <code>{{ org }}</code>.
+  The client secret is write-only — leave it blank to keep the current one.</p>
+<form class=row method=post action="/o/{{ org }}/oidc">
+  <p>Issuer URL <input name=issuer type=url value="{{ oidc.issuer }}" placeholder="https://idp.example.com" required style="width:24em"></p>
+  <p>Client ID <input name=client_id value="{{ oidc.client_id }}" required style="width:18em"></p>
+  <p>Client secret <input name=client_secret type=password placeholder="(unchanged)" style="width:18em"></p>
+  <p>Redirect URL <input name=redirect_url type=url value="{{ oidc.redirect }}" placeholder="https://dashboard/auth/callback" required style="width:24em"></p>
+  <p>Scopes <input name=scopes value="{{ oidc.scopes }}" style="width:18em"></p>
+  <p>Allowed email domains (comma-sep, blank = any) <input name=allowed_domains value="{{ oidc.allowed }}" style="width:18em"></p>
+  <p>Admin email domains (comma-sep) <input name=admin_domains value="{{ oidc.admin }}" style="width:18em"></p>
+  <button>Save SSO connection</button>
+</form>
+
+<h2>SCIM provisioning</h2>
+<p class=muted>Point your IdP's SCIM connector here so offboarded users are deactivated
+  (their sessions revoked) automatically. Endpoint:
+  <code>&lt;dashboard-url&gt;/scim/v2/Users</code> — bearer auth with the token below.</p>
+<form class=row method=post action="/o/{{ org }}/scim-token">
+  <button>Generate / rotate SCIM token</button></form>
+
+<h2>Rename organization</h2>
+{% if !former.is_empty() %}
+  <p class=muted>Formerly (still redirecting):
+    {% for f in former %}<code>{{ f }}</code>{% if !loop.last %}, {% endif %}{% endfor %}</p>
+{% endif %}
+<p class=muted>Old URLs keep working via redirect, so existing
+  <code>composer.lock</code> files don't break. The old slug is
+  <strong>permanently retired</strong> and can't be reused.</p>
+<form class=row method=post action="/o/{{ org }}/rename">
+  new slug <input name=slug placeholder="{{ org }}" required> <button>Rename</button></form>
+<p><a href="/">← back</a></p>

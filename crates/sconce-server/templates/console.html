@@ -1,0 +1,21 @@
+<h1>Instance console</h1>
+<div class=stats>
+  <div class=stat><div class=n>{{ orgs }}</div><div class=l>organizations</div></div>
+  <div class=stat><div class=n>{{ repos }}</div><div class=l>repositories</div></div>
+  <div class=stat><div class=n>{{ users }}</div><div class=l>users</div></div>
+</div>
+<h2>Instance SSO</h2>
+<p>Default OIDC connection (all orgs without their own):
+  {% if oidc_configured %}<span class="badge ok">configured</span>
+  {% else %}<span class="badge slate">not set</span>{% endif %}</p>
+<h2>Organizations</h2>
+<table>
+  <tr><th>Organization</th><th>Repos</th><th></th></tr>
+  {% for o in org_rows %}
+    <tr>
+      <td><a href="/o/{{ o.slug }}">{{ o.slug }}</a></td>
+      <td>{{ o.repos }}</td>
+      <td class=muted><a href="/o/{{ o.slug }}/settings">settings</a></td>
+    </tr>
+  {% endfor %}
+</table>

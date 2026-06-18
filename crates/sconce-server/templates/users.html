@@ -1,0 +1,44 @@
+<h1>Members</h1>
+<table>
+  <tr><th>Email</th><th>Role</th><th>Tenants</th></tr>
+  {% for u in users %}
+    <tr>
+      <td>{{ u.email }}</td>
+      <td>{% if u.is_superadmin %}<span class="badge amber">superadmin</span>{% endif %}</td>
+      <td>
+        {% if u.tenants.is_empty() %}<span class=muted>—</span>{% endif %}
+        {% for t in u.tenants %}
+          <div style="display:flex;align-items:center;gap:6px;margin:.15rem 0">
+            <span class="badge {{ t.tone }}">{{ t.slug }}{% if !t.active %} · deactivated{% endif %}</span>
+            <form class=inline method=post action=/users/grant>
+              <input type=hidden name=email value="{{ u.email }}">
+              <input type=hidden name=tenant value="{{ t.slug }}">
+              <select name=role>
+                <option value=member{% if t.role == "member" %} selected{% endif %}>member</option>
+                <option value=admin{% if t.role == "admin" %} selected{% endif %}>admin</option>
+              </select><button>Set</button>
+            </form>
+            <form class=inline method=post action=/users/remove
+                  onsubmit="return confirm('Remove {{ u.email }} from {{ t.slug }}?')">
+              <input type=hidden name=email value="{{ u.email }}">
+              <input type=hidden name=tenant value="{{ t.slug }}">
+              <button>Remove</button>
+            </form>
+          </div>
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+</table>
+<h2>Create user</h2>
+<form class=row method=post action=/users>
+  email <input name=email type=email required>
+  password <input name=password type=password required>
+  <label><input type=checkbox name=superadmin value=1> superadmin</label>
+  <button>Create</button></form>
+<h2>Grant tenant access</h2>
+<form class=row method=post action=/users/grant>
+  email <input name=email type=email required>
+  tenant <input name=tenant placeholder=org-slug required>
+  <select name=role><option value=member>member</option><option value=admin>admin</option></select>
+  <button>Grant</button></form>

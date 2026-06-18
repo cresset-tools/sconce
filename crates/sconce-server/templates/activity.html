@@ -1,0 +1,17 @@
+<h1>Activity</h1>
+<p class=muted>Background mirror jobs — newest first. Pending jobs that keep failing back off
+  and retry; a terminal failure stops and (for a package) flags it broken.</p>
+<table>
+  <tr><th>Status</th><th>Job</th><th>Target</th><th>Repo</th><th>Updated</th></tr>
+  {% for j in jobs %}
+    <tr>
+      <td><span class="badge {{ j.tone }}">{{ j.status }}</span></td>
+      <td>{{ j.kind }}</td>
+      <td class=mono>{{ j.target }}{% if !j.err.is_empty() %}<div class=muted style="font-size:11.5px">{{ j.err }}</div>{% endif %}</td>
+      <td class=mono>{{ j.repo }}</td>
+      <td class=muted>{{ j.updated }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan=5 class=muted>No background jobs yet. Sync an upstream to see activity here.</td></tr>
+  {% endfor %}
+</table>

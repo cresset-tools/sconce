@@ -1,0 +1,25 @@
+{% import "icons.html" as icons %}
+<aside class=sidebar>
+  <a class=org href=/><span class=mk>{% call icons::mark() %}{% endcall %}</span>
+    <span><span class=name>Bougie Repo</span><span class=sub>{% if single_tenant %}Single-tenant{% else %}Hosted{% endif %}</span></span></a>
+  <nav class=side-nav>
+    <a href=/{% if on_home %} class=active{% endif %}>{% call icons::nav_home() %}{% endcall %}<span>Home</span></a>
+    <a href=/repositories{% if on_repos %} class=active{% endif %}>{% call icons::nav_repos() %}{% endcall %}<span>Repositories</span></a>
+    {% if show_members %}
+      <div class=grp>ORGANIZATION</div>
+      <a href=/users{% if on_members %} class=active{% endif %}>{% call icons::nav_members() %}{% endcall %}<span>Members</span></a>
+    {% endif %}
+    <div class=grp>SYSTEM</div>
+    <a href=/activity{% if on_activity %} class=active{% endif %}>{% call icons::nav_activity() %}{% endcall %}<span>Activity</span></a>
+    {% if is_superadmin %}
+      <a href=/console{% if on_console %} class=active{% endif %}>{% call icons::nav_console() %}{% endcall %}<span>Instance console</span></a>
+    {% endif %}
+  </nav>
+  <div class=userbox>
+    {% if show_account %}<a href=/account title=Account style="display:flex;align-items:center;gap:9px;flex:1;min-width:0;text-decoration:none">{% endif %}
+    <span class=avatar>{% call icons::avatar() %}{% endcall %}</span>
+    <span style="flex:1;min-width:0"><span class=rolepill>{{ role }}</span></span>
+    {% if show_account %}</a>{% endif %}
+    {% if !single_tenant %}<form method=post action=/logout><button>Log out</button></form>{% endif %}
+  </div>
+</aside>

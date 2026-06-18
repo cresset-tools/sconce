@@ -1,0 +1,19 @@
+<h1>Account</h1>
+<p>Signed in as <strong>{{ email }}</strong>{% if is_superadmin %} (superadmin){% endif %}.</p>
+<h2>Active sessions</h2>
+<p class=muted>Revoke any session to sign that device out. Revoking <em>this device</em>
+  signs you out here.</p>
+<table>
+  <tr><th>Signed in</th><th>Expires</th><th></th></tr>
+  {% for sn in sessions %}
+    <tr>
+      <td>{{ sn.created }}{% if sn.current %} <span class="badge ok">this device</span>{% endif %}</td>
+      <td class=muted>{{ sn.expires }}</td>
+      <td>
+        <form class=inline method=post action=/account/revoke>
+          <input type=hidden name=id value="{{ sn.id }}"><button>Revoke</button></form>
+      </td>
+    </tr>
+  {% endfor %}
+</table>
+<form class=row method=post action=/logout><button>Sign out</button></form>

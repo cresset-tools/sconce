@@ -1,0 +1,423 @@
+{% import "icons.html" as icons %}
+<div class=rhead>
+  <div>
+    <div style="display:flex;align-items:center;gap:11px;flex-wrap:wrap">
+      <h1><span class=vd>{{ org }}/</span>{{ repo }}</h1>
+      {% if private_packages %}<span class="badge slate">private packages</span>{% else %}<span class="badge blue">public-only</span>{% endif %}
+      <span class="badge {{ sync_tone }}">{{ sync_label }}</span>
+    </div>
+    <p class=sub>{{ pkg_count }} package(s) · {{ total_versions }} version(s) · {{ policy_phrase }}{% if broken_count > 0 %} · <span style="color:#a82c20">{{ broken_count }} can't sync</span>{% endif %}</p>
+  </div>
+  <div class=acts>
+    <a class=btn href="/r/{{ org }}/{{ repo }}/settings">Settings</a>
+    <label class="btn primary" for=rt-overview>Install</label>
+  </div>
+</div>
+{% if read_only %}
+  <style>.ro form{display:none}</style>
+  <p class=banner>Read-only (member) access — ask an org admin to make changes.</p>
+  <div class=ro>
+{% endif %}
+<input type=radio name=rt id=rt-overview class=tabnav{% if !filtering %} checked{% endif %}>
+<input type=radio name=rt id=rt-packages class=tabnav{% if filtering %} checked{% endif %}>
+<input type=radio name=rt id=rt-approvals class=tabnav>
+<input type=radio name=rt id=rt-upstreams class=tabnav>
+<input type=radio name=rt id=rt-deps class=tabnav>
+<input type=radio name=rt id=rt-policy class=tabnav>
+<input type=radio name=rt id=rt-tokens class=tabnav>
+<input type=radio name=rt id=rt-ci class=tabnav>
+<div class=tabbar>
+  <label for=rt-overview>Overview</label>
+  <label for=rt-packages>Packages</label>
+  <label for=rt-approvals>Approvals{% if approvals_count > 0 %}<span class=cnt>{{ approvals_count }}</span>{% endif %}</label>
+  <label for=rt-upstreams>Upstreams</label>
+  <label for=rt-deps>Dependencies</label>
+  <label for=rt-policy>Policy</label>
+  <label for=rt-tokens>Tokens</label>
+  <label for=rt-ci>CI access</label>
+</div>
+
+{# ---------- Overview ---------- #}
+<div class="tabpanel t-overview">
+  {% if broken_count > 0 %}
+    <p class=banner>⚠ {{ broken_count }} package(s) can't sync — they keep serving their existing versions, but won't get new ones until fixed. See the <label for=rt-approvals style="color:inherit;cursor:pointer;font-weight:700;text-decoration:underline">Approvals</label> tab.</p>
+  {% endif %}
+  <div class=ovgrid>
+    <div>
+      <h3 style="margin:0 0 11px;font-size:15px;font-weight:600">Install in &lt;5 minutes</h3>
+      <div class=term>
+        <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config repositories.{{ repo }} composer <span class=url>{{ base }}/{{ org }}/{{ repo }}</span></code></div>
+        <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config --auth http-basic.{{ host }} token <span class=tok>&lt;YOUR_TOKEN&gt;</span></code></div>
+        <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> require {{ example_pkg }}</code></div>
+      </div>
+      <p class=muted style="margin:.7rem 0 0;font-size:11.5px">The token is the http-basic <em>password</em> — the username is ignored. Mint one under the <label for=rt-tokens style="color:var(--accent);cursor:pointer;font-weight:600">Tokens</label> tab.</p>
+    </div>
+    <div>
+      <div class=scard>
+        <div class=ttl>Supply chain</div>
+        <div class=srow><span style="display:flex;align-items:center;gap:8px"><span class="badge amber">pending</span>awaiting approval</span><span class=n style="color:#8a5a00">{{ pending_count }}</span></div>
+        <div class=srow><span style="display:flex;align-items:center;gap:8px"><span class="badge held">held</span>security hold</span><span class=n style="color:#a82c20">{{ held_count }}</span></div>
+        {% if broken_count > 0 %}
+          <div style="margin-top:13px;display:flex;align-items:center;gap:9px;background:#fbf3e1;border:1px solid #efdca6;border-radius:9px;padding:9px 11px">
+            <span style="flex:1;font-size:12px;color:#8a5a00;font-weight:600">⚠ {{ broken_count }} package(s) can't sync</span>
+            <label for=rt-approvals style="font-size:11.5px;font-weight:600;color:#8a5a00;cursor:pointer;white-space:nowrap">Review →</label></div>
+        {% endif %}
+        <label for=rt-approvals class=btn style="width:100%;justify-content:center;margin-top:14px">Open approval queue</label>
+      </div>
+      <div class=scard>
+        <div class=ttl>Recent versions</div>
+        {% if recent.is_empty() %}
+          <div class=rv><span class=muted style=font-size:12px>No versions yet.</span></div>
+        {% else %}
+          {% for v in recent %}<div class=rv><code>{{ v.package }} <span style=color:#aab0bb>{{ v.version }}</span></code><span class="badge {{ v.badge_tone }}">{{ v.badge_label }}</span></div>{% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ---------- Packages ---------- #}
+<div class="tabpanel t-packages">
+  <h2 style=margin-top:0>Packages &amp; versions</h2>
+  <form class=inline method=get action="/r/{{ org }}/{{ repo }}" style="margin:.2rem 0 .6rem">
+    <input name=q value="{{ search_q }}" placeholder="search packages" style=width:14em> <button>Search</button>
+  </form>
+  <span class=muted style=font-size:12px>
+    <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}" class="{% if state.is_empty() %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>all</a>
+    <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}&state=pending" class="{% if state == "pending" %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>pending approval</a>
+    <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}&state=held" class="{% if state == "held" %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>held</a>
+    <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}&state=yanked" class="{% if state == "yanked" %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>yanked</a>
+    <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}&state=approved" class="{% if state == "approved" %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>approved</a>
+  </span>
+  <table>
+    <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>
+    {% for v in versions %}
+      <tr>
+        <td><a href="/r/{{ org }}/{{ repo }}/p/{{ v.package }}">{{ v.package }}</a></td>
+        <td>{{ v.version }} <span class=muted>{{ v.normalized }}</span></td>
+        <td>{{ v.stability }}</td>
+        <td><span class="badge {{ v.badge_tone }}">{{ v.badge_label }}</span> <span class=muted>{{ v.released }}</span></td>
+        <td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version">
+            <input type=hidden name=package value="{{ v.package }}"><input type=hidden name=normalized value="{{ v.normalized }}">
+            <button name=action value={% if v.held %}unhold{% else %}hold{% endif %}>{% if v.held %}Unhold{% else %}Hold{% endif %}</button>
+            <button name=action value=approve>Approve</button>
+            <button name=action value={% if v.yanked %}unyank{% else %}yank{% endif %}>{% if v.yanked %}Unyank{% else %}Yank{% endif %}</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan=5 class=muted>{% if filtered %}No versions match the filter.{% else %}No packages yet. Mirror one with <code>sconce mirror</code>.{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  {% if let Some(p) = pager %}
+    <div class=pager>
+      <span class=muted>Showing {{ p.from }}&ndash;{{ p.to }} of {{ p.total }} versions</span>
+      {% if p.last_page > 1 %}
+        {% if p.page > 1 %}<a href="{{ p.base }}?{% if !p.extra.is_empty() %}{{ p.extra }}&{% endif %}page={{ p.page - 1 }}">&lsaquo; Prev</a>{% endif %}
+        <span class=muted>Page {{ p.page }} of {{ p.last_page }}</span>
+        {% if p.page < p.last_page %}<a href="{{ p.base }}?{% if !p.extra.is_empty() %}{{ p.extra }}&{% endif %}page={{ p.page + 1 }}">Next &rsaquo;</a>{% endif %}
+      {% endif %}
+    </div>
+  {% endif %}
+</div>
+
+{# ---------- Approvals ---------- #}
+<div class="tabpanel t-approvals">
+  {% if health.is_empty() %}
+    <h2 style=margin-top:0>Approvals</h2>
+    <p class=muted>Pending, cooldown and held versions are approved or held inline in the <label for=rt-packages style="color:var(--accent);cursor:pointer;font-weight:600">Packages</label> tab — filter by state there. Nothing needs attention right now.</p>
+  {% else %}
+    <h2 style=margin-top:0>Approvals</h2>
+    <p class=muted>Approve or hold individual versions inline in the <label for=rt-packages style="color:var(--accent);cursor:pointer;font-weight:600">Packages</label> tab. Below are packages whose <em>sync</em> needs attention.</p>
+    <h2 id=health>Package health</h2>
+    {% if broken_count > 0 %}<p class=muted>{{ broken_count }} package(s) can't sync (still serving their existing versions). Archive to acknowledge and silence.</p>{% endif %}
+    <table>
+      <tr><th>Package</th><th>State</th><th>Last sync</th><th>Actions</th></tr>
+      {% for h in health %}
+        <tr>
+          <td>{{ h.pkg }}</td>
+          <td><span class="badge {{ h.badge_tone }}">{{ h.badge_label }}</span>{% if let Some(r) = h.reason %} <span class=muted>{{ r }}</span>{% endif %}</td>
+          <td class=muted>last sync {{ h.last }}</td>
+          <td>{% if let Some(av) = h.action_value %}<form class=inline method=post action="/r/{{ org }}/{{ repo }}/package/archive"><input type=hidden name=package value="{{ h.pkg }}"><button name=action value={{ av }}>{{ h.action_label }}</button></form>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+</div>
+
+{# ---------- Upstreams ---------- #}
+<div class="tabpanel t-upstreams">
+  <div class=uphd>
+    <div><h2>Upstreams</h2>
+      <p>Sources that feed packages into this repository · git &amp; composer · synced on a schedule and on demand</p></div>
+    <a class="btn primary" href="#up-add">+ Add upstream</a>
+  </div>
+  <div class=uptool>
+    <label class=search>
+      <svg width=15 height=15 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round><circle cx=11 cy=11 r=7></circle><path d="M21 21l-3.6-3.6"></path></svg>
+      <input id=up-search type=search placeholder="Search upstreams…" autocomplete=off>
+    </label>
+    <div class=chips id=up-chips>
+      <span class="chip on" data-filter=all>All <span class=c>{{ up_total }}</span></span>
+      <span class=chip data-filter=git>{% call icons::git() %}{% endcall %}git <span class=c>{{ git_count }}</span></span>
+      <span class=chip data-filter=composer>{% call icons::box_icon() %}{% endcall %}composer <span class=c>{{ composer_count }}</span></span>
+      <span class=chip data-filter=failing><span class=fdot></span>Failing <span class=c>{{ failing_count }}</span></span>
+    </div>
+    <form class=synca method=post action="/r/{{ org }}/{{ repo }}/upstream/sync-all">
+      <button class=btn type=submit>
+        <svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M21 12a9 9 0 0 1-15 6.7L3 16M3 12a9 9 0 0 1 15-6.7L21 8"></path></svg>
+        Sync all</button>
+    </form>
+  </div>
+  <div class=uptbl>
+    {% if upstreams.is_empty() %}
+      <div class=upnomatch>No upstreams yet — add one below to start mirroring.</div>
+    {% else %}
+      <div class=uhead><span>KIND</span><span>URL</span><span>VISIBILITY</span><span>CRED</span><span>LAST SYNC</span><span></span></div>
+      {% for u in upstreams %}
+        <div class=urow data-kind={{ u.kind }} data-fail={% if u.failed %}1{% else %}0{% endif %} data-text="{{ u.text }}">
+          <span class=kind>{% if u.is_composer %}{% call icons::box_icon() %}{% endcall %}{% else %}{% call icons::git() %}{% endcall %}{% endif %}{{ u.kind }}</span>
+          <span class=url><code>{{ u.base }}</code>{% if let Some(f) = u.filter %}<div class=match>match <b>{{ f }}</b></div>{% endif %}{% if let Some(e) = u.error %}<div class=err>{{ e }}</div>{% endif %}</span>
+          <span>{% if u.public %}<span class="badge ok">public</span>{% else %}<span class="badge slate">private</span>{% endif %}</span>
+          <span>{% if u.has_credential %}<span class="badge slate mono">{{ u.credential_type }}</span>{% else %}<span class=dash>—</span>{% endif %}</span>
+          <span class=last><span class="badge {{ u.last_tone }}">{{ u.last_label }}</span>{% if !u.when.is_empty() %} {{ u.when }}{% endif %}</span>
+          <span class=ract>
+            {% if u.running %}<span class=busy>Syncing…</span>{% else %}<form method=post action="/r/{{ org }}/{{ repo }}/upstream/sync"><input type=hidden name=id value="{{ u.id }}"><button class=sync>{% if u.failed %}Retry{% else %}Sync{% endif %}</button></form>{% endif %}
+            <form method=post action="/r/{{ org }}/{{ repo }}/upstream/remove" data-confirm="Remove this upstream?"><input type=hidden name=id value="{{ u.id }}"><button class=rm>Remove</button></form>
+          </span>
+        </div>
+      {% endfor %}
+      <div class=upnomatch id=up-nomatch style="display:none">No upstreams match.</div>
+      <div class=upcount>Showing <span id=up-shown>{{ up_total }}</span> of {{ up_total }} upstreams</div>
+    {% endif %}
+  </div>
+  <div class=upform id=up-add>
+    <div class=ttl>Add upstream</div>
+    <form method=post action="/r/{{ org }}/{{ repo }}/upstream">
+      <div class=g1>
+        <div><label class=fl>Kind</label><select name=kind id=upkind>
+          <option value=git>git</option><option value=composer>composer</option></select></div>
+        <div><label class=fl>URL</label><input name=base placeholder="git@host:org/repo.git" required></div>
+        <div><label class=fl>Visibility</label><select name=visibility id=upvis>
+          <option value=public>public</option><option value=private>private</option></select></div>
+      </div>
+      <div class=g1>
+        <div><label class=fl>Label <span class=hint>· optional</span></label><input name=label style=font-family:inherit></div>
+        <div><label class=fl>Match <span class=hint>· composer regex</span></label><input name=package_filter placeholder="^vendor/"></div>
+        <div></div>
+      </div>
+      <div class=g2 id=credrow style="display:none">
+        <div><label class=fl>Credential type</label><select name=credential_type id=cred-type>
+          <option value=basic>basic (user + token)</option>
+          <option value=github>github token</option>
+          <option value=gitlab>gitlab token</option>
+          <option value=bearer>bearer header</option></select></div>
+        <div><label class=fl>Credential <span class=hint>· write-only, stored encrypted</span></label>
+          <div class=credline>
+            <input name=cred_user id=cred-user placeholder=username autocomplete=off style="display:none;max-width:170px">
+            <input name=credential id=cred-token type=password placeholder=token>
+            <button class=primary>Add</button></div></div>
+      </div>
+      <div class=g2 id=addrow><div></div><div style="display:flex;justify-content:flex-end"><button class=primary>Add upstream</button></div></div>
+    </form>
+    <p class=muted style="margin:.7rem 0 0">{% if has_secret_key %}Credential is stored encrypted (write-only).{% else %}Set SCONCE_SECRET_KEY to store a credential; without it only public/unauthed upstreams work.{% endif %} Credentials apply to private upstreams only.</p>
+  </div>
+</div>
+
+{# ---------- Dependencies ---------- #}
+<div class="tabpanel t-deps">
+  <h2>Dependency plan</h2>
+  <form class=inline method=post action="/r/{{ org }}/{{ repo }}/deps/resolve"><button>Resolve dependencies</button></form>
+  <span class=muted> — computes the full closure (background); add the ones you want.</span>
+  <table>
+    <tr><th>Status</th><th>Package</th><th>Required by</th><th></th></tr>
+    {% for d in deps %}
+      <tr>
+        <td>{% if d.status_kind == "missing" %}<span style="color:#a12">missing</span>{% else if d.status_kind == "present" %}<span class=muted>present</span>{% else %}{{ d.status_other }}{% endif %}</td>
+        <td>{{ d.name }}</td>
+        <td class=muted>{{ d.required_by }}</td>
+        <td>{% if d.resolvable %}<form class=inline method=post action="/r/{{ org }}/{{ repo }}/deps/add"><input type=hidden name=package value="{{ d.name }}"><button>Add</button></form>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan=4 class=muted>no plan yet — resolve to compute it</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{# ---------- Policy ---------- #}
+<div class="tabpanel t-policy">
+  <h2>Update policy</h2>
+  <form class=inline method=post action="/r/{{ org }}/{{ repo }}/policy">
+    mode <select name=mode>
+      <option{% if update_mode == "auto" %} selected{% endif %}>auto</option>
+      <option{% if update_mode == "manual" %} selected{% endif %}>manual</option>
+      <option{% if update_mode == "delayed" %} selected{% endif %}>delayed</option>
+    </select>
+    cooldown days <input name=cooldown_days type=number value={{ cooldown_days }} min=0 style=width:5rem>
+    <button>Save</button>
+  </form>
+  <h2>Granted packages</h2>
+  <table>
+    <tr><th>Package</th><th>From</th><th>Policy</th></tr>
+    {% for g in grants %}
+      <tr>
+        <td>{{ g.package }}</td>
+        <td class=muted>{{ g.source_org }}/{{ g.source_repo }}</td>
+        <td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/grant/policy">
+            <input type=hidden name=package value="{{ g.package }}">
+            <select name=mode>
+              <option value=""{% if g.mode.is_empty() %} selected{% endif %}>inherit</option>
+              <option value=auto{% if g.mode == "auto" %} selected{% endif %}>auto</option>
+              <option value=manual{% if g.mode == "manual" %} selected{% endif %}>manual</option>
+              <option value=delayed{% if g.mode == "delayed" %} selected{% endif %}>delayed</option>
+            </select>
+            <input name=cooldown_days type=number min=0 placeholder=cooldown style="width:5em" value="{{ g.cooldown }}">
+            <button>Set</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan=3 class=muted>none</td></tr>
+    {% endfor %}
+  </table>
+  <form class=row method=post action="/r/{{ org }}/{{ repo }}/grant">grant <input name=package placeholder="vendor/name" required> from <input name=from placeholder="org/repo" required> <button>Grant</button></form>
+  {% if org_sets_empty %}
+    <h2>Autogrant</h2><p class=muted>Subscribe to a package set to auto-grant its packages here. No sets yet — create one under <a href="/o/{{ org }}/sets">Package sets</a>.</p>
+  {% else %}
+    <h2>Autogrant</h2>
+    <p class=muted>Subscribe to a package set — every package it resolves to is granted here, auto-growing as the set grows.</p>
+    <table>
+      <tr><th>Set</th><th>Brings in</th><th></th></tr>
+      {% for r in autogrant_rules %}
+        <tr><td>{{ r.set_name }}</td><td>{{ r.count }} package(s)</td><td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/autogrant/remove" onsubmit="return confirm('Un-subscribe from this set?')">
+            <input type=hidden name=id value="{{ r.rid }}"><button>Un-subscribe</button></form></td></tr>
+      {% else %}
+        <tr><td colspan=3 class=muted>not subscribed to any set</td></tr>
+      {% endfor %}
+    </table>
+    <form class=row method=post action="/r/{{ org }}/{{ repo }}/autogrant">
+      subscribe to <select name=set_id>{% for o in set_opts %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}</select> <button>Subscribe</button></form>
+  {% endif %}
+</div>
+
+{# ---------- Tokens + licenses ---------- #}
+<div class="tabpanel t-tokens">
+  <h2 id=tokens>Tokens</h2>
+  <table>
+    <tr><th>Name</th><th>Origin</th><th>Created</th><th>Last used</th><th>Expires</th><th>Policy</th><th></th></tr>
+    {% for t in tokens %}
+      <tr>
+        <td>{% if let Some(l) = t.label %}{{ l }}{% else %}<em>unnamed</em>{% endif %}</td>
+        <td><span class="badge {{ t.origin_tone }}">{{ t.origin }}</span></td>
+        <td>{{ t.created }}</td>
+        <td>{{ t.last }}</td>
+        <td>{% if let Some(d) = t.expires %}{% if t.expired %}<span style="color:#a12">expired {{ d }}</span>{% else %}{{ d }}{% endif %}{% else %}never{% endif %}</td>
+        <td>
+          {% if let Some(l) = t.label %}
+            <form class=inline method=post action="/r/{{ org }}/{{ repo }}/token/policy">
+              <input type=hidden name=label value="{{ l }}">
+              <select name=mode>
+                <option value=""{% if t.mode.is_empty() %} selected{% endif %}>inherit</option>
+                <option value=auto{% if t.mode == "auto" %} selected{% endif %}>auto</option>
+                <option value=manual{% if t.mode == "manual" %} selected{% endif %}>manual</option>
+                <option value=delayed{% if t.mode == "delayed" %} selected{% endif %}>delayed</option>
+              </select>
+              <input name=cooldown_days type=number min=0 placeholder=cooldown style="width:5em" value="{{ t.cooldown }}">
+              <button>Set</button>
+            </form>
+          {% else %}<span class=muted>inherit</span>{% endif %}
+        </td>
+        <td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/token/revoke" onsubmit="return confirm('Revoke this token? Installs using it will stop working.')">
+            <input type=hidden name=id value="{{ t.id }}"><button>Revoke</button></form>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+  <p class=muted>Policy tightens the repo's supply-chain gate for that credential only (e.g. <code>delayed</code> + cooldown for a conservative buyer); it can never loosen it.</p>
+  <form class=row method=post action="/r/{{ org }}/{{ repo }}/token">
+    name <input name=label placeholder="e.g. ci-deploy"> expires in <input name=expires_days type=number min=1 placeholder=days style="width:6em"> days <button>Create token</button></form>
+
+  <h2>License keys</h2>
+  <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs (a date = “updates until”, or ≤ a major version) — it keeps everything in-window forever. Entitling a key to a <strong>set</strong> unlocks every package it resolves to, by reference (auto-grows).</p>
+  <table>
+    <tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Sets</th><th>Policy</th><th>Update bound</th></tr>
+    {% for l in licenses %}
+      <tr>
+        <td>{{ l.buyer }}</td>
+        <td>{{ l.status }}</td>
+        <td>{{ l.packages }}</td>
+        <td>
+          {% for st in l.sets %}<span class=badge>{{ st.name }} <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/set/remove"><input type=hidden name=id value="{{ l.id }}"><input type=hidden name=set_id value="{{ st.set_id }}"><button class=linkbtn title="Revoke set">×</button></form></span> {% endfor %}
+          {% if org_sets_empty %}{% if l.sets.is_empty() %}<span class=muted>—</span>{% endif %}{% else %}
+            <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/set">
+              <input type=hidden name=id value="{{ l.id }}">
+              <select name=set_id>{% for o in org_set_opts %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}</select> <button>Add set</button></form>
+          {% endif %}
+        </td>
+        <td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/policy">
+            <input type=hidden name=id value="{{ l.id }}">
+            <select name=mode>
+              <option value=""{% if l.mode.is_empty() %} selected{% endif %}>inherit</option>
+              <option value=auto{% if l.mode == "auto" %} selected{% endif %}>auto</option>
+              <option value=manual{% if l.mode == "manual" %} selected{% endif %}>manual</option>
+              <option value=delayed{% if l.mode == "delayed" %} selected{% endif %}>delayed</option>
+            </select>
+            <input name=cooldown_days type=number min=0 placeholder=cooldown style="width:5em" value="{{ l.cooldown }}">
+            <button>Set</button>
+          </form>
+        </td>
+        <td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/bound">
+            <input type=hidden name=id value="{{ l.id }}">
+            until <input name=until type=date value="{{ l.until }}" style="width:9em"> or ≤ major <input name=major type=number min=0 placeholder=any style="width:4em" value="{{ l.major }}"> <button>Set</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan=6 class=muted>none</td></tr>
+    {% endfor %}
+  </table>
+  <form class=row method=post action="/r/{{ org }}/{{ repo }}/license">buyer <input name=buyer> packages <input name=packages placeholder="vendor/a vendor/b" required> <button>Issue license</button></form>
+</div>
+
+{# ---------- CI ---------- #}
+<div class="tabpanel t-ci">
+  <h2 id=ci>CI access (OIDC)</h2>
+  <p class=muted>Zero-secret CI: a workflow POSTs its platform OIDC JWT to <code>{{ base }}/oauth/ci</code>; a matching policy mints a short-lived repo token (no stored secret). Bind the <strong>audience</strong> to this repo.</p>
+  <table>
+    <tr><th>Provider</th><th>Issuer</th><th>Audience</th><th>Claims</th><th>Token TTL</th><th></th></tr>
+    {% for c in ci %}
+      <tr>
+        <td><span class="badge slate">{{ c.provider }}</span></td>
+        <td class=mono>{{ c.issuer }}</td>
+        <td class=mono>{{ c.audience }}</td>
+        <td class=mono>{{ c.claims }}</td>
+        <td>{{ c.ttl }}s</td>
+        <td>
+          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/ci/remove" onsubmit="return confirm('Remove this CI policy?')">
+            <input type=hidden name=id value="{{ c.id }}"><button>Remove</button></form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan=6 class=muted>No CI policies yet — add one for zero-secret CI installs.</td></tr>
+    {% endfor %}
+  </table>
+  <form class=row method=post action="/r/{{ org }}/{{ repo }}/ci">
+    provider <select name=provider><option value=github>github</option><option value=gitlab>gitlab</option></select>
+    issuer <input name=issuer placeholder="https://token.actions.githubusercontent.com" required style="width:21em">
+    audience <input name=audience value="{{ base }}/{{ org }}/{{ repo }}" required style="width:16em">
+    claims <input name=claims placeholder="repository=acme/app, ref=refs/heads/main" style="width:20em">
+    TTL(s) <input name=ttl type=number value=900 min=60 style="width:6em">
+    <button>Add policy</button>
+  </form>
+  <pre># GitHub Actions (permissions: id-token: write):
+JWT=$(curl -s "$ACTIONS_ID_TOKEN_REQUEST_URL&amp;audience={{ base }}/{{ org }}/{{ repo }}" -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" | jq -r .value)
+TOKEN=$(curl -s -X POST {{ base }}/oauth/ci -H 'content-type: application/json' -d "{&quot;repository&quot;:&quot;$GITHUB_REPOSITORY&quot;,&quot;jwt&quot;:&quot;$JWT&quot;}" | jq -r .access_token)
+composer config --auth http-basic.{{ host }} token "$TOKEN"</pre>
+</div>
+{% if read_only %}</div>{% endif %}

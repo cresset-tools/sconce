@@ -1,0 +1,10 @@
+<h1>Upstream not added</h1>
+{% if reason == "filter" %}
+  <p>A composer upstream needs a <strong>match</strong> filter (a regex like
+    <code>^vendor/</code>) — an unfiltered registry mirror is refused.</p>
+{% else %}
+  <p>A credential was provided but <code>SCONCE_SECRET_KEY</code> is not set, so it
+    can't be stored encrypted. Add a credential-free upstream, or start the UI with
+    that key set.</p>
+{% endif %}
+<p><a href="/r/{{ org }}/{{ repo }}">← back to {{ org }}/{{ repo }}</a></p>

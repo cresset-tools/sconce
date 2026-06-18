@@ -1,0 +1,5 @@
+# Admin UI templates live in `templates/`. `.html` files get the HTML escaper by
+# default, so every `{{ value }}` is auto-escaped — this is what lets us delete
+# the hand-rolled `esc()` the UI used to sprinkle on every interpolation.
+[general]
+dirs = ["templates"]

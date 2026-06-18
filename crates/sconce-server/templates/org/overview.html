@@ -1,0 +1,36 @@
+<div class=toolbar>
+  <h1>{{ org }}</h1>
+  <div>
+    {% if can_admin %}
+      <a href="/o/{{ org }}/sets"><button>Package sets</button></a>
+      <a href="/o/{{ org }}/settings"><button>Settings</button></a>
+      <a href="/repos/new?org={{ org }}"><button class=primary>+ New repository</button></a>
+    {% endif %}
+  </div>
+</div>
+<table>
+  <tr>
+    <th>Repository</th><th>Visibility</th><th>Packages</th><th>Last sync</th><th>Update mode</th>
+  </tr>
+  {% for r in repos %}
+    <tr>
+      <td>
+        <a href="/r/{{ org }}/{{ r.slug }}">{{ r.slug }}</a>
+        {% if r.broken > 0 %} <span class="badge amber">⚠ {{ r.broken }}</span>{% endif %}
+      </td>
+      <td>
+        {% if r.private %}<span class="badge slate">private</span>
+        {% else %}<span class="badge blue">public-only</span>{% endif %}
+      </td>
+      <td>{{ r.packages }}</td>
+      <td class=muted>{{ r.last_sync }}</td>
+      <td>{{ r.update_mode }}</td>
+    </tr>
+  {% else %}
+    <tr>
+      <td colspan=5 class=muted>
+        No repositories yet{% if can_admin %} — <a href="/repos/new?org={{ org }}">create one</a>{% endif %}.
+      </td>
+    </tr>
+  {% endfor %}
+</table>

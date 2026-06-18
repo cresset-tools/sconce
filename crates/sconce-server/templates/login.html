@@ -1,0 +1,45 @@
+{% import "icons.html" as icons %}
+<div class=authwrap><div class=authcard>
+  <div class=authbrand>
+    <a class=brand href=/><span class=brandmark>{% call icons::mark() %}{% endcall %}</span> <span>Bougie&nbsp;Repo</span></a>
+    <div class=authpitch>
+      <h2>Vet every release before it reaches your builds.</h2>
+      <ul>
+        <li>Per-version cooldown &amp; approval queue</li>
+        <li>Security holds on compromised upstreams</li>
+        <li>Scoped, deprovisionable credentials</li>
+      </ul>
+    </div>
+    <div class=authengine>powered by the sconce engine</div>
+  </div>
+  <div class=authpane>
+    <h1>Sign in</h1><p class=authsub>to your Bougie Repo dashboard</p>
+    {% if sso_enabled %}
+      {% if has_default %}
+        <a class=ssobtn href="/auth/start"><svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=#5a4ff0 stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M15 7h3a4 4 0 0 1 0 8h-3M9 7H6a4 4 0 0 0 0 8h3M8 11h8"></path></svg><span>Sign in with SSO</span></a>
+      {% endif %}
+      <form class=authform method=post action=/auth/route style="margin-top:14px">
+        <div><label>Organization email</label>
+          <div class=orgrow>
+            <input class=mono name=email type=email placeholder="you@acme.com">
+            <button type=submit>Continue</button></div>
+          <p class=ssohint>Routes your domain to its own identity provider.</p></div>
+      </form>
+      <div class=authsep>or with a password</div>
+    {% endif %}
+    <form id=loginform class=authform method=post action=/login>
+      {% if !error.is_empty() %}
+        <div class=errbanner><svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#c0362c stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=9></circle><path d="M12 8v5M12 16h0"></path></svg><span>{{ error }}</span></div>
+      {% endif %}
+      <div><label>Email</label>
+        <input class=mono name=email type=email placeholder="you@studio.com" required autofocus></div>
+      <div>
+        <div class=pwhead><label>Password</label><a class=forgot href="/login">Forgot?</a></div>
+        <div class=pwwrap>
+          <input name=password type=password placeholder="••••••••" required>
+          <button type=button id=pwtoggle class=pwtoggle>Show</button></div></div>
+      <button id=loginsubmit class=primary type=submit>Sign in</button>
+    </form>
+    <script src=/assets/login.js></script>
+  </div>
+</div></div>

@@ -1,0 +1,33 @@
+<div class=repohead>
+  <h1 class=mono>{{ pkg }}</h1>
+  <span class="badge {{ life_tone }}">{{ life_label }}</span>{% if let Some(r) = life_reason %} <span class=muted>{{ r }}</span>{% endif %}
+  <a class=muted style="font-size:.85rem" href="/r/{{ org }}/{{ repo }}">← {{ org }}/{{ repo }}</a>
+</div>
+<p class=summary>{{ visibility }} · {{ nver }} version(s) · last sync {{ last }}</p>
+{% if let Some(av) = action_value %}
+  <form class=inline method=post action="/r/{{ org }}/{{ repo }}/package/archive">
+    <input type=hidden name=package value="{{ pkg }}"><button name=action value={{ av }}>{{ action_label }}</button></form>
+{% endif %}
+{% if let Some(e) = sync_error %}<p class=muted>Last sync error: <code>{{ e }}</code></p>{% endif %}
+<h2>Versions</h2>
+<table>
+  <tr><th>Version</th><th>State</th><th>Released</th><th>Dist sha1</th><th>Source</th><th>Actions</th></tr>
+  {% for v in versions %}
+    <tr>
+      <td class=mono>{{ v.version }}</td>
+      <td><span class="badge {{ v.badge_tone }}">{{ v.badge_label }}</span></td>
+      <td class=muted>{{ v.released }}</td>
+      <td class=mono style="font-size:11px">{{ v.sha }}</td>
+      <td class=mono style="font-size:11px">{{ v.src }}</td>
+      <td>
+        <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version">
+          <input type=hidden name=package value="{{ pkg }}">
+          <input type=hidden name=normalized value="{{ v.normalized }}">
+          <button name=action value={% if v.held %}unhold{% else %}hold{% endif %}>{% if v.held %}Unhold{% else %}Hold{% endif %}</button>
+          <button name=action value=approve>Approve</button>
+          <button name=action value={% if v.yanked %}unyank{% else %}yank{% endif %}>{% if v.yanked %}Unyank{% else %}Yank{% endif %}</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+</table>

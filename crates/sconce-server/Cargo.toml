@@ -25,6 +25,9 @@ openidconnect = { workspace = true }
 # CI OIDC token exchange (validate platform JWTs + fetch JWKS).
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
+# Admin UI: compile-time, auto-escaping HTML templates + axum IntoResponse glue.
+askama = { workspace = true }
+askama_web = { workspace = true }
 
 [lints]
 workspace = true

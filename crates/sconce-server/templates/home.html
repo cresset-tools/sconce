@@ -1,0 +1,75 @@
+{% import "icons.html" as icons %}
+<div class=homehead>
+  <div>
+    <h1>{{ greeting }}</h1>
+    <div class=homesub>
+      <p>Organizations and repositories you can access.</p>
+      {% if attention > 0 %}
+        <span class=attention>{% call icons::warn() %}{% endcall %}{{ attention }} package{% if attention != 1 %}s{% endif %} need attention</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class=acts>
+    {% if can_new_org %}<a href=/orgs/new><button>New organization</button></a>{% endif %}
+    {% if can_new_repo %}<a href=/repos/new><button class=primary>+ New repository</button></a>{% endif %}
+  </div>
+</div>
+<div class=homegrid>
+  <div class=homeorgs>
+    {% if orgs.is_empty() %}<p class=muted>No organizations you can access yet.</p>{% endif %}
+    {% for o in orgs %}
+      <div class=homecard>
+        <div class=homecard-h>
+          <span class=orgicon>{% call icons::org_hex() %}{% endcall %}</span>
+          <a class=nm href="/o/{{ o.slug }}">{{ o.name }}</a>
+          <span class=sl>{{ o.slug }}</span>
+        </div>
+        {% if o.repos.is_empty() %}
+          <div class=homeempty>
+            <div class=ic>{% call icons::hex_gray() %}{% endcall %}</div>
+            <div class=t>No repositories yet</div>
+            <div class=d>Create one to start mirroring and gating packages.</div>
+            {% if o.can_admin %}<a href="/repos/new?org={{ o.slug }}"><button>Create repository</button></a>{% endif %}
+          </div>
+        {% else %}
+          <div class=hrepohead><span>REPOSITORY</span><span>VISIBILITY</span><span class=num>PACKAGES</span><span class=sync>LAST SYNC</span></div>
+          {% for r in o.repos %}
+            <div class=reporow>
+              <a href="/r/{{ o.slug }}/{{ r.slug }}">{{ r.slug }}</a>
+              <span>{% if r.private %}<span class="badge slate">private</span>{% else %}<span class="badge ok">public</span>{% endif %}</span>
+              <span class=num>{{ r.packages }}</span>
+              <span class=sync><span class="badge {{ r.sync_tone }}">{{ r.sync_label }}</span> {{ r.when }}</span>
+            </div>
+          {% endfor %}
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+  <div class="homecard actcard">
+    <div class=ah><span>Recent activity</span><a href=/activity>View all</a></div>
+    {% if activity.is_empty() %}
+      <div class=actlist><p class=muted style="margin:8px 2px">No activity yet.</p></div>
+    {% else %}
+      <div class=actlist>
+        {% for a in activity %}
+          <div class=actitem>
+            <span class=ic style="background:{{ a.ic_bg }}">
+              {% if a.icon == "spinner" %}<span class=spinner></span>
+              {% else if a.icon == "check" %}{% call icons::check() %}{% endcall %}
+              {% else if a.icon == "x" %}{% call icons::x() %}{% endcall %}
+              {% else %}{% call icons::dot() %}{% endcall %}{% endif %}
+            </span>
+            <div class=tx>
+              <div class=tt>{{ a.kind }}{% if let Some(t) = a.target %} <span class=mono>{{ t }}</span>{% endif %}</div>
+              {% if a.failed %}
+                <div class="mt fail">{% if let Some(r) = a.repo %}{{ r }} · {% endif %}failed · {{ a.err }}</div>
+              {% else %}
+                <div class=mt>{% if let Some(r) = a.repo %}{{ r }} · {% endif %}{{ a.status }} · {{ a.when }}</div>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+</div>

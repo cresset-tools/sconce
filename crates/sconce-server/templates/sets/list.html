@@ -1,0 +1,20 @@
+<div class=toolbar>
+  <h1>Package sets</h1>
+  <a href="/o/{{ org }}"><button>← {{ org }}</button></a>
+</div>
+<p class=muted>A named group of packages — explicit members plus glob rules
+  (<code>vendor/*</code>, auto-including matching packages added later).
+  Reused by license entitlements and grants.</p>
+<table>
+  <tr><th>Set</th><th>Packages</th></tr>
+  {% for st in sets %}
+    <tr>
+      <td><a href="/o/{{ org }}/sets/{{ st.id }}">{{ st.name }}</a></td>
+      <td>{{ st.count }} package(s)</td>
+    </tr>
+  {% else %}
+    <tr><td colspan=2 class=muted>No package sets yet.</td></tr>
+  {% endfor %}
+</table>
+<form class=row method=post action="/o/{{ org }}/sets">
+  name <input name=name placeholder="e.g. Pro edition" required> <button>Create set</button></form>
