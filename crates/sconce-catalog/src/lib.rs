@@ -1853,25 +1853,30 @@ impl Catalog {
 
     /// Consume a login flow: atomically fetch + delete it, returning
     /// `(conn_id, nonce, pkce_verifier, redirect_to)`. `None` if unknown/expired.
+    ///
+    /// The row is deleted **regardless of expiry** — consuming an expired flow
+    /// still cleans it up (so expired rows don't accumulate, and a stale `state`
+    /// can be reused) — but an expired flow returns `None`, never its payload.
     pub async fn consume_oidc_flow(
         &self,
         state: &str,
     ) -> Result<Option<(Option<Uuid>, String, String, String)>, sqlx::Error> {
         let row = sqlx::query(
-            "delete from oidc_flows where state = $1 and expires_at > now() \
-             returning conn_id, nonce, pkce_verifier, redirect_to",
+            "delete from oidc_flows where state = $1 \
+             returning conn_id, nonce, pkce_verifier, redirect_to, expires_at > now() as fresh",
         )
         .bind(state)
         .fetch_optional(&self.pool)
         .await?;
         Ok(match row {
-            Some(r) => Some((
+            Some(r) if r.try_get::<bool, _>("fresh")? => Some((
                 r.try_get("conn_id")?,
                 r.try_get("nonce")?,
                 r.try_get("pkce_verifier")?,
                 r.try_get("redirect_to")?,
             )),
-            None => None,
+            // Unknown state, or it existed but had expired (now deleted).
+            _ => None,
         })
     }
 
@@ -4843,9 +4848,14 @@ mod tests {
             Some(got.id)
         );
 
+        // Process-unique state keys so re-runs (and parallel test binaries
+        // sharing the DB) never collide on the oidc_flows primary key.
+        let ok_state = format!("state-ok-{}", std::process::id());
+        let exp_state = format!("state-exp-{}", std::process::id());
+
         // Flow create → consume (single-use, carries conn_id) → gone.
         cat.create_oidc_flow(
-            "state-1",
+            &ok_state,
             Some(got.id),
             "nonce-1",
             "verifier-1",
@@ -4854,7 +4864,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let f = cat.consume_oidc_flow("state-1").await.unwrap().unwrap();
+        let f = cat.consume_oidc_flow(&ok_state).await.unwrap().unwrap();
         assert_eq!(
             f,
             (
@@ -4865,15 +4875,20 @@ mod tests {
             )
         );
         assert!(
-            cat.consume_oidc_flow("state-1").await.unwrap().is_none(),
+            cat.consume_oidc_flow(&ok_state).await.unwrap().is_none(),
             "single-use"
         );
 
-        // Expired flow is not consumable.
-        cat.create_oidc_flow("state-exp", None, "n", "v", "/", -1)
+        // Expired flow is not consumable — and consuming it deletes the row, so a
+        // second consume still finds nothing (no stale rows accumulate).
+        cat.create_oidc_flow(&exp_state, None, "n", "v", "/", -1)
             .await
             .unwrap();
-        assert!(cat.consume_oidc_flow("state-exp").await.unwrap().is_none());
+        assert!(cat.consume_oidc_flow(&exp_state).await.unwrap().is_none());
+        assert!(
+            cat.consume_oidc_flow(&exp_state).await.unwrap().is_none(),
+            "expired flow was cleaned up on the first consume"
+        );
 
         // JIT user: idempotent by email, superadmin updatable.
         let id1 = cat
