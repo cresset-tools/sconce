@@ -95,14 +95,19 @@ mod tests {
     use super::*;
 
     fn test_key() -> SecretKey {
-        SecretKey::from_base64(&base64::engine::general_purpose::STANDARD.encode([7u8; 32])).unwrap()
+        SecretKey::from_base64(&base64::engine::general_purpose::STANDARD.encode([7u8; 32]))
+            .unwrap()
     }
 
     #[test]
     fn round_trips() {
         let key = test_key();
         let ct = key.encrypt(b"oauth2:glpat-secret");
-        assert_ne!(&ct[24..], b"oauth2:glpat-secret", "ciphertext is not plaintext");
+        assert_ne!(
+            &ct[24..],
+            b"oauth2:glpat-secret",
+            "ciphertext is not plaintext"
+        );
         assert_eq!(key.decrypt(&ct).unwrap(), b"oauth2:glpat-secret");
     }
 
@@ -115,8 +120,9 @@ mod tests {
     #[test]
     fn wrong_key_fails() {
         let a = test_key();
-        let b = SecretKey::from_base64(&base64::engine::general_purpose::STANDARD.encode([9u8; 32]))
-            .unwrap();
+        let b =
+            SecretKey::from_base64(&base64::engine::general_purpose::STANDARD.encode([9u8; 32]))
+                .unwrap();
         let ct = a.encrypt(b"secret");
         assert!(matches!(b.decrypt(&ct), Err(SecretError::Decrypt)));
     }

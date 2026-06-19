@@ -105,7 +105,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0022_org_roles.sql"),
     ),
     ("0023_scim", include_str!("../migrations/0023_scim.sql")),
-    ("0024_ci_oidc", include_str!("../migrations/0024_ci_oidc.sql")),
+    (
+        "0024_ci_oidc",
+        include_str!("../migrations/0024_ci_oidc.sql"),
+    ),
     (
         "0025_package_lifecycle",
         include_str!("../migrations/0025_package_lifecycle.sql"),
@@ -137,6 +140,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0032_set_entitlements",
         include_str!("../migrations/0032_set_entitlements.sql"),
+    ),
+    (
+        "0033_upstream_requires",
+        include_str!("../migrations/0033_upstream_requires.sql"),
+    ),
+    (
+        "0034_source_paths",
+        include_str!("../migrations/0034_source_paths.sql"),
     ),
 ];
 
@@ -206,6 +217,72 @@ impl Visibility {
     }
 }
 
+/// One entry of an upstream's mirror subscription (require-list). A package is
+/// mirrored iff it matches **any** entry; a version is kept iff it satisfies the
+/// floor of at least one matching entry. `match_kind`: `prefix`|`exact`|`all`|`regex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamRequire {
+    pub match_kind: String,
+    pub pattern: String,
+    /// Bare version floor (e.g. `2.4`); `None` = every version.
+    pub version_floor: Option<String>,
+}
+
+impl UpstreamRequire {
+    /// Parse one subscription-entry spec (the CLI `--require` / UI textarea form):
+    /// `vendor/*` or `vendor/` (prefix), `vendor/pkg` (exact), `*` (require-all),
+    /// `re:<regex>` (regex); any may carry an `@<version>` floor suffix. Returns a
+    /// human message on a malformed spec.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let spec = spec.trim();
+        let (matcher, floor) = match spec.split_once('@') {
+            Some((m, f)) if !f.trim().is_empty() => (m.trim(), Some(f.trim().to_owned())),
+            _ => (spec.trim_end_matches('@').trim(), None),
+        };
+        let (match_kind, pattern) = if matcher == "*" {
+            ("all", String::new())
+        } else if let Some(re) = matcher.strip_prefix("re:") {
+            if re.is_empty() {
+                return Err(format!("empty regex in '{spec}'"));
+            }
+            ("regex", re.to_owned())
+        } else if matcher.is_empty() {
+            return Err(format!("empty match in '{spec}'"));
+        } else if let Some(stem) = matcher.strip_suffix('*') {
+            // A trailing star is a prefix glob: `mage-os/*`, `mage-os/composer*`.
+            ("prefix", stem.to_owned())
+        } else if matcher.ends_with('/') {
+            // A bare vendor (`mage-os/`) is shorthand for the vendor prefix.
+            ("prefix", matcher.to_owned())
+        } else {
+            ("exact", matcher.to_owned())
+        };
+        Ok(Self {
+            match_kind: match_kind.to_owned(),
+            pattern,
+            version_floor: floor,
+        })
+    }
+
+    /// Render back to the canonical spec form (inverse of [`parse`](Self::parse)).
+    #[must_use]
+    pub fn to_spec(&self) -> String {
+        let matcher = match self.match_kind.as_str() {
+            "all" => "*".to_owned(),
+            "regex" => format!("re:{}", self.pattern),
+            // A vendor prefix keeps its trailing slash; any other prefix shows
+            // the `*` so it round-trips back to a prefix (not an exact match).
+            "prefix" if self.pattern.ends_with('/') => self.pattern.clone(),
+            "prefix" => format!("{}*", self.pattern),
+            _ => self.pattern.clone(),
+        };
+        match &self.version_floor {
+            Some(f) => format!("{matcher}@{f}"),
+            None => matcher,
+        }
+    }
+}
+
 /// An upstream in the admin listing — no secret material, just whether one
 /// exists (`has_credential`).
 #[derive(Debug, Clone)]
@@ -218,8 +295,11 @@ pub struct UpstreamSummary {
     pub has_credential: bool,
     /// How the credential authenticates: `basic`|`github`|`gitlab`|`bearer`.
     pub credential_type: String,
-    /// Composer-only: regex scoping which packages a sync mirrors (`None` = all).
-    pub package_filter: Option<String>,
+    /// Mirror subscription: the ordered require-list scoping what this upstream
+    /// mirrors (empty = nothing matched yet / git source mirrored whole).
+    pub requires: Vec<UpstreamRequire>,
+    /// git monorepo subpaths this upstream mirrors (empty = repo root).
+    pub source_paths: Vec<String>,
     /// Status of the most recent mirror job, if any (`pending`/`running`/
     /// `ready`/`failed`).
     pub job_status: Option<String>,
@@ -331,8 +411,13 @@ pub struct UpstreamRow {
     pub credential: Option<Vec<u8>>,
     /// How to present the credential when cloning: `basic`|`github`|`gitlab`|`bearer`.
     pub credential_type: String,
-    /// Composer-only: regex scoping which packages a sync mirrors (`None` = all).
-    pub package_filter: Option<String>,
+    /// Mirror subscription (ordered require-list). For a composer upstream this
+    /// scopes which packages sync (must be non-empty); for a git upstream it is
+    /// an optional per-package version floor (empty = mirror every tag).
+    pub requires: Vec<UpstreamRequire>,
+    /// Explicit subpaths a git upstream mirrors (monorepo packages). Empty =
+    /// mirror the repo root as a single package. Unused for composer upstreams.
+    pub source_paths: Vec<String>,
 }
 
 /// Repo-level settings. Token fields are tighten-only *overrides* (`None` =
@@ -551,10 +636,11 @@ impl PolicyOverride {
             _ => 0,
         };
         let ovr_cooldown = self.cooldown_days.unwrap_or(0);
-        let ovr_mode = self
-            .update_mode
-            .as_deref()
-            .or(if ovr_cooldown > 0 { Some("delayed") } else { None });
+        let ovr_mode = self.update_mode.as_deref().or(if ovr_cooldown > 0 {
+            Some("delayed")
+        } else {
+            None
+        });
         let mode = match ovr_mode {
             Some(m) if rank(m) > rank(repo_mode) => m.to_owned(),
             _ => repo_mode.to_owned(),
@@ -873,7 +959,11 @@ impl Catalog {
                     .bind(new_slug)
                     .fetch_one(&self.pool)
                     .await?;
-            return Err(if live { RenameError::Taken } else { RenameError::Retired });
+            return Err(if live {
+                RenameError::Taken
+            } else {
+                RenameError::Retired
+            });
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -949,7 +1039,11 @@ impl Catalog {
             .bind(new_slug)
             .fetch_one(&self.pool)
             .await?;
-            return Err(if live { RenameError::Taken } else { RenameError::Retired });
+            return Err(if live {
+                RenameError::Taken
+            } else {
+                RenameError::Retired
+            });
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -1272,10 +1366,12 @@ impl Catalog {
         .bind(package)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map_or_else(PolicyOverride::default, |r| PolicyOverride {
-            update_mode: r.try_get("update_mode").ok().flatten(),
-            cooldown_days: r.try_get("cooldown_days").ok().flatten(),
-        }))
+        Ok(
+            row.map_or_else(PolicyOverride::default, |r| PolicyOverride {
+                update_mode: r.try_get("update_mode").ok().flatten(),
+                cooldown_days: r.try_get("cooldown_days").ok().flatten(),
+            }),
+        )
     }
 
     /// Set (or clear) the grant-scoped policy for a granted package, by repo +
@@ -1646,8 +1742,7 @@ impl Catalog {
         Ok(())
     }
 
-    const OIDC_SELECT: &'static str =
-        "select c.id, o.slug as org_slug, c.issuer_url, c.client_id, c.client_secret, \
+    const OIDC_SELECT: &'static str = "select c.id, o.slug as org_slug, c.issuer_url, c.client_id, c.client_secret, \
                 c.redirect_url, c.scopes, c.allowed_domains, c.admin_domains \
          from oidc_connections c left join organizations o on o.id = c.org_id";
 
@@ -1867,12 +1962,13 @@ impl Catalog {
         user_id: Uuid,
         active: bool,
     ) -> Result<bool, sqlx::Error> {
-        let done = sqlx::query("update user_tenants set active = $3 where org_id = $1 and user_id = $2")
-            .bind(org_id)
-            .bind(user_id)
-            .bind(active)
-            .execute(&self.pool)
-            .await?;
+        let done =
+            sqlx::query("update user_tenants set active = $3 where org_id = $1 and user_id = $2")
+                .bind(org_id)
+                .bind(user_id)
+                .bind(active)
+                .execute(&self.pool)
+                .await?;
         Ok(done.rows_affected() > 0)
     }
 
@@ -2155,7 +2251,11 @@ impl Catalog {
     }
 
     /// Delete a package set (cascades members + rules).
-    pub async fn delete_package_set(&self, org_id: Uuid, set_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn delete_package_set(
+        &self,
+        org_id: Uuid,
+        set_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
         let n = sqlx::query("delete from package_sets where id = $1 and org_id = $2")
             .bind(set_id)
             .bind(org_id)
@@ -2241,7 +2341,11 @@ impl Catalog {
     }
 
     /// Remove an explicit member from a set.
-    pub async fn remove_set_member(&self, set_id: Uuid, package_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn remove_set_member(
+        &self,
+        set_id: Uuid,
+        package_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("delete from package_set_members where set_id = $1 and package_id = $2")
             .bind(set_id)
             .bind(package_id)
@@ -2252,11 +2356,13 @@ impl Catalog {
 
     /// Add a glob rule to a set, returning its id.
     pub async fn add_set_rule(&self, set_id: Uuid, glob: &str) -> Result<Uuid, sqlx::Error> {
-        sqlx::query_scalar("insert into package_set_rules (set_id, glob) values ($1, $2) returning id")
-            .bind(set_id)
-            .bind(glob.trim())
-            .fetch_one(&self.pool)
-            .await
+        sqlx::query_scalar(
+            "insert into package_set_rules (set_id, glob) values ($1, $2) returning id",
+        )
+        .bind(set_id)
+        .bind(glob.trim())
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Remove a glob rule by id.
@@ -2338,13 +2444,12 @@ impl Catalog {
 
     /// Un-archive a package: resume syncing (health is re-detected on next sync).
     pub async fn unarchive_package(&self, repo_id: Uuid, name: &str) -> Result<bool, sqlx::Error> {
-        let n = sqlx::query(
-            "update packages set archived_at = null where repo_id = $1 and name = $2",
-        )
-        .bind(repo_id)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
+        let n =
+            sqlx::query("update packages set archived_at = null where repo_id = $1 and name = $2")
+                .bind(repo_id)
+                .bind(name)
+                .execute(&self.pool)
+                .await?;
         Ok(n.rows_affected() > 0)
     }
 
@@ -2596,7 +2701,7 @@ impl Catalog {
     pub async fn list_upstreams(&self, repo_id: Uuid) -> Result<Vec<UpstreamSummary>, sqlx::Error> {
         let rows = sqlx::query(
             "select u.id, u.kind, u.base, u.visibility, u.label, \
-                    (u.credential is not null) as has_credential, u.credential_type, u.package_filter, \
+                    (u.credential is not null) as has_credential, u.credential_type, \
                     j.status as job_status, j.last_error as job_error, \
                     extract(epoch from (now() - j.created_at))::bigint as last_sync_age \
              from upstreams u \
@@ -2609,17 +2714,58 @@ impl Catalog {
         .bind(repo_id)
         .fetch_all(&self.pool)
         .await?;
+        // The require-lists for every upstream in this repo, in one query, grouped
+        // by upstream so the listing avoids an N+1.
+        let req_rows = sqlx::query(
+            "select ur.upstream_id, ur.match_kind, ur.pattern, ur.version_floor \
+             from upstream_requires ur join upstreams u on u.id = ur.upstream_id \
+             where u.repo_id = $1 order by ur.position, ur.created_at",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_upstream: std::collections::HashMap<Uuid, Vec<UpstreamRequire>> =
+            std::collections::HashMap::new();
+        for r in &req_rows {
+            by_upstream
+                .entry(r.try_get("upstream_id")?)
+                .or_default()
+                .push(UpstreamRequire {
+                    match_kind: r.try_get("match_kind")?,
+                    pattern: r.try_get("pattern")?,
+                    version_floor: r.try_get("version_floor")?,
+                });
+        }
+        // Likewise the monorepo source-paths for every upstream in the repo.
+        let sp_rows = sqlx::query(
+            "select sp.upstream_id, sp.source_path \
+             from upstream_source_paths sp join upstreams u on u.id = sp.upstream_id \
+             where u.repo_id = $1 order by sp.source_path",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut paths_by_upstream: std::collections::HashMap<Uuid, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &sp_rows {
+            paths_by_upstream
+                .entry(r.try_get("upstream_id")?)
+                .or_default()
+                .push(r.try_get("source_path")?);
+        }
         rows.iter()
             .map(|r| {
+                let id: Uuid = r.try_get("id")?;
                 Ok(UpstreamSummary {
-                    id: r.try_get("id")?,
+                    id,
                     kind: r.try_get("kind")?,
                     base: r.try_get("base")?,
                     visibility: r.try_get("visibility")?,
                     label: r.try_get("label")?,
                     has_credential: r.try_get("has_credential")?,
                     credential_type: r.try_get("credential_type")?,
-                    package_filter: r.try_get("package_filter")?,
+                    requires: by_upstream.remove(&id).unwrap_or_default(),
+                    source_paths: paths_by_upstream.remove(&id).unwrap_or_default(),
                     job_status: r.try_get("job_status")?,
                     job_error: r.try_get("job_error")?,
                     last_sync_age: r.try_get("last_sync_age").ok().flatten(),
@@ -2629,17 +2775,19 @@ impl Catalog {
     }
 
     /// Load one upstream (with its encrypted credential) for mirroring.
-    pub async fn get_upstream(&self, upstream_id: Uuid) -> Result<Option<UpstreamRow>, sqlx::Error> {
+    pub async fn get_upstream(
+        &self,
+        upstream_id: Uuid,
+    ) -> Result<Option<UpstreamRow>, sqlx::Error> {
         let row = sqlx::query(
-            "select id, repo_id, kind, base, visibility, credential, credential_type, package_filter \
+            "select id, repo_id, kind, base, visibility, credential, credential_type \
              from upstreams where id = $1",
         )
         .bind(upstream_id)
         .fetch_optional(&self.pool)
         .await?;
         let Some(r) = row else { return Ok(None) };
-        let visibility = Visibility::parse(r.try_get("visibility")?)
-            .unwrap_or(Visibility::Private);
+        let visibility = Visibility::parse(r.try_get("visibility")?).unwrap_or(Visibility::Private);
         Ok(Some(UpstreamRow {
             id: r.try_get("id")?,
             repo_id: r.try_get("repo_id")?,
@@ -2648,8 +2796,32 @@ impl Catalog {
             visibility,
             credential: r.try_get("credential")?,
             credential_type: r.try_get("credential_type")?,
-            package_filter: r.try_get("package_filter")?,
+            requires: self.list_upstream_requires(upstream_id).await?,
+            source_paths: self.list_upstream_source_paths(upstream_id).await?,
         }))
+    }
+
+    /// An upstream's mirror subscription (require-list), in order.
+    pub async fn list_upstream_requires(
+        &self,
+        upstream_id: Uuid,
+    ) -> Result<Vec<UpstreamRequire>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select match_kind, pattern, version_floor from upstream_requires \
+             where upstream_id = $1 order by position, created_at",
+        )
+        .bind(upstream_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(UpstreamRequire {
+                    match_kind: r.try_get("match_kind")?,
+                    pattern: r.try_get("pattern")?,
+                    version_floor: r.try_get("version_floor")?,
+                })
+            })
+            .collect()
     }
 
     /// Remove an upstream, scoped to its repo. Returns whether one was removed.
@@ -2667,19 +2839,46 @@ impl Catalog {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Set (or clear) a composer upstream's package-filter regex, repo-scoped.
-    pub async fn set_upstream_filter(
+    /// Replace an upstream's mirror subscription (require-list) wholesale,
+    /// repo-scoped (a no-op if the upstream isn't in `repo_id`). Entries are
+    /// stored in the given order.
+    pub async fn set_upstream_requires(
         &self,
         repo_id: Uuid,
         upstream_id: Uuid,
-        filter: Option<&str>,
+        requires: &[UpstreamRequire],
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("update upstreams set package_filter = $3 where repo_id = $1 and id = $2")
-            .bind(repo_id)
+        let mut tx = self.pool.begin().await?;
+        // Scope the write to the repo: only proceed if the upstream belongs to it.
+        let owned: Option<Uuid> =
+            sqlx::query_scalar("select id from upstreams where id = $1 and repo_id = $2")
+                .bind(upstream_id)
+                .bind(repo_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owned.is_none() {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        sqlx::query("delete from upstream_requires where upstream_id = $1")
             .bind(upstream_id)
-            .bind(filter)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        for (pos, req) in requires.iter().enumerate() {
+            sqlx::query(
+                "insert into upstream_requires \
+                     (upstream_id, position, match_kind, pattern, version_floor) \
+                 values ($1, $2, $3, $4, $5)",
+            )
+            .bind(upstream_id)
+            .bind(i32::try_from(pos).unwrap_or(i32::MAX))
+            .bind(&req.match_kind)
+            .bind(&req.pattern)
+            .bind(req.version_floor.as_deref())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2694,6 +2893,78 @@ impl Catalog {
             .bind(upstream_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Record the subdirectory a (monorepo) package was archived from (`""` =
+    /// repo root). Provenance for the operator + the path the mirror re-archives.
+    pub async fn set_package_source_path(
+        &self,
+        package_id: Uuid,
+        source_path: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("update packages set source_path = $2 where id = $1")
+            .bind(package_id)
+            .bind(source_path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The explicit subpaths a git upstream mirrors (one package each), in a
+    /// stable order. Empty = mirror the repo root as a single package.
+    pub async fn list_upstream_source_paths(
+        &self,
+        upstream_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "select source_path from upstream_source_paths \
+             where upstream_id = $1 order by source_path",
+        )
+        .bind(upstream_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Replace a git upstream's explicit source-path list wholesale, repo-scoped
+    /// (a no-op if the upstream isn't in `repo_id`). Blank paths are dropped and
+    /// duplicates collapsed.
+    pub async fn set_upstream_source_paths(
+        &self,
+        repo_id: Uuid,
+        upstream_id: Uuid,
+        paths: &[String],
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let owned: Option<Uuid> =
+            sqlx::query_scalar("select id from upstreams where id = $1 and repo_id = $2")
+                .bind(upstream_id)
+                .bind(repo_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owned.is_none() {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        sqlx::query("delete from upstream_source_paths where upstream_id = $1")
+            .bind(upstream_id)
+            .execute(&mut *tx)
+            .await?;
+        let mut seen = std::collections::HashSet::new();
+        for p in paths {
+            let p = p.trim().trim_matches('/');
+            if p.is_empty() || !seen.insert(p.to_owned()) {
+                continue;
+            }
+            sqlx::query(
+                "insert into upstream_source_paths (upstream_id, source_path) values ($1, $2)",
+            )
+            .bind(upstream_id)
+            .bind(p)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3334,11 +3605,13 @@ impl Catalog {
         license_id: Uuid,
         set_id: Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("delete from license_set_entitlements where license_key_id = $1 and set_id = $2")
-            .bind(license_id)
-            .bind(set_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "delete from license_set_entitlements where license_key_id = $1 and set_id = $2",
+        )
+        .bind(license_id)
+        .bind(set_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -3639,10 +3912,12 @@ fn token_hash(token: &str) -> Vec<u8> {
 /// Lowercase hex of bytes (matches Postgres `encode(_, 'hex')`).
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Hash a (low-entropy) user password with argon2 → a PHC string for storage.
@@ -3869,6 +4144,7 @@ mod tests {
     /// The supply-chain controls, now per-repo: cooldown hides fresh releases,
     /// holds hide any version, approval reveals early.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn cooldown_hold_and_approval_gate_visibility() {
         let Some((cat, repo_id)) = repo().await else {
             return;
@@ -3920,7 +4196,11 @@ mod tests {
         let p = "acme/lib";
 
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "auto", 0, None, None)
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0", "1.1.0.0"]
         );
         assert_eq!(
@@ -3942,18 +4222,30 @@ mod tests {
             ["1.0.0.0", "1.1.0.0"]
         );
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "manual", 0, None, None).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "manual", 0, None, None)
+                    .await
+                    .unwrap()
+            ),
             ["1.1.0.0"]
         );
 
         assert!(cat.hold_version(repo_id, p, "1.0.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "auto", 0, None, None)
+                    .await
+                    .unwrap()
+            ),
             ["1.1.0.0"]
         );
         assert!(cat.unhold_version(repo_id, p, "1.0.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "auto", 0, None, None)
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0", "1.1.0.0"]
         );
 
@@ -3961,7 +4253,11 @@ mod tests {
         // prior approval doesn't override a yank. Un-yank reinstates it.
         assert!(cat.yank_version(repo_id, p, "1.1.0.0").await.unwrap());
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "auto", 0, None, None)
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0"]
         );
         assert!(cat.unyank_version(repo_id, p, "1.1.0.0").await.unwrap());
@@ -3971,16 +4267,32 @@ mod tests {
         // ~7 days to go. (We set this repo's policy so admin_package_versions
         // computes against the real cooldown_days.)
         cat.set_update_policy(repo_id, "delayed", 7).await.unwrap();
-        let av = cat.admin_package_versions(repo_id, 1000, 0, None, None).await.unwrap();
-        let old = av.iter().find(|v| v.normalized_version == "1.0.0.0").unwrap();
-        let fresh = av.iter().find(|v| v.normalized_version == "1.1.0.0").unwrap();
-        assert_eq!(old.cooldown_days_left, Some(0), "30-day-old is past cooldown");
+        let av = cat
+            .admin_package_versions(repo_id, 1000, 0, None, None)
+            .await
+            .unwrap();
+        let old = av
+            .iter()
+            .find(|v| v.normalized_version == "1.0.0.0")
+            .unwrap();
+        let fresh = av
+            .iter()
+            .find(|v| v.normalized_version == "1.1.0.0")
+            .unwrap();
+        assert_eq!(
+            old.cooldown_days_left,
+            Some(0),
+            "30-day-old is past cooldown"
+        );
         assert!(
             matches!(fresh.cooldown_days_left, Some(n) if (1..=7).contains(&n)),
             "fresh release counts down (got {:?})",
             fresh.cooldown_days_left
         );
-        assert!(fresh.approved, "approved flag surfaces in the operator view");
+        assert!(
+            fresh.approved,
+            "approved flag surfaces in the operator view"
+        );
     }
 
     #[tokio::test]
@@ -4007,19 +4319,31 @@ mod tests {
 
         // A bare cooldown override implies `delayed` (cooldown is meaningless
         // under auto) and tightens auto -> delayed/30.
-        let cd30 = PolicyOverride { update_mode: None, cooldown_days: Some(30) };
+        let cd30 = PolicyOverride {
+            update_mode: None,
+            cooldown_days: Some(30),
+        };
         assert_eq!(cd30.effective("auto", 0), ("delayed".to_owned(), 30));
 
         // mode tighten: auto -> manual.
-        let man = PolicyOverride { update_mode: Some("manual".into()), cooldown_days: None };
+        let man = PolicyOverride {
+            update_mode: Some("manual".into()),
+            cooldown_days: None,
+        };
         assert_eq!(man.effective("auto", 0), ("manual".to_owned(), 0));
 
         // Tighten-only: a looser override can NEVER weaken the repo default.
-        let loose = PolicyOverride { update_mode: Some("auto".into()), cooldown_days: Some(1) };
+        let loose = PolicyOverride {
+            update_mode: Some("auto".into()),
+            cooldown_days: Some(1),
+        };
         assert_eq!(loose.effective("manual", 14), ("manual".to_owned(), 14));
 
         // Cooldown takes the max of repo and override.
-        let cd5 = PolicyOverride { update_mode: Some("delayed".into()), cooldown_days: Some(5) };
+        let cd5 = PolicyOverride {
+            update_mode: Some("delayed".into()),
+            cooldown_days: Some(5),
+        };
         assert_eq!(cd5.effective("delayed", 10), ("delayed".to_owned(), 10));
     }
 
@@ -4041,38 +4365,76 @@ mod tests {
         )
         .unwrap();
         let day = 86_400;
-        for (v, n, rel) in [("v1.0.0", "1.0.0.0", now - 30 * day), ("v1.1.0", "1.1.0.0", now)] {
+        for (v, n, rel) in [
+            ("v1.0.0", "1.0.0.0", now - 30 * day),
+            ("v1.1.0", "1.1.0.0", now),
+        ] {
             cat.upsert_package_version(pkg, v, n, "stable", &cj, None, None, None, Some(rel))
                 .await
                 .unwrap();
         }
         let p = "acme/lib";
         // Repo default is `auto`: a plain token sees both versions.
-        let plain = cat.create_token(repo_id, Some("latest"), None).await.unwrap();
-        let pp = cat.resolve_token_policy(repo_id, &plain).await.unwrap().unwrap();
+        let plain = cat
+            .create_token(repo_id, Some("latest"), None)
+            .await
+            .unwrap();
+        let pp = cat
+            .resolve_token_policy(repo_id, &plain)
+            .await
+            .unwrap()
+            .unwrap();
         let (m, c) = pp.effective("auto", 0);
-        assert_eq!(cat.visible_versions(repo_id, p, &m, c, None, None).await.unwrap().len(), 2);
+        assert_eq!(
+            cat.visible_versions(repo_id, p, &m, c, None, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
 
         // A conservative token (delayed/7) on the SAME repo hides the fresh one.
-        let cons = cat.create_token(repo_id, Some("conservative"), None).await.unwrap();
+        let cons = cat
+            .create_token(repo_id, Some("conservative"), None)
+            .await
+            .unwrap();
         assert!(
             cat.set_token_policy(
                 repo_id,
                 "conservative",
-                &PolicyOverride { update_mode: Some("delayed".into()), cooldown_days: Some(7) },
+                &PolicyOverride {
+                    update_mode: Some("delayed".into()),
+                    cooldown_days: Some(7)
+                },
             )
             .await
             .unwrap()
         );
-        let cp = cat.resolve_token_policy(repo_id, &cons).await.unwrap().unwrap();
+        let cp = cat
+            .resolve_token_policy(repo_id, &cons)
+            .await
+            .unwrap()
+            .unwrap();
         let (m2, c2) = cp.effective("auto", 0);
         assert_eq!((m2.as_str(), c2), ("delayed", 7));
-        let vis = cat.visible_versions(repo_id, p, &m2, c2, None, None).await.unwrap();
-        assert_eq!(vis.len(), 1, "conservative credential only sees the aged release");
+        let vis = cat
+            .visible_versions(repo_id, p, &m2, c2, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            vis.len(),
+            1,
+            "conservative credential only sees the aged release"
+        );
         assert_eq!(vis[0].normalized_version, "1.0.0.0");
 
         // An invalid/expired token resolves to no policy at all.
-        assert!(cat.resolve_token_policy(repo_id, "sconce_bogus").await.unwrap().is_none());
+        assert!(
+            cat.resolve_token_policy(repo_id, "sconce_bogus")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4238,12 +4600,28 @@ mod tests {
         };
         // Public upstream, no credential.
         let pubid = cat
-            .create_upstream(repo_id, "composer", "https://repo.packagist.org", Visibility::Public, Some("packagist"), None, "basic")
+            .create_upstream(
+                repo_id,
+                "composer",
+                "https://repo.packagist.org",
+                Visibility::Public,
+                Some("packagist"),
+                None,
+                "basic",
+            )
             .await
             .unwrap();
         // Private upstream with an (already-encrypted) credential blob.
         let privid = cat
-            .create_upstream(repo_id, "git", "https://git/x.git", Visibility::Private, None, Some(b"enc"), "basic")
+            .create_upstream(
+                repo_id,
+                "git",
+                "https://git/x.git",
+                Visibility::Private,
+                None,
+                Some(b"enc"),
+                "basic",
+            )
             .await
             .unwrap();
 
@@ -4272,13 +4650,23 @@ mod tests {
         };
         let _guard = queue_guard().await;
         let up = cat
-            .create_upstream(repo_id, "composer", "https://x", Visibility::Public, None, None, "basic")
+            .create_upstream(
+                repo_id,
+                "composer",
+                "https://x",
+                Visibility::Public,
+                None,
+                None,
+                "basic",
+            )
             .await
             .unwrap();
 
         // Generalized queue: each kind enqueues + claims with its fields.
         cat.enqueue_resolve_closure_job(repo_id).await.unwrap();
-        cat.enqueue_mirror_package_job(up, "vendor/pkg").await.unwrap();
+        cat.enqueue_mirror_package_job(up, "vendor/pkg")
+            .await
+            .unwrap();
         let mut kinds = vec![];
         for _ in 0..2 {
             let j = cat.claim_mirror_job().await.unwrap().unwrap();
@@ -4311,12 +4699,25 @@ mod tests {
                 required_by: Some("x/y".to_owned()),
             },
         ];
-        cat.replace_dependency_plan(repo_id, &entries).await.unwrap();
-        cat.replace_dependency_plan(repo_id, &entries).await.unwrap(); // idempotent
+        cat.replace_dependency_plan(repo_id, &entries)
+            .await
+            .unwrap();
+        cat.replace_dependency_plan(repo_id, &entries)
+            .await
+            .unwrap(); // idempotent
         assert_eq!(cat.list_dependency_plan(repo_id).await.unwrap().len(), 2);
-        let ab = cat.dependency_plan_entry(repo_id, "a/b").await.unwrap().unwrap();
+        let ab = cat
+            .dependency_plan_entry(repo_id, "a/b")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(ab.resolver_upstream_id, Some(up));
-        assert!(cat.dependency_plan_entry(repo_id, "nope/x").await.unwrap().is_none());
+        assert!(
+            cat.dependency_plan_entry(repo_id, "nope/x")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4334,13 +4735,24 @@ mod tests {
 
         // Provision → active member; resolvable by id and userName.
         let uid = cat.scim_provision(org_id, &email).await.unwrap();
-        assert_eq!(cat.scim_member(org_id, uid).await.unwrap(), Some((email.clone(), true)));
-        assert_eq!(cat.scim_member_by_email(org_id, &email).await.unwrap(), Some((uid, true)));
+        assert_eq!(
+            cat.scim_member(org_id, uid).await.unwrap(),
+            Some((email.clone(), true))
+        );
+        assert_eq!(
+            cat.scim_member_by_email(org_id, &email).await.unwrap(),
+            Some((uid, true))
+        );
 
         // The provisioned user has an active membership → a session sees the org.
         let session = cat.create_session(uid, 1).await.unwrap();
         assert!(
-            cat.resolve_session(&session).await.unwrap().unwrap().tenant_org_ids.contains(&org_id)
+            cat.resolve_session(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant_org_ids
+                .contains(&org_id)
         );
 
         // Deactivate (the offboarding action) + revoke sessions.
@@ -4350,11 +4762,19 @@ mod tests {
         assert!(cat.resolve_session(&session).await.unwrap().is_none());
         let s2 = cat.create_session(uid, 1).await.unwrap();
         assert!(
-            !cat.resolve_session(&s2).await.unwrap().unwrap().tenant_org_ids.contains(&org_id),
+            !cat.resolve_session(&s2)
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant_org_ids
+                .contains(&org_id),
             "deactivated membership grants no access"
         );
         // SCIM still reports the user, now inactive.
-        assert_eq!(cat.scim_member(org_id, uid).await.unwrap(), Some((email, false)));
+        assert_eq!(
+            cat.scim_member(org_id, uid).await.unwrap(),
+            Some((email, false))
+        );
     }
 
     #[tokio::test]
@@ -4368,7 +4788,11 @@ mod tests {
         let uid = cat.create_user(&email, "pw", false).await.unwrap();
 
         // Grant as member → membership but not admin.
-        assert!(cat.add_user_to_tenant(&email, &slug, "member").await.unwrap());
+        assert!(
+            cat.add_user_to_tenant(&email, &slug, "member")
+                .await
+                .unwrap()
+        );
         let token = cat.create_session(uid, 1).await.unwrap();
         let au = cat.resolve_session(&token).await.unwrap().unwrap();
         let org_id = au.tenant_org_ids[0];
@@ -4376,7 +4800,11 @@ mod tests {
         assert!(!au.admin_org_ids.contains(&org_id), "member is not admin");
 
         // Upsert to admin → now in admin set.
-        assert!(cat.add_user_to_tenant(&email, &slug, "admin").await.unwrap());
+        assert!(
+            cat.add_user_to_tenant(&email, &slug, "admin")
+                .await
+                .unwrap()
+        );
         let au = cat.resolve_session(&token).await.unwrap().unwrap();
         assert!(au.admin_org_ids.contains(&org_id), "now admin");
     }
@@ -4402,56 +4830,115 @@ mod tests {
         let got = cat.oidc_connection().await.unwrap().unwrap();
         assert_eq!(got.client_id, "sconce");
         assert_eq!(got.client_secret.as_deref(), Some(&b"enc-secret"[..]));
-        assert_eq!(got.allowed_domains.as_deref(), Some(&["acme.com".to_owned()][..]));
+        assert_eq!(
+            got.allowed_domains.as_deref(),
+            Some(&["acme.com".to_owned()][..])
+        );
         assert!(got.org_slug.is_none(), "instance connection");
         // Routing an unknown domain falls back to the instance default.
         assert_eq!(
-            cat.oidc_connection_for_email("x@nowhere.test").await.unwrap(),
+            cat.oidc_connection_for_email("x@nowhere.test")
+                .await
+                .unwrap(),
             Some(got.id)
         );
 
         // Flow create → consume (single-use, carries conn_id) → gone.
-        cat.create_oidc_flow("state-1", Some(got.id), "nonce-1", "verifier-1", "/repos", 600)
-            .await
-            .unwrap();
+        cat.create_oidc_flow(
+            "state-1",
+            Some(got.id),
+            "nonce-1",
+            "verifier-1",
+            "/repos",
+            600,
+        )
+        .await
+        .unwrap();
         let f = cat.consume_oidc_flow("state-1").await.unwrap().unwrap();
         assert_eq!(
             f,
-            (Some(got.id), "nonce-1".to_owned(), "verifier-1".to_owned(), "/repos".to_owned())
+            (
+                Some(got.id),
+                "nonce-1".to_owned(),
+                "verifier-1".to_owned(),
+                "/repos".to_owned()
+            )
         );
-        assert!(cat.consume_oidc_flow("state-1").await.unwrap().is_none(), "single-use");
+        assert!(
+            cat.consume_oidc_flow("state-1").await.unwrap().is_none(),
+            "single-use"
+        );
 
         // Expired flow is not consumable.
-        cat.create_oidc_flow("state-exp", None, "n", "v", "/", -1).await.unwrap();
+        cat.create_oidc_flow("state-exp", None, "n", "v", "/", -1)
+            .await
+            .unwrap();
         assert!(cat.consume_oidc_flow("state-exp").await.unwrap().is_none());
 
         // JIT user: idempotent by email, superadmin updatable.
-        let id1 = cat.find_or_create_sso_user("sso@acme.com", false).await.unwrap();
-        let id2 = cat.find_or_create_sso_user("sso@acme.com", true).await.unwrap();
+        let id1 = cat
+            .find_or_create_sso_user("sso@acme.com", false)
+            .await
+            .unwrap();
+        let id2 = cat
+            .find_or_create_sso_user("sso@acme.com", true)
+            .await
+            .unwrap();
         assert_eq!(id1, id2, "same email = same user");
     }
 
     #[tokio::test]
-    async fn upstream_package_filter_round_trips() {
+    async fn upstream_requires_round_trip() {
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
         let id = cat
-            .create_upstream(repo_id, "composer", "https://repo.mage-os.org", Visibility::Public, None, None, "basic")
+            .create_upstream(
+                repo_id,
+                "composer",
+                "https://repo.mage-os.org",
+                Visibility::Public,
+                None,
+                None,
+                "basic",
+            )
             .await
             .unwrap();
-        // Default: no filter.
-        assert!(cat.get_upstream(id).await.unwrap().unwrap().package_filter.is_none());
-        // Set, then clear.
-        cat.set_upstream_filter(repo_id, id, Some("^mage-os/")).await.unwrap();
-        assert_eq!(
-            cat.get_upstream(id).await.unwrap().unwrap().package_filter.as_deref(),
-            Some("^mage-os/")
+        // Default: an empty subscription.
+        assert!(
+            cat.get_upstream(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .requires
+                .is_empty()
         );
-        let listed = cat.list_upstreams(repo_id).await.unwrap();
-        assert_eq!(listed[0].package_filter.as_deref(), Some("^mage-os/"));
-        cat.set_upstream_filter(repo_id, id, None).await.unwrap();
-        assert!(cat.get_upstream(id).await.unwrap().unwrap().package_filter.is_none());
+        // Set an ordered require-list, then read it back (get + list paths).
+        let reqs = vec![
+            UpstreamRequire {
+                match_kind: "prefix".into(),
+                pattern: "mage-os/".into(),
+                version_floor: Some("2.4".into()),
+            },
+            UpstreamRequire {
+                match_kind: "exact".into(),
+                pattern: "psr/log".into(),
+                version_floor: None,
+            },
+        ];
+        cat.set_upstream_requires(repo_id, id, &reqs).await.unwrap();
+        assert_eq!(cat.get_upstream(id).await.unwrap().unwrap().requires, reqs);
+        assert_eq!(cat.list_upstreams(repo_id).await.unwrap()[0].requires, reqs);
+        // Replace-all wholesale: a new list supersedes the old.
+        cat.set_upstream_requires(repo_id, id, &[]).await.unwrap();
+        assert!(
+            cat.get_upstream(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .requires
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4473,7 +4960,10 @@ mod tests {
             .await
             .unwrap();
         let got = cat.get_upstream(id).await.unwrap().unwrap();
-        assert!(got.credential.is_none(), "public upstream stores no credential");
+        assert!(
+            got.credential.is_none(),
+            "public upstream stores no credential"
+        );
         let listed = cat.list_upstreams(repo_id).await.unwrap();
         assert!(!listed.iter().find(|u| u.id == id).unwrap().has_credential);
     }
@@ -4495,8 +4985,16 @@ mod tests {
         assert!(p.broken_reason.is_none() && p.last_success_at.is_none());
 
         // A terminal failure flags an existing package; a missing one is a no-op.
-        assert!(cat.mark_package_broken(repo_id, name, "source_gone").await.unwrap());
-        assert!(!cat.mark_package_broken(repo_id, "vendor/nope", "x").await.unwrap());
+        assert!(
+            cat.mark_package_broken(repo_id, name, "source_gone")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !cat.mark_package_broken(repo_id, "vendor/nope", "x")
+                .await
+                .unwrap()
+        );
         let p = &cat.list_packages(repo_id).await.unwrap()[0];
         assert_eq!(p.sync_health, "broken");
         assert_eq!(p.broken_reason.as_deref(), Some("source_gone"));
@@ -4510,10 +5008,14 @@ mod tests {
         assert!(p.last_success_at.is_some());
 
         // Archiving masks the broken flag: a later terminal failure won't re-flag.
-        cat.mark_package_broken(repo_id, name, "source_gone").await.unwrap();
+        cat.mark_package_broken(repo_id, name, "source_gone")
+            .await
+            .unwrap();
         assert!(cat.archive_package(repo_id, name).await.unwrap());
         assert!(
-            !cat.mark_package_broken(repo_id, name, "source_gone").await.unwrap(),
+            !cat.mark_package_broken(repo_id, name, "source_gone")
+                .await
+                .unwrap(),
             "archived packages are not re-flagged"
         );
         assert!(cat.list_packages(repo_id).await.unwrap()[0].archived);
@@ -4530,7 +5032,15 @@ mod tests {
         };
         let _guard = queue_guard().await;
         let up = cat
-            .create_upstream(repo_id, "git", "https://git/x.git", Visibility::Private, None, None, "basic")
+            .create_upstream(
+                repo_id,
+                "git",
+                "https://git/x.git",
+                Visibility::Private,
+                None,
+                None,
+                "basic",
+            )
             .await
             .unwrap();
 
@@ -4542,7 +5052,11 @@ mod tests {
         );
 
         // Claim it: status running, attempt 1. No second job is claimable.
-        let job = cat.claim_mirror_job().await.unwrap().expect("a job to claim");
+        let job = cat
+            .claim_mirror_job()
+            .await
+            .unwrap()
+            .expect("a job to claim");
         assert_eq!(job.upstream_id, Some(up));
         assert_eq!(job.kind, "mirror_upstream");
         assert_eq!(job.attempts, 1);
@@ -4553,7 +5067,10 @@ mod tests {
 
         // Complete it; a fresh enqueue is now allowed (prior job is 'ready').
         cat.complete_mirror_job(job.id).await.unwrap();
-        assert!(cat.enqueue_mirror_job(up).await.unwrap(), "re-enqueue after ready");
+        assert!(
+            cat.enqueue_mirror_job(up).await.unwrap(),
+            "re-enqueue after ready"
+        );
 
         // Claim + reschedule with backoff → not immediately claimable again.
         let job2 = cat.claim_mirror_job().await.unwrap().unwrap();
@@ -4625,7 +5142,10 @@ mod tests {
             .await
             .unwrap();
         ver(&cat, pubp, "sym/console").await;
-        assert_eq!(cat.all_package_names(repo_id).await.unwrap(), ["sym/console"]);
+        assert_eq!(
+            cat.all_package_names(repo_id).await.unwrap(),
+            ["sym/console"]
+        );
         assert_eq!(
             cat.visible_versions(repo_id, "sym/console", "auto", 0, None, None)
                 .await
@@ -4766,7 +5286,10 @@ mod tests {
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
-        let (_key, lic) = cat.create_license_key(repo_id, Some("buyer")).await.unwrap();
+        let (_key, lic) = cat
+            .create_license_key(repo_id, Some("buyer"))
+            .await
+            .unwrap();
         // Default: no override.
         assert!(!cat.license_policy(lic).await.unwrap().is_some());
 
@@ -4776,7 +5299,10 @@ mod tests {
             cat.set_license_policy(
                 repo_id,
                 lic,
-                &PolicyOverride { update_mode: Some("delayed".into()), cooldown_days: Some(30) },
+                &PolicyOverride {
+                    update_mode: Some("delayed".into()),
+                    cooldown_days: Some(30)
+                },
             )
             .await
             .unwrap()
@@ -4813,33 +5339,62 @@ mod tests {
         let repo_id = cat.create_repo(&o, "web").await.unwrap();
 
         // Canonical resolves, not moved.
-        let loc = cat.resolve_repo_canonical(&o, "web").await.unwrap().unwrap();
+        let loc = cat
+            .resolve_repo_canonical(&o, "web")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!loc.moved && loc.repo_id == repo_id);
 
         // Rename the repo: the old slug now redirects to the canonical one.
         cat.rename_repo(repo_id, "site").await.unwrap();
-        let loc = cat.resolve_repo_canonical(&o, "web").await.unwrap().unwrap();
+        let loc = cat
+            .resolve_repo_canonical(&o, "web")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(loc.moved && loc.repo_slug == "site" && loc.repo_id == repo_id);
-        assert!(!cat.resolve_repo_canonical(&o, "site").await.unwrap().unwrap().moved);
+        assert!(
+            !cat.resolve_repo_canonical(&o, "site")
+                .await
+                .unwrap()
+                .unwrap()
+                .moved
+        );
 
         // The retired slug can't be re-used (renamed back, or recreated).
-        assert!(matches!(cat.rename_repo(repo_id, "web").await, Err(RenameError::Retired)));
+        assert!(matches!(
+            cat.rename_repo(repo_id, "web").await,
+            Err(RenameError::Retired)
+        ));
         assert!(cat.repo_slug_unavailable(org_id, "web").await.unwrap());
 
         // Rename the org too: the old org+repo slug pair redirects (chained) to
         // the new canonical pair.
         cat.rename_org(org_id, &format!("{o}-new")).await.unwrap();
-        let loc = cat.resolve_repo_canonical(&o, "web").await.unwrap().unwrap();
+        let loc = cat
+            .resolve_repo_canonical(&o, "web")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(loc.moved);
         assert_eq!(loc.org_slug, format!("{o}-new"));
         assert_eq!(loc.repo_slug, "site");
 
         // A live slug can't be taken by another rename.
         cat.create_repo(&format!("{o}-new"), "site2").await.unwrap();
-        assert!(matches!(cat.rename_repo(repo_id, "site2").await, Err(RenameError::Taken)));
+        assert!(matches!(
+            cat.rename_repo(repo_id, "site2").await,
+            Err(RenameError::Taken)
+        ));
 
         // Unknown slug → no location.
-        assert!(cat.resolve_repo_canonical("nope-org", "nope").await.unwrap().is_none());
+        assert!(
+            cat.resolve_repo_canonical("nope-org", "nope")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4853,12 +5408,18 @@ mod tests {
             .await
             .unwrap();
         for n in ["acme/a", "acme/b", "other/c"] {
-            cat.upsert_package(repo_id, n, "git", None, Visibility::Public).await.unwrap();
+            cat.upsert_package(repo_id, n, "git", None, Visibility::Public)
+                .await
+                .unwrap();
         }
         let set = cat.create_package_set(org_id, "Pro").await.unwrap();
 
         // explicit member + glob rule.
-        let cid = cat.find_package_in_org(org_id, "other/c").await.unwrap().unwrap();
+        let cid = cat
+            .find_package_in_org(org_id, "other/c")
+            .await
+            .unwrap()
+            .unwrap();
         cat.add_set_member(set, cid).await.unwrap();
         cat.add_set_rule(set, "acme/*").await.unwrap();
         assert_eq!(
@@ -4867,8 +5428,15 @@ mod tests {
         );
 
         // Auto-grow: a new acme/* package joins the set without re-config.
-        cat.upsert_package(repo_id, "acme/d", "git", None, Visibility::Public).await.unwrap();
-        assert!(cat.resolve_set(set).await.unwrap().contains(&"acme/d".to_owned()));
+        cat.upsert_package(repo_id, "acme/d", "git", None, Visibility::Public)
+            .await
+            .unwrap();
+        assert!(
+            cat.resolve_set(set)
+                .await
+                .unwrap()
+                .contains(&"acme/d".to_owned())
+        );
 
         // Listing, members, rules, delete.
         assert_eq!(cat.list_package_sets(org_id).await.unwrap().len(), 1);
@@ -4892,12 +5460,17 @@ mod tests {
             .await
             .unwrap();
         for n in ["acme/a", "acme/b", "solo/x"] {
-            cat.upsert_package(repo_id, n, "git", None, Visibility::Private).await.unwrap();
+            cat.upsert_package(repo_id, n, "git", None, Visibility::Private)
+                .await
+                .unwrap();
         }
         let set = cat.create_package_set(org_id, "Edition").await.unwrap();
         cat.add_set_rule(set, "acme/*").await.unwrap();
 
-        let (_key, lic) = cat.create_license_key(repo_id, Some("buyer")).await.unwrap();
+        let (_key, lic) = cat
+            .create_license_key(repo_id, Some("buyer"))
+            .await
+            .unwrap();
         // A direct package entitlement plus a set entitlement coexist.
         assert!(cat.entitle_package(lic, repo_id, "solo/x").await.unwrap());
         cat.entitle_set(lic, set).await.unwrap();
@@ -4908,8 +5481,15 @@ mod tests {
         );
 
         // Auto-grow: a new acme/* package is unlocked without touching the license.
-        cat.upsert_package(repo_id, "acme/c", "git", None, Visibility::Private).await.unwrap();
-        assert!(cat.entitled_package_names(lic).await.unwrap().contains(&"acme/c".to_owned()));
+        cat.upsert_package(repo_id, "acme/c", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        assert!(
+            cat.entitled_package_names(lic)
+                .await
+                .unwrap()
+                .contains(&"acme/c".to_owned())
+        );
 
         // Listing surfaces the entitled set.
         let listed = &cat.list_licenses(repo_id).await.unwrap()[0];
@@ -4919,7 +5499,10 @@ mod tests {
 
         // Revoke the set: only the direct entitlement remains.
         cat.remove_set_entitlement(lic, set).await.unwrap();
-        assert_eq!(cat.entitled_package_names(lic).await.unwrap(), vec!["solo/x"]);
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["solo/x"]
+        );
     }
 
     #[tokio::test]
@@ -4955,16 +5538,30 @@ mod tests {
         };
 
         // Unbounded: all three.
-        assert_eq!(cat.visible_versions(repo_id, p, "auto", 0, None, None).await.unwrap().len(), 3);
+        assert_eq!(
+            cat.visible_versions(repo_id, p, "auto", 0, None, None)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
         // Time bound: a license whose window ended 60 days ago keeps only the
         // version released within it (perpetual fallback).
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0, Some(now - 60 * day), None).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "auto", 0, Some(now - 60 * day), None)
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0"]
         );
         // Version bound: "this major and below" (<= 2) excludes the 3.x line.
         assert_eq!(
-            norm(cat.visible_versions(repo_id, p, "auto", 0, None, Some(2)).await.unwrap()),
+            norm(
+                cat.visible_versions(repo_id, p, "auto", 0, None, Some(2))
+                    .await
+                    .unwrap()
+            ),
             ["1.0.0.0", "2.0.0.0"]
         );
     }
@@ -4983,30 +5580,63 @@ mod tests {
         let client = cat.create_repo(&org_slug, "client").await.unwrap();
 
         // A package in the source repo + a version.
-        let pkg = cat.upsert_package(src_repo, "acme/x", "git", None, Visibility::Public).await.unwrap();
-        let cj = serde_json::json!({"name": "acme/x"});
-        cat.upsert_package_version(pkg, "1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None)
+        let pkg = cat
+            .upsert_package(src_repo, "acme/x", "git", None, Visibility::Public)
             .await
             .unwrap();
+        let cj = serde_json::json!({"name": "acme/x"});
+        cat.upsert_package_version(
+            pkg, "1.0.0", "1.0.0.0", "stable", &cj, None, None, None, None,
+        )
+        .await
+        .unwrap();
 
         // A set with a glob rule, subscribed by the client repo.
         let set = cat.create_package_set(org_id, "Bundle").await.unwrap();
         cat.add_set_rule(set, "acme/*").await.unwrap();
-        assert!(!cat.all_package_names(client).await.unwrap().contains(&"acme/x".to_owned()));
+        assert!(
+            !cat.all_package_names(client)
+                .await
+                .unwrap()
+                .contains(&"acme/x".to_owned())
+        );
         cat.add_grant_rule(client, set).await.unwrap();
 
         // The client now serves the set's package (and its versions), virtually.
-        assert!(cat.all_package_names(client).await.unwrap().contains(&"acme/x".to_owned()));
-        assert_eq!(cat.visible_versions(client, "acme/x", "auto", 0, None, None).await.unwrap().len(), 1);
+        assert!(
+            cat.all_package_names(client)
+                .await
+                .unwrap()
+                .contains(&"acme/x".to_owned())
+        );
+        assert_eq!(
+            cat.visible_versions(client, "acme/x", "auto", 0, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(cat.list_grant_rules(client).await.unwrap().len(), 1);
 
         // Auto-grow: a new acme/* package flows in without re-config.
-        cat.upsert_package(src_repo, "acme/y", "git", None, Visibility::Public).await.unwrap();
-        assert!(cat.all_package_names(client).await.unwrap().contains(&"acme/y".to_owned()));
+        cat.upsert_package(src_repo, "acme/y", "git", None, Visibility::Public)
+            .await
+            .unwrap();
+        assert!(
+            cat.all_package_names(client)
+                .await
+                .unwrap()
+                .contains(&"acme/y".to_owned())
+        );
 
         // Un-subscribe removes the inherited access.
         let rid = cat.list_grant_rules(client).await.unwrap()[0].0;
         cat.remove_grant_rule(client, rid).await.unwrap();
-        assert!(!cat.all_package_names(client).await.unwrap().contains(&"acme/x".to_owned()));
+        assert!(
+            !cat.all_package_names(client)
+                .await
+                .unwrap()
+                .contains(&"acme/x".to_owned())
+        );
     }
 }

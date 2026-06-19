@@ -143,7 +143,10 @@ OXs7a/RdHA7gfudBEgU8KNL17rvquOlU6rpLzcupHG1qt+mHqBr/EKBqVLuow3zH\n\
 
         let got = validate_jwt(&jwt, &jwks(), "https://idp.test", "sconce").unwrap();
         assert_eq!(got["repository"], "acme/app");
-        assert!(claims_match(&got, &json!({"repository": "acme/app", "ref": "refs/heads/main"})));
+        assert!(claims_match(
+            &got,
+            &json!({"repository": "acme/app", "ref": "refs/heads/main"})
+        ));
         assert!(!claims_match(&got, &json!({"repository": "evil/x"})));
 
         // Wrong audience / issuer are rejected by the signature/claims validator.

@@ -236,16 +236,13 @@ enum Command {
         database_url: String,
     },
 
-    /// Mirror a whole composer registry: every package in `available-packages`,
-    /// optionally filtered by a regex (e.g. `^mage-os/` or `^magento/module-`).
+    /// Mirror a composer registry per the upstream's stored require-list: every
+    /// package in `available-packages` it selects (set the list with `upstream
+    /// add --require …`). An upstream with no requires is refused.
     MirrorRegistry {
         /// Composer upstream id (see `upstream list`).
         #[arg(long)]
         upstream: uuid::Uuid,
-        /// Regex package names must match (required — an unfiltered registry
-        /// mirror is refused).
-        #[arg(long = "match")]
-        pattern: String,
         /// Directory of the content-addressed store.
         #[arg(long)]
         cas: PathBuf,
@@ -551,10 +548,18 @@ enum UpstreamAction {
         /// How to present the credential: basic | github | gitlab | bearer.
         #[arg(long, default_value = "basic")]
         credential_type: CredType,
-        /// composer-only: regex scoping which packages a sync mirrors (e.g.
-        /// `^mage-os/`). Omit to mirror everything the registry lists.
-        #[arg(long = "match")]
-        pattern: Option<String>,
+        /// Mirror subscription entry, repeatable (OR-union). Forms:
+        /// `vendor/*` or `vendor/` (a vendor prefix), `vendor/pkg` (one package),
+        /// `*` (the whole registry — require-all), `re:<regex>` (advanced). Append
+        /// `@<version>` for a version floor, e.g. `mage-os/*@2.4`. Required for a
+        /// composer upstream; optional floor for a git one (use `*@<version>`).
+        #[arg(long = "require")]
+        require: Vec<String>,
+        /// git-only: a monorepo subdirectory to mirror as its own package
+        /// (the dir holding that package's composer.json), repeatable. Omit to
+        /// mirror the repo root as a single package.
+        #[arg(long = "source-path")]
+        source_path: Vec<String>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -814,7 +819,8 @@ fn main() -> Result<()> {
                 label,
                 credential,
                 credential_type,
-                pattern,
+                require,
+                source_path,
                 database_url,
             } => upstream_add(
                 &repo,
@@ -824,7 +830,8 @@ fn main() -> Result<()> {
                 label.as_deref(),
                 credential.as_deref(),
                 credential_type.as_str(),
-                pattern.as_deref(),
+                &require,
+                &source_path,
                 &database_url,
             ),
             UpstreamAction::List { repo, database_url } => upstream_list(&repo, &database_url),
@@ -847,10 +854,9 @@ fn main() -> Result<()> {
         } => mirror_package(upstream, &package, &cas, &database_url),
         Command::MirrorRegistry {
             upstream,
-            pattern,
             cas,
             database_url,
-        } => mirror_registry(upstream, &pattern, &cas, &database_url),
+        } => mirror_registry(upstream, &cas, &database_url),
         Command::Deps { action } => match action {
             DepsAction::Resolve { repo, database_url } => deps_resolve(&repo, &database_url),
             DepsAction::Plan { repo, database_url } => deps_plan(&repo, &database_url),
@@ -923,7 +929,15 @@ fn main() -> Result<()> {
                 claims,
                 ttl_secs,
                 database_url,
-            } => ci_policy_add(&repo, &provider, &issuer, &audience, &claims, ttl_secs, &database_url),
+            } => ci_policy_add(
+                &repo,
+                &provider,
+                &issuer,
+                &audience,
+                &claims,
+                ttl_secs,
+                &database_url,
+            ),
             CiPolicyAction::List { repo, database_url } => ci_policy_list(&repo, &database_url),
         },
         Command::ScimToken { org, database_url } => scim_token(&org, &database_url),
@@ -1020,15 +1034,23 @@ fn upstream_add(
     label: Option<&str>,
     credential: Option<&str>,
     credential_type: &str,
-    pattern: Option<&str>,
+    require: &[String],
+    source_path: &[String],
     database_url: &str,
 ) -> Result<()> {
-    // A composer upstream must be scoped — an unfiltered sync would mirror the
-    // whole registry. Require a non-empty match.
-    let pattern = pattern.map(str::trim).filter(|p| !p.is_empty());
-    if kind == "composer" && pattern.is_none() {
+    let requires = require
+        .iter()
+        .map(|r| sconce_catalog::UpstreamRequire::parse(r).map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<Vec<_>>>()?;
+    if kind != "git" && !source_path.is_empty() {
+        anyhow::bail!("--source-path is only valid for a git upstream");
+    }
+    // A composer upstream must be scoped — an empty require-list would mirror the
+    // whole registry. (Use `--require '*'` to opt into a require-all explicitly.)
+    if kind == "composer" && requires.is_empty() {
         anyhow::bail!(
-            "composer upstreams require --match <regex> (refusing to mirror an entire registry)"
+            "composer upstreams require at least one --require entry \
+             (e.g. --require 'mage-os/*'; use --require '*' to mirror everything)"
         );
     }
     // Public upstreams are unauthenticated — drop any credential rather than
@@ -1060,11 +1082,17 @@ fn upstream_add(
             )
             .await
             .context("creating upstream")?;
-        if let Some(p) = pattern {
+        if !requires.is_empty() {
             catalog
-                .set_upstream_filter(repo_id, id, Some(p))
+                .set_upstream_requires(repo_id, id, &requires)
                 .await
-                .context("setting package filter")?;
+                .context("setting mirror subscription")?;
+        }
+        if !source_path.is_empty() {
+            catalog
+                .set_upstream_source_paths(repo_id, id, source_path)
+                .await
+                .context("setting source paths")?;
         }
         println!("upstream added: {id}");
         Ok(())
@@ -1084,12 +1112,23 @@ fn upstream_list(repo: &str, database_url: &str) -> Result<()> {
         for u in ups {
             let label = u.label.as_deref().unwrap_or("-");
             let cred = if u.has_credential { "auth" } else { "no-auth" };
-            let filt = u
-                .package_filter
-                .as_deref()
-                .map_or(String::new(), |p| format!("  match={p}"));
+            let reqs = if u.requires.is_empty() {
+                String::new()
+            } else {
+                let entries: Vec<String> = u
+                    .requires
+                    .iter()
+                    .map(sconce_catalog::UpstreamRequire::to_spec)
+                    .collect();
+                format!("  require=[{}]", entries.join(", "))
+            };
+            let paths = if u.source_paths.is_empty() {
+                String::new()
+            } else {
+                format!("  paths=[{}]", u.source_paths.join(", "))
+            };
             println!(
-                "{}  [{}/{}]  {label}  ({cred})  {}{filt}",
+                "{}  [{}/{}]  {label}  ({cred})  {}{reqs}{paths}",
                 u.id, u.kind, u.visibility, u.base
             );
         }
@@ -1186,12 +1225,7 @@ fn mirror_package(
     })
 }
 
-fn mirror_registry(
-    upstream: uuid::Uuid,
-    pattern: &str,
-    cas: &Path,
-    database_url: &str,
-) -> Result<()> {
+fn mirror_registry(upstream: uuid::Uuid, cas: &Path, database_url: &str) -> Result<()> {
     use sconce_cas::FsBlobStore;
     use sconce_catalog::Catalog;
 
@@ -1204,10 +1238,9 @@ fn mirror_registry(
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
 
-        let report =
-            sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream, Some(pattern))
-                .await
-                .with_context(|| format!("mirroring registry upstream {upstream}"))?;
+        let report = sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream)
+            .await
+            .with_context(|| format!("mirroring registry upstream {upstream}"))?;
         // Summarize per package so a big run is readable.
         let mut by_pkg: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for m in &report.mirrored {
@@ -1236,7 +1269,9 @@ fn deps_resolve(repo: &str, database_url: &str) -> Result<()> {
             .enqueue_resolve_closure_job(repo_id)
             .await
             .context("enqueueing resolve job")?;
-        println!("queued dependency resolution for {repo} — run `sconce worker` to compute it, then `sconce deps plan --repo {repo}`.");
+        println!(
+            "queued dependency resolution for {repo} — run `sconce worker` to compute it, then `sconce deps plan --repo {repo}`."
+        );
         Ok(())
     })
 }
@@ -1244,7 +1279,10 @@ fn deps_resolve(repo: &str, database_url: &str) -> Result<()> {
 fn package_list(repo: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
-        let packages = catalog.list_packages(repo_id).await.context("listing packages")?;
+        let packages = catalog
+            .list_packages(repo_id)
+            .await
+            .context("listing packages")?;
         if packages.is_empty() {
             eprintln!("No packages yet.");
         }
@@ -1258,13 +1296,21 @@ fn package_list(repo: &str, database_url: &str) -> Result<()> {
                 "ok".to_owned()
             };
             let last = p.last_success_at.as_deref().unwrap_or("never");
-            println!("{:<22} {:<8} {:<22} last-sync {last}", state, p.visibility, p.name);
+            println!(
+                "{:<22} {:<8} {:<22} last-sync {last}",
+                state, p.visibility, p.name
+            );
         }
         Ok(())
     })
 }
 
-fn package_set_archived(repo: &str, package: &str, archived: bool, database_url: &str) -> Result<()> {
+fn package_set_archived(
+    repo: &str,
+    package: &str,
+    archived: bool,
+    database_url: &str,
+) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
         let changed = if archived {
@@ -1278,7 +1324,11 @@ fn package_set_archived(repo: &str, package: &str, archived: bool, database_url:
         }
         println!(
             "{package}: {}",
-            if archived { "archived (frozen)" } else { "un-archived (syncing resumes)" }
+            if archived {
+                "archived (frozen)"
+            } else {
+                "un-archived (syncing resumes)"
+            }
         );
         Ok(())
     })
@@ -1311,7 +1361,10 @@ fn deps_add(repo: &str, package: &str, database_url: &str) -> Result<()> {
             .context("looking up plan entry")?
             .with_context(|| format!("'{package}' is not in the plan (run `deps resolve`)"))?;
         let upstream = entry.resolver_upstream_id.with_context(|| {
-            format!("'{package}' is {} — nothing to add (no resolver)", entry.status)
+            format!(
+                "'{package}' is {} — nothing to add (no resolver)",
+                entry.status
+            )
         })?;
         catalog
             .enqueue_mirror_package_job(upstream, package)
@@ -1333,13 +1386,19 @@ struct JobFailure {
 
 impl From<sconce_mirror::Error> for JobFailure {
     fn from(e: sconce_mirror::Error) -> Self {
-        JobFailure { terminal: e.is_terminal(), message: e.to_string() }
+        JobFailure {
+            terminal: e.is_terminal(),
+            message: e.to_string(),
+        }
     }
 }
 
 /// A malformed/unroutable job: deterministic, so terminal.
 fn bad_job(message: impl Into<String>) -> JobFailure {
-    JobFailure { message: message.into(), terminal: true }
+    JobFailure {
+        message: message.into(),
+        terminal: true,
+    }
 }
 
 async fn run_job(
@@ -1350,7 +1409,9 @@ async fn run_job(
 ) -> std::result::Result<String, JobFailure> {
     match job.kind.as_str() {
         "mirror_upstream" => {
-            let uid = job.upstream_id.ok_or_else(|| bad_job("job missing upstream_id"))?;
+            let uid = job
+                .upstream_id
+                .ok_or_else(|| bad_job("job missing upstream_id"))?;
             let r = sconce_mirror::mirror_upstream(catalog, store, uid, key).await?;
             Ok(format!(
                 "{} mirrored, {} skipped",
@@ -1359,8 +1420,13 @@ async fn run_job(
             ))
         }
         "mirror_package" => {
-            let uid = job.upstream_id.ok_or_else(|| bad_job("job missing upstream_id"))?;
-            let pkg = job.package.as_deref().ok_or_else(|| bad_job("job missing package"))?;
+            let uid = job
+                .upstream_id
+                .ok_or_else(|| bad_job("job missing upstream_id"))?;
+            let pkg = job
+                .package
+                .as_deref()
+                .ok_or_else(|| bad_job("job missing package"))?;
             let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg).await?;
             Ok(format!("{pkg}: {} version(s)", r.mirrored.len()))
         }
@@ -1371,7 +1437,10 @@ async fn run_job(
             catalog
                 .replace_dependency_plan(rid, &plan)
                 .await
-                .map_err(|e| JobFailure { message: e.to_string(), terminal: false })?;
+                .map_err(|e| JobFailure {
+                    message: e.to_string(),
+                    terminal: false,
+                })?;
             Ok(format!("resolved {} dependencies", plan.len()))
         }
         other => Err(bad_job(format!("unknown job kind: {other}"))),
@@ -1439,14 +1508,20 @@ async fn run_worker_loop(
                 let outcome = run_job(&catalog, &store, key.as_ref(), &job).await;
                 match outcome {
                     Ok(summary) => {
-                        catalog.complete_mirror_job(job.id).await.context("complete")?;
+                        catalog
+                            .complete_mirror_job(job.id)
+                            .await
+                            .context("complete")?;
                         println!("worker: {} ready — {summary}", job.kind);
                     }
                     // Terminal: retrying won't help (source gone / access refused
                     // / bad content). Stop — the package (if any) is already
                     // flagged broken by the mirror layer.
                     Err(fail) if fail.terminal => {
-                        catalog.fail_mirror_job(job.id, &fail.message).await.context("fail")?;
+                        catalog
+                            .fail_mirror_job(job.id, &fail.message)
+                            .await
+                            .context("fail")?;
                         eprintln!("worker: {} failed terminally: {}", job.kind, fail.message);
                     }
                     // Non-terminal (transport / 5xx / our own infra): never give
@@ -1638,8 +1713,14 @@ fn repo_settings(
             .max_token_ttl_days
             .map_or_else(|| "no limit".to_owned(), |d| format!("{d} day(s)"));
         println!("repo {repo} overrides:");
-        println!("  allow_raw_tokens       = {}", show_bool(cfg.allow_raw_tokens));
-        println!("  max_token_ttl_days     = {}", show_ttl(cfg.max_token_ttl_days));
+        println!(
+            "  allow_raw_tokens       = {}",
+            show_bool(cfg.allow_raw_tokens)
+        );
+        println!(
+            "  max_token_ttl_days     = {}",
+            show_ttl(cfg.max_token_ttl_days)
+        );
         println!("  allow_private_packages = {}", cfg.allow_private_packages);
         println!("effective policy:");
         println!("  allow_raw_tokens   = {}", effective.allow_raw_tokens);
@@ -1715,7 +1796,11 @@ fn ci_policy_add(
 fn ci_policy_list(repo: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
-        for p in catalog.ci_policies(repo_id).await.context("listing CI policies")? {
+        for p in catalog
+            .ci_policies(repo_id)
+            .await
+            .context("listing CI policies")?
+        {
             println!(
                 "{}  [{}]  iss={} aud={} ttl={}s  claims={}",
                 p.id, p.provider, p.issuer, p.audience, p.token_ttl_secs, p.claims
@@ -1727,7 +1812,11 @@ fn ci_policy_list(repo: &str, database_url: &str) -> Result<()> {
 
 fn scim_token(org: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
-        match catalog.create_scim_token(org).await.context("creating SCIM token")? {
+        match catalog
+            .create_scim_token(org)
+            .await
+            .context("creating SCIM token")?
+        {
             Some(token) => {
                 println!("{token}");
                 eprintln!(
@@ -1924,7 +2013,10 @@ fn token_create(
 fn token_list(repo: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
-        let tokens = catalog.list_tokens(repo_id).await.context("listing tokens")?;
+        let tokens = catalog
+            .list_tokens(repo_id)
+            .await
+            .context("listing tokens")?;
         if tokens.is_empty() {
             eprintln!("No tokens for {repo}.");
         }
@@ -1944,7 +2036,10 @@ fn token_list(repo: &str, database_url: &str) -> Result<()> {
                     c.map_or_else(|| "-".to_owned(), |d| d.to_string())
                 ),
             };
-            println!("{}  {label}  [{}]  ({expires}; {last}){policy}", t.id, t.origin);
+            println!(
+                "{}  {label}  [{}]  ({expires}; {last}){policy}",
+                t.id, t.origin
+            );
         }
         Ok(())
     })
@@ -2265,7 +2360,10 @@ mod tests {
         // Capped at one hour even for absurd attempt counts (no overflow/panic).
         for n in [12, 20, 1000, i32::MAX] {
             let b = retry_backoff_secs(n);
-            assert!(b.is_finite() && (1800.0..=5400.0).contains(&b), "attempt {n}: {b}");
+            assert!(
+                b.is_finite() && (1800.0..=5400.0).contains(&b),
+                "attempt {n}: {b}"
+            );
         }
     }
 }

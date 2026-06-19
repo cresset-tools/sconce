@@ -105,12 +105,23 @@ async fn authorize(
     s: &AppState,
     repo_id: Uuid,
     headers: &HeaderMap,
-) -> Result<(Access, sconce_catalog::PolicyOverride, sconce_catalog::LicenseBound), AppError> {
+) -> Result<
+    (
+        Access,
+        sconce_catalog::PolicyOverride,
+        sconce_catalog::LicenseBound,
+    ),
+    AppError,
+> {
     let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
 
     if let Some(policy) = s.catalog.resolve_token_policy(repo_id, &cred).await? {
         // A repo token has no perpetual-fallback bound (unbounded).
-        return Ok((Access::Full, policy, sconce_catalog::LicenseBound::default()));
+        return Ok((
+            Access::Full,
+            policy,
+            sconce_catalog::LicenseBound::default(),
+        ));
     }
     if let Some(license_id) = s.catalog.resolve_license(repo_id, &cred).await? {
         let entitled = s

@@ -178,7 +178,7 @@
       {% for u in upstreams %}
         <div class=urow data-kind={{ u.kind }} data-fail={% if u.failed %}1{% else %}0{% endif %} data-text="{{ u.text }}">
           <span class=kind>{% if u.is_composer %}{% call icons::box_icon() %}{% endcall %}{% else %}{% call icons::git() %}{% endcall %}{% endif %}{{ u.kind }}</span>
-          <span class=url><code>{{ u.base }}</code>{% if let Some(f) = u.filter %}<div class=match>match <b>{{ f }}</b></div>{% endif %}{% if let Some(e) = u.error %}<div class=err>{{ e }}</div>{% endif %}</span>
+          <span class=url><code>{{ u.base }}</code>{% if !u.requires.is_empty() %}<div class=match>require {% for r in u.requires %}<b>{{ r }}</b>{% if !loop.last %} {% endif %}{% endfor %}</div>{% endif %}{% if !u.source_paths.is_empty() %}<div class=match>paths {% for p in u.source_paths %}<b>{{ p }}</b>{% if !loop.last %} {% endif %}{% endfor %}</div>{% endif %}{% if let Some(e) = u.error %}<div class=err>{{ e }}</div>{% endif %}</span>
           <span>{% if u.public %}<span class="badge ok">public</span>{% else %}<span class="badge slate">private</span>{% endif %}</span>
           <span>{% if u.has_credential %}<span class="badge slate mono">{{ u.credential_type }}</span>{% else %}<span class=dash>—</span>{% endif %}</span>
           <span class=last><span class="badge {{ u.last_tone }}">{{ u.last_label }}</span>{% if !u.when.is_empty() %} {{ u.when }}{% endif %}</span>
@@ -204,8 +204,10 @@
       </div>
       <div class=g1>
         <div><label class=fl>Label <span class=hint>· optional</span></label><input name=label style=font-family:inherit></div>
-        <div><label class=fl>Match <span class=hint>· composer regex</span></label><input name=package_filter placeholder="^vendor/"></div>
-        <div></div>
+        <div style=grid-column:span_2><label class=fl>Subscription <span class=hint>· one per line · required for composer</span></label><textarea name=requires rows=2 placeholder="mage-os/*@2.4&#10;psr/log"></textarea></div>
+      </div>
+      <div class=g1>
+        <div style=grid-column:span_3><label class=fl>Monorepo paths <span class=hint>· git only · one subdir per line · empty = repo root</span></label><textarea name=source_paths rows=2 placeholder="packages/console&#10;packages/http"></textarea></div>
       </div>
       <div class=g2 id=credrow style="display:none">
         <div><label class=fl>Credential type</label><select name=credential_type id=cred-type>

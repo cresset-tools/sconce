@@ -95,7 +95,10 @@ pub fn router(
         .route("/auth/start", get(auth_start))
         .route("/auth/route", post(auth_route))
         .route("/auth/callback", get(auth_callback))
-        .route("/scim/v2/Users", get(scim_list_users).post(scim_create_user))
+        .route(
+            "/scim/v2/Users",
+            get(scim_list_users).post(scim_create_user),
+        )
         .route(
             "/scim/v2/Users/{id}",
             get(scim_get_user)
@@ -115,7 +118,10 @@ pub fn router(
         .route("/orgs/new", get(new_org_page))
         .route("/repos/new", get(new_repo_page))
         .route("/o/{org}", get(org_overview_page))
-        .route("/o/{org}/settings", get(org_settings_page).post(save_org_settings))
+        .route(
+            "/o/{org}/settings",
+            get(org_settings_page).post(save_org_settings),
+        )
         .route("/o/{org}/rename", post(rename_org_action))
         .route("/o/{org}/sets", get(sets_page).post(create_set))
         .route("/o/{org}/sets/{id}", get(set_editor_page))
@@ -128,7 +134,10 @@ pub fn router(
         .route("/o/{org}/scim-token", post(gen_scim_token))
         .route("/repos", post(create_repo))
         .route("/r/{org}/{repo}", get(repo_page))
-        .route("/r/{org}/{repo}/settings", get(repo_settings_page).post(save_repo_settings))
+        .route(
+            "/r/{org}/{repo}/settings",
+            get(repo_settings_page).post(save_repo_settings),
+        )
         .route("/r/{org}/{repo}/rename", post(rename_repo_action))
         .route("/r/{org}/{repo}/delete", post(delete_repo_action))
         .route("/r/{org}/{repo}/policy", post(set_policy))
@@ -137,18 +146,30 @@ pub fn router(
         .route("/r/{org}/{repo}/token/revoke", post(revoke_token))
         .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
         .route("/r/{org}/{repo}/license/policy", post(set_license_policy))
-        .route("/r/{org}/{repo}/license/bound", post(set_license_bound_action))
+        .route(
+            "/r/{org}/{repo}/license/bound",
+            post(set_license_bound_action),
+        )
         .route("/r/{org}/{repo}/license/set", post(entitle_license_set))
-        .route("/r/{org}/{repo}/license/set/remove", post(remove_license_set))
+        .route(
+            "/r/{org}/{repo}/license/set/remove",
+            post(remove_license_set),
+        )
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
-        .route("/r/{org}/{repo}/grant/policy", post(set_grant_policy_action))
+        .route(
+            "/r/{org}/{repo}/grant/policy",
+            post(set_grant_policy_action),
+        )
         .route("/r/{org}/{repo}/autogrant", post(add_autogrant))
         .route("/r/{org}/{repo}/autogrant/remove", post(remove_autogrant))
         .route("/r/{org}/{repo}/upstream", post(create_upstream))
         .route("/r/{org}/{repo}/upstream/remove", post(remove_upstream))
         .route("/r/{org}/{repo}/upstream/sync", post(sync_upstream))
-        .route("/r/{org}/{repo}/upstream/sync-all", post(sync_all_upstreams))
+        .route(
+            "/r/{org}/{repo}/upstream/sync-all",
+            post(sync_all_upstreams),
+        )
         .route("/r/{org}/{repo}/deps/resolve", post(resolve_deps))
         .route("/r/{org}/{repo}/deps/add", post(add_dep))
         .route("/r/{org}/{repo}/package/archive", post(package_archive))
@@ -345,7 +366,10 @@ fn sidebar(s: &Ui, user: &CurrentUser, title: &str) -> String {
 /// in `assets/*.{css,js}`; fonts in `assets/fonts/`. All long-cached + immutable.
 async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, bytes): (&str, &'static [u8]) = match path.as_str() {
-        "app.css" => ("text/css; charset=utf-8", include_bytes!("../assets/app.css")),
+        "app.css" => (
+            "text/css; charset=utf-8",
+            include_bytes!("../assets/app.css"),
+        ),
         "repo.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../assets/repo.js"),
@@ -355,9 +379,10 @@ async fn asset(Path(path): Path<String>) -> Response {
             include_bytes!("../assets/login.js"),
         ),
         "fonts/geist.woff2" => ("font/woff2", include_bytes!("../assets/fonts/geist.woff2")),
-        "fonts/geist-mono.woff2" => {
-            ("font/woff2", include_bytes!("../assets/fonts/geist-mono.woff2"))
-        }
+        "fonts/geist-mono.woff2" => (
+            "font/woff2",
+            include_bytes!("../assets/fonts/geist-mono.woff2"),
+        ),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (
@@ -451,7 +476,11 @@ async fn org_overview_page(
     Path(org): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
     let summary = lookup_org(&s, &user, &org).await?;
-    let repos = s.catalog.org_repo_overview(summary.id).await.map_err(e500)?;
+    let repos = s
+        .catalog
+        .org_repo_overview(summary.id)
+        .await
+        .map_err(e500)?;
     let view = views::OrgOverview {
         org: org.clone(),
         can_admin: user.can_admin(summary.id),
@@ -477,8 +506,16 @@ async fn org_settings_page(
 ) -> Result<Html<String>, StatusCode> {
     let summary = lookup_org(&s, &user, &org).await?;
     let cfg = s.catalog.org_settings(summary.id).await.map_err(e500)?;
-    let conn = s.catalog.oidc_connection_for_org(summary.id).await.map_err(e500)?;
-    let former = s.catalog.former_slugs("org", summary.id).await.unwrap_or_default();
+    let conn = s
+        .catalog
+        .oidc_connection_for_org(summary.id)
+        .await
+        .map_err(e500)?;
+    let former = s
+        .catalog
+        .former_slugs("org", summary.id)
+        .await
+        .unwrap_or_default();
     // The client secret is write-only and never rendered back.
     let oidc = match conn.as_ref() {
         Some(c) => views::OidcView {
@@ -486,8 +523,16 @@ async fn org_settings_page(
             client_id: c.client_id.clone(),
             redirect: c.redirect_url.clone(),
             scopes: c.scopes.clone(),
-            allowed: c.allowed_domains.as_ref().map(|d| d.join(", ")).unwrap_or_default(),
-            admin: c.admin_domains.as_ref().map(|d| d.join(", ")).unwrap_or_default(),
+            allowed: c
+                .allowed_domains
+                .as_ref()
+                .map(|d| d.join(", "))
+                .unwrap_or_default(),
+            admin: c
+                .admin_domains
+                .as_ref()
+                .map(|d| d.join(", "))
+                .unwrap_or_default(),
         },
         None => views::OidcView {
             scopes: "openid email profile".to_owned(),
@@ -497,12 +542,20 @@ async fn org_settings_page(
     let view = views::OrgSettings {
         org: org.clone(),
         allow_raw_tokens: cfg.allow_raw_tokens,
-        max_ttl: cfg.max_token_ttl_days.map(|d| d.to_string()).unwrap_or_default(),
+        max_ttl: cfg
+            .max_token_ttl_days
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
         oidc_configured: conn.is_some(),
         oidc,
         former,
     };
-    Ok(shell(&s, &user, &format!("{org} settings"), &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        &format!("{org} settings"),
+        &view.render().map_err(e500)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -536,7 +589,12 @@ async fn save_oidc(
     let summary = lookup_org_admin(&s, &user, &org).await?;
     // Write-only secret: a blank field keeps the stored one (set_oidc_connection
     // replaces the row, so we must re-supply it).
-    let client_secret = match f.client_secret.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    let client_secret = match f
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         Some(sec) => Some(sec.as_bytes().to_vec()),
         None => s
             .catalog
@@ -556,7 +614,10 @@ async fn save_oidc(
         allowed_domains: split_domains(f.allowed_domains.as_deref()),
         admin_domains: split_domains(f.admin_domains.as_deref()),
     };
-    s.catalog.set_oidc_connection(Some(&org), &conn).await.map_err(e500)?;
+    s.catalog
+        .set_oidc_connection(Some(&org), &conn)
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/o/{org}/settings")))
 }
 
@@ -577,7 +638,12 @@ async fn gen_scim_token(
         org: org.clone(),
         token,
     };
-    Ok(shell(&s, &user, "SCIM token", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "SCIM token",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 // ----- package sets (F6) -----
@@ -600,13 +666,14 @@ struct IdForm {
 }
 
 /// Resolve a set within an org, 404/403-ing if it doesn't belong here.
-async fn lookup_set(
-    s: &Ui,
-    org_id: Uuid,
-    id: &str,
-) -> Result<(Uuid, String), StatusCode> {
+async fn lookup_set(s: &Ui, org_id: Uuid, id: &str) -> Result<(Uuid, String), StatusCode> {
     let set_id = id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let (name, set_org) = s.catalog.package_set(set_id).await.map_err(e500)?.ok_or(StatusCode::NOT_FOUND)?;
+    let (name, set_org) = s
+        .catalog
+        .package_set(set_id)
+        .await
+        .map_err(e500)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     if set_org != org_id {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -619,7 +686,11 @@ async fn sets_page(
     Path(org): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
     let summary = lookup_org(&s, &user, &org).await?;
-    let sets = s.catalog.list_package_sets(summary.id).await.map_err(e500)?;
+    let sets = s
+        .catalog
+        .list_package_sets(summary.id)
+        .await
+        .map_err(e500)?;
     let mut rows = Vec::with_capacity(sets.len());
     for st in &sets {
         let count = s.catalog.resolve_set(st.id).await.map_err(e500)?.len();
@@ -633,7 +704,12 @@ async fn sets_page(
         org: org.clone(),
         sets: rows,
     };
-    Ok(shell(&s, &user, "Package sets", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "Package sets",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 async fn create_set(
@@ -696,7 +772,10 @@ async fn delete_set(
 ) -> Result<Redirect, StatusCode> {
     let summary = lookup_org_admin(&s, &user, &org).await?;
     let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
-    s.catalog.delete_package_set(summary.id, set_id).await.map_err(e500)?;
+    s.catalog
+        .delete_package_set(summary.id, set_id)
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/o/{org}/sets")))
 }
 
@@ -708,7 +787,12 @@ async fn add_set_member(
 ) -> Result<Response, StatusCode> {
     let summary = lookup_org_admin(&s, &user, &org).await?;
     let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
-    match s.catalog.find_package_in_org(summary.id, f.package.trim()).await.map_err(e500)? {
+    match s
+        .catalog
+        .find_package_in_org(summary.id, f.package.trim())
+        .await
+        .map_err(e500)?
+    {
         Some(pid) => {
             s.catalog.add_set_member(set_id, pid).await.map_err(e500)?;
             Ok(Redirect::to(&format!("/o/{org}/sets/{id}")).into_response())
@@ -732,7 +816,10 @@ async fn remove_set_member(
     let summary = lookup_org_admin(&s, &user, &org).await?;
     let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
     let pid = f.id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    s.catalog.remove_set_member(set_id, pid).await.map_err(e500)?;
+    s.catalog
+        .remove_set_member(set_id, pid)
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/o/{org}/sets/{id}")))
 }
 
@@ -744,7 +831,10 @@ async fn add_set_rule(
 ) -> Result<Redirect, StatusCode> {
     let summary = lookup_org_admin(&s, &user, &org).await?;
     let (set_id, _) = lookup_set(&s, summary.id, &id).await?;
-    s.catalog.add_set_rule(set_id, f.glob.trim()).await.map_err(e500)?;
+    s.catalog
+        .add_set_rule(set_id, f.glob.trim())
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/o/{org}/sets/{id}")))
 }
 
@@ -771,9 +861,9 @@ async fn rename_org_action(
     let new = f.slug.trim().to_owned();
     match s.catalog.rename_org(summary.id, &new).await {
         Ok(()) => Ok(Redirect::to(&format!("/o/{new}/settings")).into_response()),
-        Err(e @ (sconce_catalog::RenameError::Taken | sconce_catalog::RenameError::Retired)) => {
-            Ok(rename_failed(&s, &user, &format!("/o/{org}/settings"), &e.to_string()))
-        }
+        Err(e @ (sconce_catalog::RenameError::Taken | sconce_catalog::RenameError::Retired)) => Ok(
+            rename_failed(&s, &user, &format!("/o/{org}/settings"), &e.to_string()),
+        ),
         Err(_) => Err(StatusCode::BAD_REQUEST),
     }
 }
@@ -826,7 +916,11 @@ async fn repo_settings_page(
         .effective_token_policy(summary.id)
         .await
         .map_err(e500)?;
-    let former = s.catalog.former_slugs("repo", summary.id).await.unwrap_or_default();
+    let former = s
+        .catalog
+        .former_slugs("repo", summary.id)
+        .await
+        .unwrap_or_default();
     let ttl = |d: Option<i64>| d.map_or_else(|| "no limit".to_owned(), |d| format!("{d} day(s)"));
     let view = views::RepoSettings {
         org: org.clone(),
@@ -837,15 +931,31 @@ async fn repo_settings_page(
             Some(true) => "allow",
             Some(false) => "deny",
         },
-        repo_ttl: repo_cfg.max_token_ttl_days.map(|d| d.to_string()).unwrap_or_default(),
+        repo_ttl: repo_cfg
+            .max_token_ttl_days
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
         private: repo_cfg.allow_private_packages,
-        org_raw: if org_cfg.allow_raw_tokens { "allowed" } else { "disabled" },
+        org_raw: if org_cfg.allow_raw_tokens {
+            "allowed"
+        } else {
+            "disabled"
+        },
         org_ttl: ttl(org_cfg.max_token_ttl_days),
-        eff_raw: if effective.allow_raw_tokens { "allowed" } else { "disabled" },
+        eff_raw: if effective.allow_raw_tokens {
+            "allowed"
+        } else {
+            "disabled"
+        },
         eff_ttl: ttl(effective.max_token_ttl_days),
         former,
     };
-    Ok(shell(&s, &user, &format!("{org}/{repo} settings"), &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        &format!("{org}/{repo} settings"),
+        &view.render().map_err(e500)?,
+    ))
 }
 
 /// A muted "Formerly: a, b" line (still redirecting), or empty if never renamed.
@@ -906,7 +1016,12 @@ async fn rename_repo_action(
     match s.catalog.rename_repo(summary.id, &new).await {
         Ok(()) => Ok(Redirect::to(&format!("/r/{org}/{new}")).into_response()),
         Err(e @ (sconce_catalog::RenameError::Taken | sconce_catalog::RenameError::Retired)) => {
-            Ok(rename_failed(&s, &user, &format!("/r/{org}/{repo}/settings"), &e.to_string()))
+            Ok(rename_failed(
+                &s,
+                &user,
+                &format!("/r/{org}/{repo}/settings"),
+                &e.to_string(),
+            ))
         }
         Err(_) => Err(StatusCode::BAD_REQUEST),
     }
@@ -1009,9 +1124,11 @@ async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response
         .await
         .map_err(e500)?
     else {
-        return Ok(login_page(&s, "Invalid email or password. Try again, or use SSO.")
-            .await
-            .into_response());
+        return Ok(
+            login_page(&s, "Invalid email or password. Try again, or use SSO.")
+                .await
+                .into_response(),
+        );
     };
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
     let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
@@ -1019,7 +1136,10 @@ async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response
 }
 
 /// Decrypt an OIDC connection's stored client secret (if any).
-fn oidc_secret(s: &Ui, conn: &sconce_catalog::OidcConnection) -> Result<Option<String>, StatusCode> {
+fn oidc_secret(
+    s: &Ui,
+    conn: &sconce_catalog::OidcConnection,
+) -> Result<Option<String>, StatusCode> {
     match (&conn.client_secret, &s.secret_key) {
         (None, _) => Ok(None),
         (Some(ct), Some(key)) => key
@@ -1055,7 +1175,7 @@ async fn auth_start(
         Err(e) => {
             return Ok(login_page(&s, &format!("SSO unavailable: {e}"))
                 .await
-                .into_response())
+                .into_response());
         }
     };
     s.catalog
@@ -1079,13 +1199,17 @@ struct RouteForm {
 
 /// Route an organization email to its identity provider (by domain), else the
 /// instance default.
-async fn auth_route(
-    State(s): State<Ui>,
-    Form(f): Form<RouteForm>,
-) -> Result<Response, StatusCode> {
-    match s.catalog.oidc_connection_for_email(&f.email).await.map_err(e500)? {
+async fn auth_route(State(s): State<Ui>, Form(f): Form<RouteForm>) -> Result<Response, StatusCode> {
+    match s
+        .catalog
+        .oidc_connection_for_email(&f.email)
+        .await
+        .map_err(e500)?
+    {
         Some(id) => Ok(Redirect::to(&format!("/auth/start?conn={id}")).into_response()),
-        None => Ok(login_page(&s, "no SSO is configured for that email domain").await.into_response()),
+        None => Ok(login_page(&s, "no SSO is configured for that email domain")
+            .await
+            .into_response()),
     }
 }
 
@@ -1113,7 +1237,11 @@ async fn auth_callback(
     let Some((conn_id, nonce, verifier, redirect_to)) =
         s.catalog.consume_oidc_flow(&state).await.map_err(e500)?
     else {
-        return Ok(login_page(&s, "login session expired or invalid — try again").await.into_response());
+        return Ok(
+            login_page(&s, "login session expired or invalid — try again")
+                .await
+                .into_response(),
+        );
     };
     // Use the same connection the flow began with.
     let conn = match conn_id {
@@ -1131,7 +1259,7 @@ async fn auth_callback(
             Err(e) => {
                 return Ok(login_page(&s, &format!("SSO failed: {e}"))
                     .await
-                    .into_response())
+                    .into_response());
             }
         };
 
@@ -1139,7 +1267,11 @@ async fn auth_callback(
     if conn.allowed_domains.as_ref().is_some_and(|d| !d.is_empty())
         && !crate::oidc::domain_matches(&identity.email, &conn.allowed_domains)
     {
-        return Ok(login_page(&s, "your email domain is not allowed to sign in").await.into_response());
+        return Ok(
+            login_page(&s, "your email domain is not allowed to sign in")
+                .await
+                .into_response(),
+        );
     }
     let is_superadmin = crate::oidc::domain_matches(&identity.email, &conn.admin_domains);
     let user_id = s
@@ -1156,7 +1288,11 @@ async fn auth_callback(
     }
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
     let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
-    let dest = if redirect_to.starts_with('/') { redirect_to } else { "/".to_owned() };
+    let dest = if redirect_to.starts_with('/') {
+        redirect_to
+    } else {
+        "/".to_owned()
+    };
     Ok(redirect_with_cookie(&dest, &cookie))
 }
 
@@ -1209,12 +1345,15 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 
 /// Authenticate a SCIM request → the org it provisions into.
 async fn scim_org(s: &Ui, headers: &HeaderMap) -> Result<uuid::Uuid, Response> {
-    let token =
-        bearer(headers).ok_or_else(|| scim_error(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+    let token = bearer(headers)
+        .ok_or_else(|| scim_error(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
     match s.catalog.resolve_scim_token(&token).await {
         Ok(Some(org)) => Ok(org),
         Ok(None) => Err(scim_error(StatusCode::UNAUTHORIZED, "invalid SCIM token")),
-        Err(_) => Err(scim_error(StatusCode::INTERNAL_SERVER_ERROR, "server error")),
+        Err(_) => Err(scim_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server error",
+        )),
     }
 }
 
@@ -1228,13 +1367,20 @@ fn scim_bool(v: &Value) -> Option<bool> {
 fn extract_active(body: &Value) -> Option<bool> {
     if let Some(ops) = body.get("Operations").and_then(Value::as_array) {
         for op in ops {
-            let path = op.get("path").and_then(Value::as_str).map(str::to_ascii_lowercase);
+            let path = op
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase);
             if path.as_deref() == Some("active")
                 && let Some(b) = op.get("value").and_then(scim_bool)
             {
                 return Some(b);
             }
-            if let Some(b) = op.get("value").and_then(|v| v.get("active")).and_then(scim_bool) {
+            if let Some(b) = op
+                .get("value")
+                .and_then(|v| v.get("active"))
+                .and_then(scim_bool)
+            {
                 return Some(b);
             }
         }
@@ -1313,7 +1459,11 @@ fn parse_username_filter(filter: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-async fn scim_get_user(State(s): State<Ui>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn scim_get_user(
+    State(s): State<Ui>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let org = match scim_org(&s, &headers).await {
         Ok(o) => o,
         Err(r) => return r,
@@ -1355,7 +1505,10 @@ async fn scim_patch_user(
         Ok(o) => o,
         Err(r) => return r,
     };
-    let (Ok(uid), Ok(v)) = (id.parse::<uuid::Uuid>(), serde_json::from_str::<Value>(&body)) else {
+    let (Ok(uid), Ok(v)) = (
+        id.parse::<uuid::Uuid>(),
+        serde_json::from_str::<Value>(&body),
+    ) else {
         return scim_error(StatusCode::BAD_REQUEST, "invalid request");
     };
     match extract_active(&v) {
@@ -1422,7 +1575,12 @@ async fn account_page(
              there's no per-user account here.</p>",
         ));
     };
-    let email = s.catalog.user_email(uid).await.map_err(e500)?.unwrap_or_default();
+    let email = s
+        .catalog
+        .user_email(uid)
+        .await
+        .map_err(e500)?
+        .unwrap_or_default();
     let current = session_cookie(&headers);
     let sessions = s
         .catalog
@@ -1528,7 +1686,12 @@ async fn console_page(
             })
             .collect(),
     };
-    Ok(shell(&s, &user, "Instance console", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "Instance console",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 /// G1 — the "is it done yet?" surface: recent mirror jobs and their state.
@@ -1554,9 +1717,7 @@ async fn activity_page(
                     "ready" => ("ok", "ready".to_owned()),
                     "running" => ("blue", "running".to_owned()),
                     "failed" => ("held", "failed".to_owned()),
-                    _ if j.attempts > 1 => {
-                        ("amber", format!("retrying · attempt {}", j.attempts))
-                    }
+                    _ if j.attempts > 1 => ("amber", format!("retrying · attempt {}", j.attempts)),
                     _ => ("slate", "queued".to_owned()),
                 };
                 let kind = match j.kind.as_str() {
@@ -1677,9 +1838,17 @@ async fn index(
     // Greeting: capitalize the first name-ish token of the email local part.
     let greeting = match user.id {
         Some(uid) => {
-            let email = s.catalog.user_email(uid).await.map_err(e500)?.unwrap_or_default();
+            let email = s
+                .catalog
+                .user_email(uid)
+                .await
+                .map_err(e500)?
+                .unwrap_or_default();
             let local = email.split('@').next().unwrap_or("");
-            let first = local.split(['.', '+', '_']).next().filter(|s| !s.is_empty());
+            let first = local
+                .split(['.', '+', '_'])
+                .next()
+                .filter(|s| !s.is_empty());
             match first {
                 Some(f) => format!("Welcome back, {}", capitalize(f)),
                 None => "Welcome back".to_owned(),
@@ -1842,7 +2011,12 @@ async fn repositories_page(
         vis: vis_filter.to_owned(),
         repos: rows,
     };
-    Ok(shell(&s, &user, "Repositories", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "Repositories",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 /// Uppercase the first character of `s` (ASCII/Unicode-aware), leaving the rest.
@@ -1877,7 +2051,12 @@ async fn new_repo_page(
         selected: q.org.unwrap_or_default(),
         orgs: admin_orgs,
     };
-    Ok(shell(&s, &user, "New repository", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "New repository",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 /// The "New organization" screen (superadmin).
@@ -1888,7 +2067,12 @@ async fn new_org_page(
     if !user.is_superadmin {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(shell(&s, &user, "New organization", &views::NewOrg.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "New organization",
+        &views::NewOrg.render().map_err(e500)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1906,7 +2090,11 @@ async fn create_org(
         return Err(StatusCode::FORBIDDEN);
     }
     // A retired slug can never be re-registered (it still redirects elsewhere).
-    if s.catalog.org_slug_retired(f.slug.trim()).await.map_err(e500)? {
+    if s.catalog
+        .org_slug_retired(f.slug.trim())
+        .await
+        .map_err(e500)?
+    {
         return Ok(error_card(
             &s,
             &user,
@@ -1944,7 +2132,11 @@ async fn create_repo(
         return Err(StatusCode::FORBIDDEN);
     }
     // A retired repo slug can't be reused (it still redirects).
-    if s.catalog.repo_slug_retired(org.id, f.repo.trim()).await.map_err(e500)? {
+    if s.catalog
+        .repo_slug_retired(org.id, f.repo.trim())
+        .await
+        .map_err(e500)?
+    {
         return Ok(error_card(
             &s,
             &user,
@@ -1977,7 +2169,9 @@ fn urlencode(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
             _ => {
                 let _ = write!(out, "%{b:02X}");
             }
@@ -2020,11 +2214,19 @@ async fn repo_page(
     let licenses = s.catalog.list_licenses(summary.id).await.map_err(e500)?;
     let grants = s.catalog.list_grants(summary.id).await.map_err(e500)?;
     let grant_rules = s.catalog.list_grant_rules(summary.id).await.map_err(e500)?;
-    let org_sets = s.catalog.list_package_sets(summary.org_id).await.map_err(e500)?;
+    let org_sets = s
+        .catalog
+        .list_package_sets(summary.org_id)
+        .await
+        .map_err(e500)?;
     let upstreams = s.catalog.list_upstreams(summary.id).await.map_err(e500)?;
     let ci_policies = s.catalog.ci_policies(summary.id).await.map_err(e500)?;
     let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
-    let dep_plan = s.catalog.list_dependency_plan(summary.id).await.map_err(e500)?;
+    let dep_plan = s
+        .catalog
+        .list_dependency_plan(summary.id)
+        .await
+        .map_err(e500)?;
     let title = format!("{org}/{repo}");
 
     // ---- Packages tab: version rows ----
@@ -2112,7 +2314,13 @@ async fn repo_page(
                 Option<&'static str>,
                 &'static str,
             ) = if p.archived {
-                ("slate", "archived · frozen", None, Some("unarchive"), "Un-archive")
+                (
+                    "slate",
+                    "archived · frozen",
+                    None,
+                    Some("unarchive"),
+                    "Un-archive",
+                )
             } else if p.sync_health == "broken" {
                 (
                     "amber",
@@ -2129,14 +2337,23 @@ async fn repo_page(
                     .chars()
                     .take(60)
                     .collect();
-                ("blue", "sync stale", Some(format!("retrying — {}", err.trim())), None, "")
+                (
+                    "blue",
+                    "sync stale",
+                    Some(format!("retrying — {}", err.trim())),
+                    None,
+                    "",
+                )
             };
             views::HealthRow {
                 pkg: p.name.clone(),
                 badge_tone: tone,
                 badge_label: label,
                 reason,
-                last: p.last_success_at.clone().unwrap_or_else(|| "never".to_owned()),
+                last: p
+                    .last_success_at
+                    .clone()
+                    .unwrap_or_else(|| "never".to_owned()),
                 action_value,
                 action_label,
             }
@@ -2151,7 +2368,10 @@ async fn repo_page(
             source_org: g.source_org.clone(),
             source_repo: g.source_repo.clone(),
             mode: g.policy.update_mode.clone().unwrap_or_default(),
-            cooldown: g.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
+            cooldown: g
+                .policy
+                .cooldown_days
+                .map_or_else(String::new, |d| d.to_string()),
         })
         .collect();
     let mut autogrant_rules = Vec::with_capacity(grant_rules.len());
@@ -2201,9 +2421,17 @@ async fn repo_page(
                 kind: u.kind.clone(),
                 is_composer: u.kind == "composer",
                 base: u.base.clone(),
-                filter: u.package_filter.clone(),
-                error: failed
-                    .then(|| u.job_error.clone().unwrap_or_else(|| "sync failed".to_owned())),
+                requires: u
+                    .requires
+                    .iter()
+                    .map(sconce_catalog::UpstreamRequire::to_spec)
+                    .collect(),
+                source_paths: u.source_paths.clone(),
+                error: failed.then(|| {
+                    u.job_error
+                        .clone()
+                        .unwrap_or_else(|| "sync failed".to_owned())
+                }),
                 public: u.visibility == "public",
                 has_credential: u.has_credential,
                 credential_type: u.credential_type.clone(),
@@ -2254,7 +2482,10 @@ async fn repo_page(
                 })
                 .collect(),
             mode: l.policy.update_mode.clone().unwrap_or_default(),
-            cooldown: l.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
+            cooldown: l
+                .policy
+                .cooldown_days
+                .map_or_else(String::new, |d| d.to_string()),
             until: l.bound.until.clone().unwrap_or_default(),
             major: l.bound.major.map_or_else(String::new, |m| m.to_string()),
         })
@@ -2274,7 +2505,10 @@ async fn repo_page(
             expired: t.expired,
             expires: t.expires.clone(),
             mode: t.policy.update_mode.clone().unwrap_or_default(),
-            cooldown: t.policy.cooldown_days.map_or_else(String::new, |d| d.to_string()),
+            cooldown: t
+                .policy
+                .cooldown_days
+                .map_or_else(String::new, |d| d.to_string()),
             id: t.id.to_string(),
         })
         .collect();
@@ -2312,7 +2546,11 @@ async fn repo_page(
         .count_package_versions(summary.id, None, Some("held"))
         .await
         .map_err(e500)?;
-    let has_status = |st: &str| upstreams.iter().any(|u| u.job_status.as_deref() == Some(st));
+    let has_status = |st: &str| {
+        upstreams
+            .iter()
+            .any(|u| u.job_status.as_deref() == Some(st))
+    };
     let (sync_tone, sync_label) = if upstreams.is_empty() {
         ("slate", "no upstreams")
     } else if has_status("failed") {
@@ -2323,7 +2561,10 @@ async fn repo_page(
         ("ok", "synced")
     };
     let policy_phrase = match summary.update_mode.as_str() {
-        "delayed" => format!("delayed updates with a {}-day cooldown", summary.cooldown_days),
+        "delayed" => format!(
+            "delayed updates with a {}-day cooldown",
+            summary.cooldown_days
+        ),
         "manual" => "manual approval required".to_owned(),
         _ => "automatic updates".to_owned(),
     };
@@ -2407,7 +2648,13 @@ async fn repo_page(
         tokens: token_rows,
         ci,
     };
-    Ok(shell_js(&s, &user, &title, &view.render().map_err(e500)?, "/assets/repo.js"))
+    Ok(shell_js(
+        &s,
+        &user,
+        &title,
+        &view.render().map_err(e500)?,
+        "/assets/repo.js",
+    ))
 }
 
 // ----- repo actions (access already enforced by `lookup`) -----
@@ -2459,7 +2706,11 @@ async fn version_action(
                 .await
         }
         "yank" => s.catalog.yank_version(id, &f.package, &f.normalized).await,
-        "unyank" => s.catalog.unyank_version(id, &f.package, &f.normalized).await,
+        "unyank" => {
+            s.catalog
+                .unyank_version(id, &f.package, &f.normalized)
+                .await
+        }
         _ => return Err(StatusCode::BAD_REQUEST),
     }
     .map_err(e500)?;
@@ -2482,7 +2733,10 @@ async fn package_detail_page(
     let summary = lookup(&s, &user, &org, &repo).await?;
     let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
     let Some(ps) = packages.iter().find(|p| p.name == pkg) else {
-        return Ok(status_page("Package not found", "No such package in this repository."));
+        return Ok(status_page(
+            "Package not found",
+            "No such package in this repository.",
+        ));
     };
     let versions = s
         .catalog
@@ -2493,7 +2747,13 @@ async fn package_detail_page(
     // Lifecycle header badge + optional archive action.
     let stale = ps.sync_health == "ok" && !ps.archived && ps.upstream_error.is_some();
     let (life_tone, life_label, life_reason, action_value, action_label) = if ps.archived {
-        ("slate", "archived · frozen", None, Some("unarchive"), "Un-archive")
+        (
+            "slate",
+            "archived · frozen",
+            None,
+            Some("unarchive"),
+            "Un-archive",
+        )
     } else if ps.sync_health == "broken" {
         (
             "amber",
@@ -2503,7 +2763,13 @@ async fn package_detail_page(
             "Archive",
         )
     } else if stale {
-        ("blue", "sync stale · retrying", None, Some("archive"), "Archive")
+        (
+            "blue",
+            "sync stale · retrying",
+            None,
+            Some("archive"),
+            "Archive",
+        )
     } else {
         ("ok", "healthy", None, None, "")
     };
@@ -2552,7 +2818,10 @@ async fn package_detail_page(
         action_label,
         visibility: ps.visibility.clone(),
         nver: versions.len(),
-        last: ps.last_success_at.clone().unwrap_or_else(|| "never".to_owned()),
+        last: ps
+            .last_success_at
+            .clone()
+            .unwrap_or_else(|| "never".to_owned()),
         sync_error: ps.upstream_error.clone().filter(|_| stale),
         versions: rows,
     };
@@ -2609,12 +2878,22 @@ async fn add_ci(
         return Err(StatusCode::BAD_REQUEST);
     }
     let ttl = match f.ttl.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
-        Some(t) => t.parse::<i64>().map_err(|_| StatusCode::BAD_REQUEST)?.max(60),
+        Some(t) => t
+            .parse::<i64>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .max(60),
         None => 900,
     };
     let claims = parse_claims(f.claims.as_deref().unwrap_or(""));
     s.catalog
-        .add_ci_policy(id, &f.provider, f.issuer.trim(), f.audience.trim(), &claims, ttl)
+        .add_ci_policy(
+            id,
+            &f.provider,
+            f.issuer.trim(),
+            f.audience.trim(),
+            &claims,
+            ttl,
+        )
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}#ci")))
@@ -2632,8 +2911,13 @@ async fn remove_ci(
     Form(f): Form<CiRemoveForm>,
 ) -> Result<Redirect, StatusCode> {
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    s.catalog.delete_ci_policy(repo_id, id).await.map_err(e500)?;
+    let id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog
+        .delete_ci_policy(repo_id, id)
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}#ci")))
 }
 
@@ -2662,11 +2946,17 @@ async fn add_autogrant(
     Form(f): Form<AutograntForm>,
 ) -> Result<Redirect, StatusCode> {
     let summary = lookup_admin(&s, &user, &org, &repo).await?;
-    let set_id = f.set_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let set_id = f
+        .set_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     // The set must belong to this repo's org.
     match s.catalog.package_set(set_id).await.map_err(e500)? {
         Some((_, set_org)) if set_org == summary.org_id => {
-            s.catalog.add_grant_rule(summary.id, set_id).await.map_err(e500)?;
+            s.catalog
+                .add_grant_rule(summary.id, set_id)
+                .await
+                .map_err(e500)?;
             Ok(Redirect::to(&format!("/r/{org}/{repo}")))
         }
         _ => Err(StatusCode::BAD_REQUEST),
@@ -2680,8 +2970,13 @@ async fn remove_autogrant(
     Form(f): Form<IdForm>,
 ) -> Result<Redirect, StatusCode> {
     let summary = lookup_admin(&s, &user, &org, &repo).await?;
-    let rule_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    s.catalog.remove_grant_rule(summary.id, rule_id).await.map_err(e500)?;
+    let rule_id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog
+        .remove_grant_rule(summary.id, rule_id)
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 
@@ -2701,7 +2996,10 @@ async fn set_grant_policy_action(
         None | Some("") => None,
         Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
     };
-    let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
+    let policy = sconce_catalog::PolicyOverride {
+        update_mode,
+        cooldown_days,
+    };
     s.catalog
         .set_grant_policy(repo_id, f.package.trim(), &policy)
         .await
@@ -2736,9 +3034,14 @@ struct UpstreamForm {
     /// into the stored `user:token` credential here.
     cred_user: Option<String>,
     credential_type: Option<String>,
-    package_filter: Option<String>,
+    /// Mirror subscription: one entry per line (`vendor/*@2.4`, `re:^x/`, `*`, …).
+    /// Required for a composer upstream.
+    requires: Option<String>,
+    /// git-only: monorepo subpaths to mirror, one per line (empty = repo root).
+    source_paths: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn create_upstream(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
@@ -2755,14 +3058,22 @@ async fn create_upstream(
     if !matches!(credential_type, "basic" | "github" | "gitlab" | "bearer") {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let package_filter = f
-        .package_filter
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty());
+    // Parse the mirror subscription (one entry per line). A malformed entry or an
+    // empty list for a composer upstream is refused.
+    let mut requires = Vec::new();
+    for line in f.requires.as_deref().unwrap_or("").lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match sconce_catalog::UpstreamRequire::parse(line) {
+            Ok(r) => requires.push(r),
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        }
+    }
     // A composer upstream must be scoped — refuse to register one that would
-    // mirror the whole registry on sync.
-    if f.kind == "composer" && package_filter.is_none() {
+    // mirror the whole registry on sync (an explicit `*` entry opts into all).
+    if f.kind == "composer" && requires.is_empty() {
         let body = views::UpstreamNotice {
             reason: "filter",
             org: org.clone(),
@@ -2775,12 +3086,18 @@ async fn create_upstream(
     let label = f.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
     // For basic auth the username comes from a separate box; fold it into the
     // stored `user:token` form (unless the token already contains a `user:`).
-    let token = f.credential.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let cred_user = f.cred_user.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let token = f
+        .credential
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let cred_user = f
+        .cred_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
     let combined = match (credential_type, cred_user, token) {
-        ("basic", Some(user), Some(tok)) if !tok.contains(':') => {
-            Some(format!("{user}:{tok}"))
-        }
+        ("basic", Some(user), Some(tok)) if !tok.contains(':') => Some(format!("{user}:{tok}")),
         _ => token.map(str::to_owned),
     };
     // Public upstreams carry no credential — ignore any submitted one (so no key
@@ -2821,12 +3138,29 @@ async fn create_upstream(
         )
         .await
         .map_err(e500)?;
-    // Store the composer package filter (required above for composer kind).
-    if let Some(p) = package_filter {
+    // Store the mirror subscription (required above for a composer upstream).
+    if !requires.is_empty() {
         s.catalog
-            .set_upstream_filter(repo_id, id, Some(p))
+            .set_upstream_requires(repo_id, id, &requires)
             .await
             .map_err(e500)?;
+    }
+    // Store any monorepo source-paths (git upstreams only).
+    if f.kind == "git" {
+        let paths: Vec<String> = f
+            .source_paths
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !paths.is_empty() {
+            s.catalog
+                .set_upstream_source_paths(repo_id, id, &paths)
+                .await
+                .map_err(e500)?;
+        }
     }
     Ok(Redirect::to(&format!("/r/{org}/{repo}")).into_response())
 }
@@ -2838,7 +3172,9 @@ async fn remove_upstream(
     Form(f): Form<RevokeTokenForm>,
 ) -> Result<Redirect, StatusCode> {
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     s.catalog.delete_upstream(repo_id, id).await.map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
@@ -2853,7 +3189,9 @@ async fn sync_upstream(
 ) -> Result<Redirect, StatusCode> {
     // The upstream must belong to a repo the user can access.
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     if !s
         .catalog
         .list_upstreams(repo_id)
@@ -2954,7 +3292,12 @@ async fn create_license(
         org: org.clone(),
         repo: repo.clone(),
     };
-    Ok(shell(&s, &user, "License created", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "License created",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -3016,7 +3359,12 @@ async fn create_token(
         org: org.clone(),
         repo: repo.clone(),
     };
-    Ok(shell(&s, &user, "Token created", &view.render().map_err(e500)?))
+    Ok(shell(
+        &s,
+        &user,
+        "Token created",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -3031,7 +3379,9 @@ async fn revoke_token(
     Form(f): Form<RevokeTokenForm>,
 ) -> Result<Redirect, StatusCode> {
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let token_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token_id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     s.catalog
         .revoke_token(repo_id, token_id)
         .await
@@ -3063,7 +3413,10 @@ async fn set_token_policy(
         None | Some("") => None,
         Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
     };
-    let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
+    let policy = sconce_catalog::PolicyOverride {
+        update_mode,
+        cooldown_days,
+    };
     s.catalog
         .set_token_policy(repo_id, &f.label, &policy)
         .await
@@ -3085,7 +3438,9 @@ async fn set_license_bound_action(
     Form(f): Form<LicenseBoundForm>,
 ) -> Result<Redirect, StatusCode> {
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let license_id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     let until = f.until.as_deref().map(str::trim).filter(|x| !x.is_empty());
     let major = match f.major.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
         None => None,
@@ -3112,7 +3467,9 @@ async fn set_license_policy(
     Form(f): Form<LicensePolicyForm>,
 ) -> Result<Redirect, StatusCode> {
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let license_id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     let update_mode = match f.mode.as_str() {
         "auto" | "manual" | "delayed" => Some(f.mode.clone()),
         "" => None,
@@ -3122,7 +3479,10 @@ async fn set_license_policy(
         None | Some("") => None,
         Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
     };
-    let policy = sconce_catalog::PolicyOverride { update_mode, cooldown_days };
+    let policy = sconce_catalog::PolicyOverride {
+        update_mode,
+        cooldown_days,
+    };
     s.catalog
         .set_license_policy(repo_id, license_id, &policy)
         .await
@@ -3143,14 +3503,22 @@ async fn entitle_license_set(
     Form(f): Form<LicenseSetForm>,
 ) -> Result<Redirect, StatusCode> {
     let summary = lookup_admin(&s, &user, &org, &repo).await?;
-    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let set_id = f.set_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let license_id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let set_id = f
+        .set_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     // The set must belong to the repo's org (no cross-tenant entitlement).
     match s.catalog.package_set(set_id).await.map_err(e500)? {
         Some((_, org_id)) if org_id == summary.org_id => {}
         _ => return Err(StatusCode::BAD_REQUEST),
     }
-    s.catalog.entitle_set(license_id, set_id).await.map_err(e500)?;
+    s.catalog
+        .entitle_set(license_id, set_id)
+        .await
+        .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 
@@ -3161,8 +3529,13 @@ async fn remove_license_set(
     Form(f): Form<LicenseSetForm>,
 ) -> Result<Redirect, StatusCode> {
     lookup_admin(&s, &user, &org, &repo).await?;
-    let license_id = f.id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let set_id = f.set_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let license_id =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let set_id = f
+        .set_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     s.catalog
         .remove_set_entitlement(license_id, set_id)
         .await

@@ -73,6 +73,8 @@ pub enum Error {
     },
     #[error("a tree path was not valid UTF-8: {path:?}")]
     NonUtf8Path { path: String },
+    #[error("subtree {subpath:?} not found at {refspec:?}")]
+    SubtreeNotFound { refspec: String, subpath: String },
 }
 
 /// Build a [`CanonicalArchive`] from the tree that `refspec` resolves to in the
@@ -84,6 +86,20 @@ pub fn archive_ref(
     repo_path: impl AsRef<std::path::Path>,
     refspec: &str,
 ) -> Result<CanonicalArchive, Error> {
+    archive_subtree(repo_path, refspec, "")
+}
+
+/// Like [`archive_ref`], but archive only the subtree rooted at `subpath` (a
+/// monorepo package's directory, e.g. `src/Symfony/Component/Console`). `""`
+/// archives the repo root (identical to [`archive_ref`]). Archive paths and
+/// `.gitattributes export-ignore` are evaluated **relative to `subpath`**, so the
+/// subtree archives exactly as if it were its own repository — matching how a
+/// per-package Composer dist of a monorepo subdir looks.
+pub fn archive_subtree(
+    repo_path: impl AsRef<std::path::Path>,
+    refspec: &str,
+    subpath: &str,
+) -> Result<CanonicalArchive, Error> {
     let repo = gix::open(repo_path.as_ref()).map_err(|e| Error::Open(Box::new(e)))?;
 
     let id = repo
@@ -92,7 +108,7 @@ pub fn archive_ref(
             refspec: refspec.to_owned(),
             source: Box::new(source),
         })?;
-    let tree = id
+    let root = id
         .object()
         .map_err(|source| Error::PeelToTree {
             refspec: refspec.to_owned(),
@@ -103,6 +119,33 @@ pub fn archive_ref(
             refspec: refspec.to_owned(),
             source: Box::new(source),
         })?;
+    // Navigate to the requested subtree (the whole tree when `subpath` is empty).
+    let subpath = subpath.trim_matches('/');
+    let tree = if subpath.is_empty() {
+        root
+    } else {
+        let entry = root
+            .lookup_entry_by_path(subpath)
+            .map_err(|e| Error::PeelToTree {
+                refspec: refspec.to_owned(),
+                source: Box::new(e),
+            })?
+            .ok_or_else(|| Error::SubtreeNotFound {
+                refspec: refspec.to_owned(),
+                subpath: subpath.to_owned(),
+            })?;
+        entry
+            .object()
+            .map_err(|e| Error::PeelToTree {
+                refspec: refspec.to_owned(),
+                source: Box::new(e),
+            })?
+            .peel_to_tree()
+            .map_err(|e| Error::PeelToTree {
+                refspec: refspec.to_owned(),
+                source: Box::new(e),
+            })?
+    };
     let tree_id = tree.id;
 
     // Attribute stack that reads `.gitattributes` from the tree itself (via an
@@ -385,6 +428,65 @@ mod tests {
         names.retain(|n| !n.ends_with('/'));
         names.sort();
         names
+    }
+
+    #[test]
+    fn archives_a_subtree_as_its_own_root() {
+        // A monorepo with two packages at subpaths, plus a root file.
+        let dir = tempdir();
+        write(&dir, "composer.json", b"{\"name\":\"acme/mono\"}\n");
+        write(
+            &dir,
+            "packages/console/composer.json",
+            b"{\"name\":\"acme/console\"}\n",
+        );
+        write(&dir, "packages/console/src/Console.php", b"<?php\n");
+        write(
+            &dir,
+            "packages/console/.gitattributes",
+            b"/tests export-ignore\n",
+        );
+        write(&dir, "packages/console/tests/T.php", b"<?php\n");
+        write(
+            &dir,
+            "packages/http/composer.json",
+            b"{\"name\":\"acme/http\"}\n",
+        );
+        commit_repo(&dir);
+
+        // The subtree archives with paths relative to it — no `packages/console/`
+        // prefix — and its own `.gitattributes export-ignore` applies.
+        let zip = archive_subtree(&dir, "HEAD", "packages/console")
+            .unwrap()
+            .into_zip();
+        let names = local_header_names(&zip);
+        assert!(names.contains(&"composer.json".to_string()));
+        assert!(names.contains(&"src/Console.php".to_string()));
+        assert!(names.contains(&".gitattributes".to_string()));
+        assert!(
+            !names.iter().any(|n| n.starts_with("packages/")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("tests/")),
+            "subtree export-ignore applies"
+        );
+        // Sibling package + root file are absent from this package's archive.
+        assert!(!names.iter().any(|n| n.contains("http")));
+
+        // A trailing/leading slash is tolerated; a missing subpath errors.
+        assert!(archive_subtree(&dir, "HEAD", "/packages/http/").is_ok());
+        assert!(matches!(
+            archive_subtree(&dir, "HEAD", "packages/missing"),
+            Err(Error::SubtreeNotFound { .. })
+        ));
+        // Empty subpath == archive_ref (whole repo root).
+        assert_eq!(
+            local_header_names(&archive_subtree(&dir, "HEAD", "").unwrap().into_zip()),
+            archived_paths(&dir),
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

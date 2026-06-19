@@ -7,12 +7,12 @@
 //! maps the identity to a session — this module never touches the catalog.
 #![allow(clippy::doc_markdown)] // OIDC/PKCE/JWKS acronyms read fine unbacktick'd
 
+use openidconnect::TokenResponse as _;
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, reqwest,
 };
-use openidconnect::TokenResponse as _;
 use sconce_catalog::OidcConnection;
 
 /// What [`begin`] returns: where to send the browser, and the flow state to
@@ -58,8 +58,8 @@ fn http_client() -> Result<reqwest::Client, Error> {
 /// boundary — so callers inline this via the `oidc_client!` pattern below.
 macro_rules! build_client {
     ($conn:expr, $secret:expr, $http:expr) => {{
-        let issuer = IssuerUrl::new($conn.issuer_url.clone())
-            .map_err(|e| Error::Config(e.to_string()))?;
+        let issuer =
+            IssuerUrl::new($conn.issuer_url.clone()).map_err(|e| Error::Config(e.to_string()))?;
         let redirect = RedirectUrl::new($conn.redirect_url.clone())
             .map_err(|e| Error::Config(e.to_string()))?;
         let metadata = CoreProviderMetadata::discover_async(issuer, $http)

@@ -464,7 +464,11 @@ pub struct UpstreamRow {
     pub kind: String,
     pub is_composer: bool,
     pub base: String,
-    pub filter: Option<String>,
+    /// The mirror subscription rendered as spec strings (`mage-os/*@2.4`, …);
+    /// empty = no require-list (a git source mirrored whole).
+    pub requires: Vec<String>,
+    /// git monorepo subpaths this upstream mirrors (empty = repo root).
+    pub source_paths: Vec<String>,
     pub error: Option<String>,
     pub public: bool,
     pub has_credential: bool,
