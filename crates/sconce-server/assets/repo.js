@@ -50,6 +50,89 @@ for (const form of document.querySelectorAll('form[data-confirm]')) {
   }
 }
 
+// Approvals tab: the approval queue — filter chips, package search, per-package
+// expand/collapse, and a selection bar that bulk-approves the ticked versions.
+{
+  const queue = document.getElementById('ap-queue');
+  if (queue) {
+    const sections = [...queue.querySelectorAll('.apsec')];
+    const items = [...queue.querySelectorAll('.apgroup, .apcool, .apheld')];
+    const search = document.getElementById('ap-search');
+    const filters = document.getElementById('ap-filters');
+    let bucket = 'all';
+
+    // Show items matching the active bucket + search; hide now-empty sections.
+    const apply = () => {
+      const query = (search?.value || '').trim().toLowerCase();
+      for (const item of items) {
+        const ok = (query === '' || (item.dataset.pkg || '').includes(query));
+        item.style.display = ok ? '' : 'none';
+      }
+      for (const sec of sections) {
+        const inBucket = bucket === 'all' || sec.dataset.bucket === bucket;
+        const anyVisible = [...sec.querySelectorAll('.apgroup, .apcool, .apheld')]
+          .some((el) => el.style.display !== 'none');
+        sec.style.display = inBucket && anyVisible ? '' : 'none';
+      }
+    };
+
+    search?.addEventListener('input', apply);
+    if (filters) {
+      for (const chip of filters.querySelectorAll('.apchip')) {
+        chip.addEventListener('click', () => {
+          for (const c of filters.querySelectorAll('.apchip')) c.classList.remove('on');
+          chip.classList.add('on');
+          bucket = chip.dataset.bucket;
+          apply();
+        });
+      }
+    }
+
+    // Expand/collapse a package group (ignore clicks on its inner controls).
+    for (const head of queue.querySelectorAll('.apghead')) {
+      head.addEventListener('click', (e) => {
+        if (e.target.closest('a, .apall, .apgcheck')) return;
+        head.parentElement.classList.toggle('open');
+      });
+    }
+
+    // Selection → bulk-approve bar.
+    const bulk = document.getElementById('ap-bulk');
+    const selVals = document.getElementById('ap-selvals');
+    const selN = document.getElementById('ap-seln');
+    const clear = document.getElementById('ap-clear');
+    const boxes = [...queue.querySelectorAll('.apvcheck')];
+
+    const refresh = () => {
+      const picked = boxes.filter((b) => b.checked);
+      selVals.value = picked.map((b) => b.dataset.val).join('\n');
+      selN.textContent = picked.length;
+      bulk.hidden = picked.length === 0;
+      // Reflect each group's row selection in its header checkbox.
+      for (const head of queue.querySelectorAll('.apgcheck')) {
+        const rows = [...head.closest('.apgroup').querySelectorAll('.apvcheck')];
+        const on = rows.filter((b) => b.checked).length;
+        head.checked = on > 0 && on === rows.length;
+        head.indeterminate = on > 0 && on < rows.length;
+      }
+    };
+
+    for (const box of boxes) box.addEventListener('change', refresh);
+    for (const head of queue.querySelectorAll('.apgcheck')) {
+      head.addEventListener('change', () => {
+        for (const b of head.closest('.apgroup').querySelectorAll('.apvcheck')) {
+          b.checked = head.checked;
+        }
+        refresh();
+      });
+    }
+    clear?.addEventListener('click', () => {
+      for (const b of boxes) b.checked = false;
+      refresh();
+    });
+  }
+}
+
 // Upstreams add-form: reveal the credential fields only for a private source.
 {
   const vis = document.getElementById('upvis');

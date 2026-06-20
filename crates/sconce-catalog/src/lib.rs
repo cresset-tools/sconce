@@ -3960,6 +3960,29 @@ impl Catalog {
             .await
     }
 
+    /// Bulk-approve every still-undecided version in a repo (those with no
+    /// hold / yank / approval yet), optionally narrowed to one package. Powers
+    /// the Approvals tab's per-package "Approve all N" and footer "Approve all
+    /// pending" actions. Returns the number of versions exposed.
+    pub async fn approve_all_pending(
+        &self,
+        repo_id: Uuid,
+        package: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        let done = sqlx::query(
+            "update package_versions pv set approved_at = now() \
+             from packages p \
+             where p.id = pv.package_id and p.repo_id = $1 \
+               and ($2::text is null or p.name = $2) \
+               and pv.held_at is null and pv.yanked_at is null and pv.approved_at is null",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Set `held_at`/`approved_at` to `now()`/`null` for one version in a repo.
     /// `column` and `value` are fixed literals chosen by the callers above —
     /// never user input — so interpolating them is safe.
@@ -5867,6 +5890,85 @@ mod tests {
                 .await
                 .unwrap()
                 .contains(&"acme/x".to_owned())
+        );
+    }
+
+    /// The Approvals tab's bulk action: `approve_all_pending` exposes every
+    /// still-undecided version (optionally one package) and never touches held
+    /// ones. Also exercises the `pending` / `held` state filters the tab reads.
+    #[tokio::test]
+    async fn bulk_approve_pending_skips_held() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        cat.set_update_policy(repo_id, "manual", 0).await.unwrap();
+        let cj = serde_json::json!({"name": "x"});
+        // Two packages, two unapproved versions each; hold one of them.
+        for name in ["acme/a", "acme/b"] {
+            let pkg = cat
+                .upsert_package(repo_id, name, "git", None, Visibility::Private)
+                .await
+                .unwrap();
+            for v in ["1.0.0", "1.1.0"] {
+                cat.upsert_package_version(
+                    pkg,
+                    v,
+                    &format!("{v}.0"),
+                    "stable",
+                    &cj,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        cat.hold_version(repo_id, "acme/b", "1.1.0.0").await.unwrap();
+
+        // 4 versions, 1 held → 3 pending, 1 held (the tab's bucket counts).
+        assert_eq!(
+            cat.count_package_versions(repo_id, None, Some("pending"))
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            cat.count_package_versions(repo_id, None, Some("held"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Per-package "Approve all" only clears that package's pending versions.
+        assert_eq!(
+            cat.approve_all_pending(repo_id, Some("acme/a"))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            cat.count_package_versions(repo_id, None, Some("pending"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Repo-wide "Approve all pending" clears the remaining one and leaves the
+        // held version held (approve_all_pending skips held_at-set rows).
+        assert_eq!(cat.approve_all_pending(repo_id, None).await.unwrap(), 1);
+        assert_eq!(
+            cat.count_package_versions(repo_id, None, Some("pending"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            cat.count_package_versions(repo_id, None, Some("held"))
+                .await
+                .unwrap(),
+            1
         );
     }
 }

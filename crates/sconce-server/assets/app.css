@@ -1673,3 +1673,469 @@ pre code {
   flex: none;
   height: 36px;
 }
+
+/* ---- Approvals tab: the approval queue ---- */
+/* A white panel (header strip, filter toolbar, bulk bar, then grouped/carded
+   versions and a footer) mirroring the Slate "Approval queue" design. */
+.apqueue {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(16, 18, 26, 0.05);
+}
+.aphead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 22px;
+  border-bottom: 1px solid var(--soft);
+}
+.aphead .apttl {
+  display: flex;
+  align-items: baseline;
+  gap: 11px;
+  flex-wrap: wrap;
+}
+.aphead .h {
+  font-size: 16px;
+  font-weight: 600;
+}
+.aphead .meta {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.aphead .meta strong {
+  color: #2a2f39;
+  font-weight: 600;
+}
+.aphead .meta strong.danger {
+  color: #b8392c;
+}
+.apsync {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--accent-fg);
+  background: #f1effc;
+  border: 1px solid #e2dcf8;
+  border-radius: 6px;
+  padding: 4px 10px;
+  flex: none;
+}
+.apsync .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* toolbar: filter chips + package search */
+.aptool {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 11px 22px;
+  border-bottom: 1px solid var(--soft);
+}
+.apfilters {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  background: #f3f4f6;
+  border-radius: 9px;
+  padding: 3px;
+}
+.apchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #6b7280;
+  cursor: pointer;
+  user-select: none;
+}
+.apchip .c {
+  font-size: 11px;
+  color: #aab0bb;
+  font-family: var(--mono);
+}
+.apchip.danger {
+  color: #b8392c;
+}
+.apchip.on {
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(16, 18, 26, 0.06);
+  font-weight: 600;
+  color: #2a2f39;
+}
+.apchip.on .c {
+  color: #9098a4;
+}
+.apchip.danger.on {
+  color: #b8392c;
+}
+.apsearch {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid #dcdfe6;
+  border-radius: 8px;
+  width: 220px;
+}
+.apsearch svg {
+  color: #aab0bb;
+  flex: none;
+}
+.apsearch input {
+  border: 0;
+  outline: 0;
+  background: none;
+  width: 100%;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+/* bulk action bar (revealed when versions are ticked) */
+.apbulk {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 10px 22px;
+  background: #f1effc;
+  border-bottom: 1px solid #e2dcf8;
+}
+.apbulk[hidden] {
+  display: none;
+}
+.apbulk .mark {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  border-radius: 5px;
+  background: var(--accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.apbulk .n {
+  font-size: 12.5px;
+  color: #2a2f39;
+}
+.apbulk button.ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+  background: #127544;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.apbulk button.ok:hover {
+  background: #0f6038;
+}
+.apbulk #ap-clear {
+  margin-left: auto;
+  height: 30px;
+  font-size: 12px;
+}
+
+.apbody {
+  padding: 16px 22px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.aplabel {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: #a2a9b4;
+}
+.aplabel.danger {
+  color: #c0362c;
+}
+.apsec {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* a per-package pending group: header + (collapsible) version rows */
+.apgroup {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.apghead {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 16px;
+  background: #fbfbfe;
+}
+.apgroup.open .apghead {
+  border-bottom: 1px solid var(--soft);
+}
+.apghead .pkg {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2a2f39;
+}
+.apghead .pkg a {
+  color: inherit;
+}
+.apchev {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: 0;
+  background: none;
+  color: #8a93a0;
+  transition: transform 0.15s;
+}
+.apchev:hover {
+  background: none;
+  color: var(--text2);
+}
+.apgroup.open .apchev {
+  transform: rotate(90deg);
+}
+.apghead .apall {
+  margin-left: auto;
+}
+button.approveall {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px;
+  background: var(--surface);
+  border: 1px solid #b7e0c6;
+  color: #127544;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+button.approveall:hover {
+  background: #eaf6ef;
+  border-color: #a6d6b8;
+}
+.apgrows {
+  display: none;
+}
+.apgroup.open .apgrows {
+  display: block;
+}
+.aprow {
+  display: grid;
+  grid-template-columns: 22px 150px 88px 1fr 130px 70px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #f5f6f8;
+}
+.aprow:last-child {
+  border-bottom: 0;
+}
+.aprow .ver {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #2a2f39;
+}
+.aprow .age {
+  font-size: 12px;
+  color: var(--muted);
+}
+.aprow .sha {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 11.5px;
+  color: #9aa1ad;
+}
+.aprow .acts {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.aprow .acts button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+}
+.aprow .acts button.iapprove {
+  background: #eaf6ef;
+  border-color: #c4e6d2;
+  color: #127544;
+}
+.aprow .acts button.iapprove:hover {
+  background: #dcefe3;
+}
+.aprow .acts button.ihold {
+  color: #8a93a0;
+}
+.apmore {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.apmore > span:first-child {
+  width: 22px;
+}
+.apmore a {
+  margin-left: auto;
+  font-weight: 600;
+}
+
+/* cooldown card: countdown + progress bar */
+.apcool {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.apcool .h {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 18px 11px;
+}
+.apcool .h code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #2a2f39;
+}
+.apcool .h code .v {
+  color: #aab0bb;
+}
+.apcool .h .left {
+  font-size: 12px;
+  font-weight: 600;
+  color: #8a5a00;
+  font-family: var(--mono);
+}
+.apcool .apearly {
+  margin-left: auto;
+}
+.apcool .bar {
+  height: 7px;
+  margin: 0 18px 14px;
+  border-radius: 4px;
+  background: #f1f2f5;
+  overflow: hidden;
+}
+.apcool .bar span {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #e0a400, #d09000);
+}
+
+/* held card: a red, dangerous surface */
+.apheld {
+  background: #fef6f5;
+  border: 1px solid #f1c7c0;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 0 0 3px rgba(216, 58, 44, 0.05);
+}
+.apheld .h {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 18px;
+  border-bottom: 1px solid #f4d3cd;
+  color: #c0362c;
+}
+.apheld .h code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #7d231b;
+}
+.apheld .h code .v {
+  color: #c08a84;
+}
+.apheld .h .tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 21px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  background: #d83a2c;
+  color: #fff;
+}
+.apheld .h .tag .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fff;
+}
+.apheld .h .rel {
+  font-size: 11.5px;
+  color: #b07a73;
+}
+.apheld .h form {
+  margin-left: auto;
+}
+.apheld .h button {
+  border-color: #e7c3bd;
+  color: #b8392c;
+}
+.apheld .desc {
+  padding: 11px 18px;
+  font-size: 12.5px;
+  color: #9a4a42;
+}
+
+.apnote {
+  font-size: 12px;
+  color: var(--muted);
+}
+.apfoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 4px 2px;
+  border-top: 1px solid var(--soft);
+}

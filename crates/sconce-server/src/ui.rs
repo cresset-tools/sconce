@@ -157,6 +157,7 @@ pub fn router(
         .route("/r/{org}/{repo}/delete", post(delete_repo_action))
         .route("/r/{org}/{repo}/policy", post(set_policy))
         .route("/r/{org}/{repo}/version", post(version_action))
+        .route("/r/{org}/{repo}/approve-bulk", post(approve_bulk))
         .route("/r/{org}/{repo}/token", post(create_token))
         .route("/r/{org}/{repo}/token/revoke", post(revoke_token))
         .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
@@ -2384,6 +2385,10 @@ async fn repo_page(
     // Paginate the (potentially long) packages & versions list, with optional
     // name search + state filter.
     const PER_PAGE: i64 = 50;
+    // Approval-queue display caps (Approvals tab).
+    const AP_CAP: i64 = 300; // versions fetched per state for the queue
+    const AP_ROWS: usize = 4; // pending rows shown per package group
+    const AP_CARDS: usize = 8; // cooldown / held cards before "+ N more"
     let summary = lookup(&s, &user, &org, &repo).await?;
     let name_q = q.q.as_deref().map(str::trim).filter(|x| !x.is_empty());
     let state_q = q
@@ -2553,6 +2558,115 @@ async fn repo_page(
             }
         })
         .collect();
+
+    // ---- Approvals: the approval queue (pending groups, cooldown, held) ----
+    let pending_versions = s
+        .catalog
+        .admin_package_versions(summary.id, AP_CAP + 1, 0, None, Some("pending"))
+        .await
+        .map_err(e500)?;
+    let held_versions = s
+        .catalog
+        .admin_package_versions(summary.id, AP_CAP + 1, 0, None, Some("held"))
+        .await
+        .map_err(e500)?;
+    let cap = usize::try_from(AP_CAP).unwrap_or(usize::MAX);
+    let ap_capped = pending_versions.len() > cap || held_versions.len() > cap;
+
+    // Short dist sha → "a3f9c1b…e7d2"; release timestamp → its date.
+    let short_sha = |h: &Option<String>| match h {
+        Some(x) if x.len() > 12 => format!("{}…{}", &x[..7], &x[x.len() - 4..]),
+        Some(x) => x.clone(),
+        None => "—".to_owned(),
+    };
+    let rel_date = |r: &Option<String>| {
+        r.as_deref()
+            .map_or_else(|| "—".to_owned(), |t| t.get(..10).unwrap_or(t).to_owned())
+    };
+
+    // In a delayed repo an un-decided version with days left is "cooling"
+    // (auto-exposes later); everywhere else an un-decided version is "pending".
+    let delayed = summary.update_mode == "delayed";
+    let is_cooling = |v: &sconce_catalog::AdminVersion| {
+        delayed && matches!(v.cooldown_days_left, Some(n) if n > 0)
+    };
+
+    // Cooldown cards: a countdown + progress bar per still-cooling version.
+    let ap_cooldown = pending_versions.iter().filter(|v| is_cooling(v)).count();
+    let ap_cooldowns: Vec<views::CooldownCard> = pending_versions
+        .iter()
+        .filter(|v| is_cooling(v))
+        .take(AP_CARDS)
+        .map(|v| {
+            let left = v.cooldown_days_left.unwrap_or(0);
+            let total = i64::from(summary.cooldown_days.max(1));
+            views::CooldownCard {
+                package: v.package.clone(),
+                version: v.version.clone(),
+                normalized: v.normalized_version.clone(),
+                days_left: left,
+                pct: (((total - left).max(0) * 100) / total).clamp(0, 100),
+            }
+        })
+        .collect();
+
+    // Pending versions (awaiting approval) grouped by package. They arrive
+    // ordered by (package, version), so consecutive runs share a package.
+    let mut ap_groups: Vec<views::ApprovalGroup> = Vec::new();
+    for v in pending_versions.iter().filter(|v| !is_cooling(v)) {
+        let row = views::ApprovalVer {
+            package: v.package.clone(),
+            normalized: v.normalized_version.clone(),
+            version: v.version.clone(),
+            stability: v.stability.clone(),
+            stab_tone: if v.stability == "stable" { "ok" } else { "slate" },
+            age: rel_date(&v.released_at),
+            sha: short_sha(&v.dist_shasum),
+        };
+        match ap_groups.last_mut() {
+            Some(g) if g.package == v.package => {
+                g.count += 1;
+                if g.rows.len() < AP_ROWS {
+                    g.rows.push(row);
+                } else {
+                    g.more += 1;
+                }
+            }
+            _ => ap_groups.push(views::ApprovalGroup {
+                package: v.package.clone(),
+                count: 1,
+                rows: vec![row],
+                more: 0,
+                expanded: false,
+            }),
+        }
+    }
+    // Expand the largest batch by default (matches the design's open group).
+    if let Some((i, _)) = ap_groups.iter().enumerate().max_by_key(|(_, g)| g.count) {
+        ap_groups[i].expanded = true;
+    }
+    let ap_pending: usize = ap_groups.iter().map(|g| g.count).sum();
+
+    // Held cards.
+    let ap_helds: Vec<views::HeldCard> = held_versions
+        .iter()
+        .take(AP_CARDS)
+        .map(|v| views::HeldCard {
+            package: v.package.clone(),
+            version: v.version.clone(),
+            normalized: v.normalized_version.clone(),
+            released: rel_date(&v.released_at),
+        })
+        .collect();
+    let ap_held = held_versions.len();
+    let ap_total = ap_pending + ap_cooldown + ap_held;
+
+    // "synced 2m ago" pill — the freshest upstream sync, if any.
+    let ap_synced = upstreams
+        .iter()
+        .filter_map(|u| u.last_sync_age)
+        .min()
+        .map_or_else(String::new, ago);
 
     // ---- Policy: grants + autogrant rules ----
     let grant_rows: Vec<views::GrantRow> = grants
@@ -2823,6 +2937,15 @@ async fn repo_page(
         filtered: name_q.is_some() || state_q.is_some(),
         versions: version_rows,
         pager,
+        ap_total,
+        ap_pending,
+        ap_cooldown,
+        ap_held,
+        ap_synced,
+        ap_capped,
+        ap_groups,
+        ap_cooldowns,
+        ap_helds,
         health,
         update_mode: summary.update_mode.clone(),
         cooldown_days: summary.cooldown_days,
@@ -2908,6 +3031,43 @@ async fn version_action(
         _ => return Err(StatusCode::BAD_REQUEST),
     }
     .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct ApproveBulkForm {
+    /// Whole-package "Approve all N" (the group header / footer forms).
+    package: Option<String>,
+    /// Newline-separated `package|normalized` pairs from the selection bar.
+    /// Present-but-empty means "selection bar, nothing ticked" → a no-op, which
+    /// is why it's distinguished from the absent ("approve everything") case.
+    versions: Option<String>,
+}
+
+/// Approvals tab bulk action: approve a hand-picked selection, a whole package,
+/// or every still-pending version in the repo.
+async fn approve_bulk(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<ApproveBulkForm>,
+) -> Result<Redirect, StatusCode> {
+    let id = lookup(&s, &user, &org, &repo).await?.id;
+    if let Some(list) = f.versions.as_deref() {
+        // Selection bar: approve exactly the ticked versions (skip empties).
+        for line in list.lines() {
+            if let Some((pkg, norm)) = line.split_once('|') {
+                let (pkg, norm) = (pkg.trim(), norm.trim());
+                if !pkg.is_empty() && !norm.is_empty() {
+                    s.catalog.approve_version(id, pkg, norm).await.map_err(e500)?;
+                }
+            }
+        }
+    } else {
+        // No `versions` field → a whole-package or repo-wide "Approve all".
+        let pkg = f.package.as_deref().filter(|x| !x.is_empty());
+        s.catalog.approve_all_pending(id, pkg).await.map_err(e500)?;
+    }
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 

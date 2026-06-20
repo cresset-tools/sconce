@@ -14,7 +14,7 @@
   </div>
 </div>
 {% if read_only %}
-  <style>.ro form{display:none}</style>
+  <style>.ro form{display:none}.ro .apvcheck,.ro .apgcheck,.ro .apbulk{display:none}</style>
   <p class=banner>Read-only (member) access — ask an org admin to make changes.</p>
   <div class=ro>
 {% endif %}
@@ -124,12 +124,137 @@
 
 {# ---------- Approvals ---------- #}
 <div class="tabpanel t-approvals">
-  {% if health.is_empty() %}
-    <h2 style=margin-top:0>Approvals</h2>
-    <p class=muted>Pending, cooldown and held versions are approved or held inline in the <label for=rt-packages style="color:var(--accent);cursor:pointer;font-weight:600">Packages</label> tab — filter by state there. Nothing needs attention right now.</p>
+  {% if ap_total == 0 %}
+    <h2 style=margin-top:0>Approval queue</h2>
+    <p class=muted>Nothing awaiting a decision. New versions arrive here as upstreams sync; approve or hold them inline or in bulk. You can also filter by state in the <label for=rt-packages style="color:var(--accent);cursor:pointer;font-weight:600">Packages</label> tab.</p>
   {% else %}
-    <h2 style=margin-top:0>Approvals</h2>
-    <p class=muted>Approve or hold individual versions inline in the <label for=rt-packages style="color:var(--accent);cursor:pointer;font-weight:600">Packages</label> tab. Below are packages whose <em>sync</em> needs attention.</p>
+  <div class=apqueue id=ap-queue>
+    {# header strip #}
+    <div class=aphead>
+      <div class=apttl>
+        <span class=h>Approval queue</span>
+        <span class=meta><strong>{{ ap_total }}</strong> version(s) awaiting a decision{% if ap_held > 0 %} · <strong class=danger>{{ ap_held }}</strong> held{% endif %}</span>
+      </div>
+      {% if !ap_synced.is_empty() %}<span class=apsync><span class=dot></span>synced {{ ap_synced }} ago</span>{% endif %}
+    </div>
+
+    {# toolbar: filter chips + package search #}
+    <div class=aptool>
+      <div class=apfilters id=ap-filters>
+        <span class="apchip on" data-bucket=all>All <span class=c>{{ ap_total }}</span></span>
+        {% if ap_pending > 0 %}<span class=apchip data-bucket=pending>Pending <span class=c>{{ ap_pending }}</span></span>{% endif %}
+        {% if ap_cooldown > 0 %}<span class=apchip data-bucket=cooldown>Cooldown <span class=c>{{ ap_cooldown }}</span></span>{% endif %}
+        {% if ap_held > 0 %}<span class="apchip danger" data-bucket=held>Held <span class=c>{{ ap_held }}</span></span>{% endif %}
+      </div>
+      <label class=apsearch>
+        <svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=11 cy=11 r=7></circle><path d="M21 21l-4-4"></path></svg>
+        <input id=ap-search type=search placeholder="Filter by package…" autocomplete=off>
+      </label>
+    </div>
+
+    {# bulk action bar (revealed by JS when versions are ticked) #}
+    <div class=apbulk id=ap-bulk hidden>
+      <span class=mark><svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=3 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg></span>
+      <span class=n><strong id=ap-seln>0</strong> selected</span>
+      <form method=post action="/r/{{ org }}/{{ repo }}/approve-bulk" class=inline>
+        <input type=hidden name=versions id=ap-selvals>
+        <button class="ok" type=submit><svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>Approve selected</button>
+      </form>
+      <button type=button id=ap-clear>Clear</button>
+    </div>
+
+    <div class=apbody>
+      {# ---- awaiting approval, grouped by package ---- #}
+      {% if !ap_groups.is_empty() %}
+      <div class=apsec data-bucket=pending>
+        <div class=aplabel>AWAITING APPROVAL · GROUPED BY PACKAGE</div>
+        {% for g in ap_groups %}
+        <div class="apgroup{% if g.expanded %} open{% endif %}" data-pkg="{{ g.package }}">
+          <div class=apghead>
+            <input type=checkbox class=apgcheck aria-label="Select all in {{ g.package }}">
+            <button type=button class=apchev aria-label="Expand"><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M9 6l6 6-6 6"></path></svg></button>
+            <code class=pkg><a href="/r/{{ org }}/{{ repo }}/p/{{ g.package }}">{{ g.package }}</a></code>
+            <span class="badge violet">{{ g.count }} pending</span>
+            <form class="apall inline" method=post action="/r/{{ org }}/{{ repo }}/approve-bulk">
+              <input type=hidden name=package value="{{ g.package }}">
+              <button class=approveall type=submit><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>Approve all {{ g.count }}</button>
+            </form>
+          </div>
+          <div class=apgrows>
+            {% for v in g.rows %}
+            <div class=aprow>
+              <input type=checkbox class=apvcheck data-val="{{ v.package }}|{{ v.normalized }}" aria-label="Select {{ v.version }}">
+              <code class=ver>{{ v.version }}</code>
+              <span class="badge {{ v.stab_tone }}">{{ v.stability }}</span>
+              <span class=age>{{ v.age }}</span>
+              <code class=sha>{{ v.sha }}</code>
+              <span class=acts>
+                <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version"><input type=hidden name=package value="{{ v.package }}"><input type=hidden name=normalized value="{{ v.normalized }}"><button class=iapprove name=action value=approve title=Approve><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.6 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg></button></form>
+                <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version"><input type=hidden name=package value="{{ v.package }}"><input type=hidden name=normalized value="{{ v.normalized }}"><button class=ihold name=action value=hold title=Hold><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><rect x=5 y=11 width=14 height=9 rx=2></rect><path d="M8 11V8a4 4 0 0 1 8 0v3"></path></svg></button></form>
+              </span>
+            </div>
+            {% endfor %}
+            {% if g.more > 0 %}<div class=apmore><span></span>+ {{ g.more }} more version(s) in this batch<a href="/r/{{ org }}/{{ repo }}/p/{{ g.package }}">View package</a></div>{% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {# ---- in cooldown ---- #}
+      {% if !ap_cooldowns.is_empty() %}
+      <div class=apsec data-bucket=cooldown>
+        <div class=aplabel>IN COOLDOWN · AUTO-EXPOSES WHEN THE TIMER ELAPSES</div>
+        {% for c in ap_cooldowns %}
+        <div class=apcool data-pkg="{{ c.package }}">
+          <div class=h>
+            <code>{{ c.package }} <span class=v>{{ c.version }}</span></code>
+            <span class="badge amber">in cooldown</span>
+            <span class=left>{{ c.days_left }}d left</span>
+            <form class="apearly inline" method=post action="/r/{{ org }}/{{ repo }}/version"><input type=hidden name=package value="{{ c.package }}"><input type=hidden name=normalized value="{{ c.normalized }}"><button name=action value=approve>Approve early</button></form>
+          </div>
+          <div class=bar><span style="width:{{ c.pct }}%"></span></div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {# ---- held ---- #}
+      {% if !ap_helds.is_empty() %}
+      <div class=apsec data-bucket=held>
+        <div class="aplabel danger">HELD · WITHHELD FROM EVERY CLIENT UNTIL UNHELD</div>
+        {% for hc in ap_helds %}
+        <div class=apheld data-pkg="{{ hc.package }}">
+          <div class=h>
+            <svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><rect x=5 y=11 width=14 height=9 rx=2></rect><path d="M8 11V8a4 4 0 0 1 8 0v3"></path></svg>
+            <code>{{ hc.package }} <span class=v>{{ hc.version }}</span></code>
+            <span class=tag><span class=dot></span>HELD</span>
+            <span class=rel>released {{ hc.released }}</span>
+            <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version"><input type=hidden name=package value="{{ hc.package }}"><input type=hidden name=normalized value="{{ hc.normalized }}"><button name=action value=unhold>Unhold…</button></form>
+          </div>
+          <div class=desc>This version is withheld from every client and won't install until it's unheld.</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if ap_capped %}<div class=apnote>Showing the most recent versions per state — use the <label for=rt-packages style="color:var(--accent);cursor:pointer;font-weight:600">Packages</label> tab to filter the full list.</div>{% endif %}
+
+      {# footer: queue summary + approve-all #}
+      {% if ap_pending + ap_cooldown > 0 %}
+      <div class=apfoot>
+        <span class=muted>{{ ap_total }} version(s) in the queue</span>
+        <form class=inline method=post action="/r/{{ org }}/{{ repo }}/approve-bulk" data-confirm="Approve all {{ ap_pending + ap_cooldown }} pending version(s)? They'll be exposed to clients immediately.">
+          <button class=approveall type=submit><svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>Approve all {{ ap_pending + ap_cooldown }} pending</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {# package sync-health (broken / stale / archived) #}
+  {% if !health.is_empty() %}
     <h2 id=health>Package health</h2>
     {% if broken_count > 0 %}<p class=muted>{{ broken_count }} package(s) can't sync (still serving their existing versions). Archive to acknowledge and silence.</p>{% endif %}
     <table>

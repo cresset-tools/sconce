@@ -443,6 +443,53 @@ pub struct RecentVer {
     pub badge_label: String,
 }
 
+/// One version inside a per-package approval group (Approvals tab).
+pub struct ApprovalVer {
+    pub package: String,
+    pub normalized: String,
+    pub version: String,
+    pub stability: String,
+    /// Badge tone for the stability chip ("ok" for stable, else "slate").
+    pub stab_tone: &'static str,
+    /// Release date (or "—"), shown in the row's age column.
+    pub age: String,
+    /// Short dist sha (`a3f9c1b…e7d2`), or "—".
+    pub sha: String,
+}
+
+/// A package group of pending versions in the Approvals tab — the design's
+/// expandable "Approve all N" batch.
+pub struct ApprovalGroup {
+    pub package: String,
+    /// Total pending versions in this package (the "Approve all N").
+    pub count: usize,
+    /// The first few rows, shown when expanded.
+    pub rows: Vec<ApprovalVer>,
+    /// Versions beyond `rows` (`count - rows.len()`).
+    pub more: usize,
+    /// Render expanded on load (the first / largest batch).
+    pub expanded: bool,
+}
+
+/// A delayed-cooldown version card in the Approvals tab (countdown + progress).
+pub struct CooldownCard {
+    pub package: String,
+    pub version: String,
+    pub normalized: String,
+    /// Whole days until it clears cooldown and auto-exposes.
+    pub days_left: i64,
+    /// Percent of the cooldown window already elapsed (0–100).
+    pub pct: i64,
+}
+
+/// A held version card in the Approvals tab (the design's "security hold").
+pub struct HeldCard {
+    pub package: String,
+    pub version: String,
+    pub normalized: String,
+    pub released: String,
+}
+
 /// A package-health row in the Approvals tab.
 pub struct HealthRow {
     pub pkg: String,
@@ -599,6 +646,18 @@ pub struct RepoPage {
     pub versions: Vec<RepoVerRow>,
     pub pager: Option<Pager>,
     // Approvals
+    /// Versions awaiting a decision (pending + cooldown + held).
+    pub ap_total: usize,
+    pub ap_pending: usize,
+    pub ap_cooldown: usize,
+    pub ap_held: usize,
+    /// "synced 2m ago" pill text from the freshest upstream, or empty.
+    pub ap_synced: String,
+    /// True when the queue exceeds the per-bucket display cap (lists truncated).
+    pub ap_capped: bool,
+    pub ap_groups: Vec<ApprovalGroup>,
+    pub ap_cooldowns: Vec<CooldownCard>,
+    pub ap_helds: Vec<HeldCard>,
     pub health: Vec<HealthRow>,
     // Policy
     pub update_mode: String,
@@ -694,5 +753,142 @@ mod tests {
         // Real content still renders.
         assert!(html.contains("badge amber"));
         assert!(html.contains("badge slate")); // private repo
+    }
+
+    /// A `RepoPage` with everything but the approval queue left empty — used to
+    /// render just the Approvals tab in isolation.
+    fn repo_page_with_approvals(
+        ap_groups: Vec<ApprovalGroup>,
+        ap_cooldowns: Vec<CooldownCard>,
+        ap_helds: Vec<HeldCard>,
+    ) -> RepoPage {
+        let ap_pending: usize = ap_groups.iter().map(|g| g.count).sum();
+        let ap_cooldown = ap_cooldowns.len();
+        let ap_held = ap_helds.len();
+        RepoPage {
+            org: "cresset".to_owned(),
+            repo: "acme-storefront".to_owned(),
+            private_packages: true,
+            sync_tone: "ok",
+            sync_label: "synced",
+            pkg_count: 0,
+            total_versions: 0,
+            policy_phrase: "manual approval required".to_owned(),
+            broken_count: 0,
+            read_only: false,
+            filtering: false,
+            approvals_count: 0,
+            base: "https://x".to_owned(),
+            host: "x".to_owned(),
+            example_pkg: "acme/widget".to_owned(),
+            pending_count: 0,
+            held_count: 0,
+            recent: vec![],
+            search_q: String::new(),
+            q_enc: String::new(),
+            state: String::new(),
+            filtered: false,
+            versions: vec![],
+            pager: None,
+            ap_total: ap_pending + ap_cooldown + ap_held,
+            ap_pending,
+            ap_cooldown,
+            ap_held,
+            ap_synced: "2m".to_owned(),
+            ap_capped: false,
+            ap_groups,
+            ap_cooldowns,
+            ap_helds,
+            health: vec![],
+            update_mode: "manual".to_owned(),
+            cooldown_days: 0,
+            grants: vec![],
+            org_sets_empty: true,
+            autogrant_rules: vec![],
+            set_opts: vec![],
+            upstreams: vec![],
+            up_total: 0,
+            git_count: 0,
+            composer_count: 0,
+            failing_count: 0,
+            has_secret_key: false,
+            deps: vec![],
+            licenses: vec![],
+            org_set_opts: vec![],
+            tokens: vec![],
+            ci: vec![],
+        }
+    }
+
+    /// The Approvals tab renders the queue: a per-package group with a bulk
+    /// "Approve all", a cooldown card with a progress bar, and a held card —
+    /// each wired to the right action endpoint.
+    #[test]
+    fn approvals_tab_renders_the_queue() {
+        let html = repo_page_with_approvals(
+            vec![ApprovalGroup {
+                package: "acme/widget".to_owned(),
+                count: 3,
+                rows: vec![ApprovalVer {
+                    package: "acme/widget".to_owned(),
+                    normalized: "1.2.0.0".to_owned(),
+                    version: "v1.2.0".to_owned(),
+                    stability: "stable".to_owned(),
+                    stab_tone: "ok",
+                    age: "2024-06-01".to_owned(),
+                    sha: "a3f9c1b…e7d2".to_owned(),
+                }],
+                more: 2,
+                expanded: true,
+            }],
+            vec![CooldownCard {
+                package: "acme/blocks".to_owned(),
+                version: "v3.3.0".to_owned(),
+                normalized: "3.3.0.0".to_owned(),
+                days_left: 2,
+                pct: 33,
+            }],
+            vec![HeldCard {
+                package: "acme/loyalty".to_owned(),
+                version: "v0.8.0".to_owned(),
+                normalized: "0.8.0.0".to_owned(),
+                released: "2024-05-20".to_owned(),
+            }],
+        )
+        .render()
+        .unwrap();
+
+        // Queue chrome + header counts (1 group of 3 + 1 cooldown + 1 held = 5).
+        assert!(html.contains("Approval queue"));
+        assert!(html.contains("<strong>5</strong> version(s) awaiting a decision"));
+        // The package group with its bulk action, expanded by default.
+        assert!(html.contains("acme/widget"));
+        assert!(html.contains(r#"class="apgroup open""#));
+        assert!(html.contains("Approve all 3"));
+        assert!(html.contains("/r/cresset/acme-storefront/approve-bulk"));
+        assert!(html.contains("a3f9c1b…e7d2"));
+        assert!(html.contains("+ 2 more version(s)"));
+        // Cooldown card with its progress bar + countdown.
+        assert!(html.contains("in cooldown"));
+        assert!(html.contains("width:33%"));
+        assert!(html.contains("Approve early"));
+        // Held card.
+        assert!(html.contains("acme/loyalty"));
+        assert!(html.contains("HELD"));
+        // The selection bulk bar posts the picked versions.
+        assert!(html.contains(r#"name=versions"#));
+    }
+
+    /// With nothing pending, the Approvals tab shows the friendly empty state and
+    /// no queue panel.
+    #[test]
+    fn approvals_tab_empty_state() {
+        let html = repo_page_with_approvals(vec![], vec![], vec![])
+            .render()
+            .unwrap();
+        assert!(html.contains("Nothing awaiting a decision"));
+        // No queue panel and no bulk-approve action when the queue is empty.
+        assert!(!html.contains("id=ap-queue"));
+        assert!(!html.contains("approve-bulk"));
     }
 }
