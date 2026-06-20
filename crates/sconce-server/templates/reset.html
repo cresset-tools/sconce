@@ -1,0 +1,33 @@
+{% import "icons.html" as icons %}
+<div class=authwrap><div class=authcard>
+  <div class=authbrand>
+    <a class=brand href=/><span class=brandmark>{% call icons::mark() %}{% endcall %}</span> <span>Bougie&nbsp;Repo</span></a>
+    <div class=authpitch>
+      <h2>Choose a new password.</h2>
+      <ul>
+        <li>At least 8 characters</li>
+        <li>Resetting signs out your other sessions</li>
+        <li>This link works once</li>
+      </ul>
+    </div>
+    <div class=authengine>powered by the sconce engine</div>
+  </div>
+  <div class=authpane>
+    <h1>Set a new password</h1><p class=authsub>for your Bougie Repo account</p>
+    <form id=resetform class=authform method=post action=/reset>
+      {% if !error.is_empty() %}
+        <div class=errbanner><svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#c0362c stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=9></circle><path d="M12 8v5M12 16h0"></path></svg><span>{{ error }}</span></div>
+      {% endif %}
+      <input type=hidden name=token value="{{ token }}">
+      <div>
+        <div class=pwhead><label>New password</label></div>
+        <div class=pwwrap>
+          <input name=password type=password placeholder="••••••••" required autofocus minlength=8>
+          <button type=button id=pwtoggle class=pwtoggle>Show</button></div></div>
+      <div><label>Confirm password</label>
+        <input name=confirm type=password placeholder="••••••••" required minlength=8></div>
+      <button class=primary type=submit>Reset password</button>
+    </form>
+    <script src=/assets/login.js></script>
+  </div>
+</div></div>

@@ -40,6 +40,13 @@ struct Ui {
     /// For encrypting upstream credentials (from `SCONCE_SECRET_KEY`); `None`
     /// means credentials can't be stored, only credential-free upstreams.
     secret_key: Option<sconce_catalog::secret::SecretKey>,
+    /// Public base URL of *this admin UI* (from `SCONCE_UI_BASE_URL`), used to
+    /// build absolute links in emails (the password-reset link). Distinct from
+    /// `public_base_url`, which is the Composer wire endpoint.
+    dashboard_url: String,
+    /// Sends transactional email (password-reset links). Configured from the
+    /// environment; the dev backend prints to stderr.
+    mailer: crate::mail::Mailer,
 }
 
 /// The viewer's access, resolved per request.
@@ -74,6 +81,7 @@ impl CurrentUser {
 }
 
 /// Build the admin UI router.
+#[allow(clippy::too_many_lines)]
 pub fn router(
     catalog: Catalog,
     public_base_url: String,
@@ -86,12 +94,19 @@ pub fn router(
         single_tenant,
         admin_password,
         secret_key: sconce_catalog::secret::SecretKey::from_env().ok(),
+        dashboard_url: std::env::var("SCONCE_UI_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8081".to_owned()),
+        mailer: crate::mail::Mailer::from_env(),
     };
     Router::new()
         .route("/", get(index))
         .route("/repositories", get(repositories_page))
         .route("/assets/{*path}", get(asset))
         .route("/login", get(login_form).post(login))
+        .route("/forgot", get(forgot_form).post(forgot_submit))
+        .route("/reset", get(reset_form).post(reset_submit))
         .route("/auth/start", get(auth_start))
         .route("/auth/route", post(auth_route))
         .route("/auth/callback", get(auth_callback))
@@ -217,7 +232,7 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
     }
 
     let path = req.uri().path();
-    if path == "/login" || path.starts_with("/auth/") {
+    if path == "/login" || path == "/forgot" || path == "/reset" || path.starts_with("/auth/") {
         return next.run(req).await;
     }
     let user = match session_cookie(req.headers()) {
@@ -1133,6 +1148,185 @@ async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
     let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
     Ok(redirect_with_cookie("/", &cookie))
+}
+
+// ----- password reset -----
+
+/// How long a reset link stays valid.
+const RESET_TTL_MINUTES: i64 = 60;
+/// Minimum new-password length (mirrors the form's `minlength`).
+const MIN_PASSWORD_LEN: usize = 8;
+
+/// Render the forgot-password page; a non-empty `error` shows an inline banner.
+fn forgot_page(error: &str) -> Html<String> {
+    let body = views::Forgot {
+        error: error.to_owned(),
+    }
+    .render()
+    .unwrap_or_default();
+    doc("Forgot password", &body)
+}
+
+/// Render the set-new-password page for a (validated) token.
+fn reset_page(token: &str, error: &str) -> Html<String> {
+    let body = views::Reset {
+        token: token.to_owned(),
+        error: error.to_owned(),
+    }
+    .render()
+    .unwrap_or_default();
+    doc("Reset password", &body)
+}
+
+/// The neutral confirmation shown after requesting a reset — identical whether or
+/// not the email matched an account (so it never reveals which emails exist).
+fn forgot_sent_page() -> Html<String> {
+    status_page(
+        "Check your email",
+        "If an account exists for that address, we've sent a password-reset link. \
+         It expires in 60 minutes.",
+    )
+}
+
+/// Password reset has no meaning without user accounts.
+fn reset_disabled(s: &Ui) -> Option<Response> {
+    s.single_tenant.then(|| {
+        status_page(
+            "Not available",
+            "Password reset is disabled in single-tenant mode.",
+        )
+        .into_response()
+    })
+}
+
+async fn forgot_form(State(s): State<Ui>) -> Response {
+    if let Some(r) = reset_disabled(&s) {
+        return r;
+    }
+    forgot_page("").into_response()
+}
+
+#[derive(Deserialize)]
+struct ForgotForm {
+    email: String,
+}
+
+async fn forgot_submit(
+    State(s): State<Ui>,
+    Form(f): Form<ForgotForm>,
+) -> Result<Response, StatusCode> {
+    if let Some(r) = reset_disabled(&s) {
+        return Ok(r);
+    }
+    let email = f.email.trim();
+    // Mint a token only if the user exists; either way the response is identical.
+    if let Some(reset) = s
+        .catalog
+        .create_password_reset(email, RESET_TTL_MINUTES)
+        .await
+        .map_err(e500)?
+    {
+        let link = format!(
+            "{}/reset?token={}",
+            s.dashboard_url.trim_end_matches('/'),
+            reset.token
+        );
+        let body = format!(
+            "Someone (hopefully you) asked to reset the password for your Bougie Repo \
+             account.\n\nOpen this link to choose a new password — it expires in {RESET_TTL_MINUTES} \
+             minutes and can be used once:\n\n{link}\n\nIf you didn't request this, you can ignore \
+             this email; your password won't change."
+        );
+        // Best-effort: a mail failure must not reveal that the account exists, so
+        // log it server-side and still show the neutral confirmation.
+        if let Err(e) = s
+            .mailer
+            .send(email, "Reset your Bougie Repo password", &body)
+            .await
+        {
+            eprintln!("mail: failed to send reset link to {email}: {e}");
+        }
+    }
+    Ok(forgot_sent_page().into_response())
+}
+
+#[derive(Deserialize)]
+struct ResetParams {
+    token: Option<String>,
+}
+
+async fn reset_form(State(s): State<Ui>, Query(q): Query<ResetParams>) -> Response {
+    if let Some(r) = reset_disabled(&s) {
+        return r;
+    }
+    let token = q.token.unwrap_or_default();
+    match s.catalog.password_reset_valid(&token).await {
+        Ok(true) => reset_page(&token, "").into_response(),
+        Ok(false) => status_page(
+            "Link expired",
+            "This password-reset link is invalid or has expired. Request a new one from the \
+             sign-in page.",
+        )
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResetForm {
+    token: String,
+    password: String,
+    confirm: String,
+}
+
+async fn reset_submit(
+    State(s): State<Ui>,
+    Form(f): Form<ResetForm>,
+) -> Result<Response, StatusCode> {
+    if let Some(r) = reset_disabled(&s) {
+        return Ok(r);
+    }
+    // Re-validate on submit (the token could have expired since the form loaded).
+    if !s
+        .catalog
+        .password_reset_valid(&f.token)
+        .await
+        .map_err(e500)?
+    {
+        return Ok(status_page(
+            "Link expired",
+            "This password-reset link is invalid or has expired. Request a new one from the \
+             sign-in page.",
+        )
+        .into_response());
+    }
+    if f.password.chars().count() < MIN_PASSWORD_LEN {
+        return Ok(reset_page(&f.token, "Password must be at least 8 characters.").into_response());
+    }
+    if f.password != f.confirm {
+        return Ok(reset_page(&f.token, "The passwords didn't match.").into_response());
+    }
+    // Consume the token + set the password. None means it was used/expired in a
+    // race since the check above.
+    if s.catalog
+        .reset_password(&f.token, &f.password)
+        .await
+        .map_err(e500)?
+        .is_none()
+    {
+        return Ok(status_page(
+            "Link expired",
+            "This password-reset link is invalid or has expired. Request a new one from the \
+             sign-in page.",
+        )
+        .into_response());
+    }
+    Ok(status_page(
+        "Password updated",
+        "Your password has been reset and your other sessions signed out. \
+         You can now sign in with your new password.",
+    )
+    .into_response())
 }
 
 /// Decrypt an OIDC connection's stored client secret (if any).

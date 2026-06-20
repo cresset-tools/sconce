@@ -149,6 +149,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0034_source_paths",
         include_str!("../migrations/0034_source_paths.sql"),
     ),
+    (
+        "0035_password_resets",
+        include_str!("../migrations/0035_password_resets.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -590,6 +594,14 @@ pub struct SessionInfo {
     pub expires: String,
     /// Whether this is the session making the current request.
     pub current: bool,
+}
+
+/// A freshly-minted password-reset token. `token` is the plaintext (shown once,
+/// emailed to the user); only its hash is persisted.
+#[derive(Debug, Clone)]
+pub struct PasswordReset {
+    pub user_id: Uuid,
+    pub token: String,
 }
 
 /// A version row for the admin UI, with its control state.
@@ -1985,6 +1997,92 @@ impl Catalog {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected())
+    }
+
+    /// Begin a password reset for `email`: mint a single-use token (returning its
+    /// plaintext) and store only its hash. Returns `None` when no user has that
+    /// email — the caller must respond identically either way (no enumeration).
+    /// Any earlier outstanding resets for the user are dropped (one live link).
+    pub async fn create_password_reset(
+        &self,
+        email: &str,
+        ttl_minutes: i64,
+    ) -> Result<Option<PasswordReset>, sqlx::Error> {
+        let Some(user_id): Option<Uuid> =
+            sqlx::query_scalar("select id from users where email = $1")
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from password_resets where user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let token = generate_secret("scpr_");
+        sqlx::query(
+            "insert into password_resets (token_hash, user_id, expires_at) \
+             values ($1, $2, now() + make_interval(mins => $3::int))",
+        )
+        .bind(token_hash(&token))
+        .bind(user_id)
+        .bind(i32::try_from(ttl_minutes).unwrap_or(i32::MAX))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(PasswordReset { user_id, token }))
+    }
+
+    /// Whether a reset token is currently valid (unexpired, unused) — for showing
+    /// the set-new-password form without consuming the token.
+    pub async fn password_reset_valid(&self, token: &str) -> Result<bool, sqlx::Error> {
+        let ok: Option<i32> = sqlx::query_scalar(
+            "select 1 from password_resets \
+             where token_hash = $1 and used_at is null and expires_at > now()",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(ok.is_some())
+    }
+
+    /// Consume a reset token and set the user's new password in one transaction:
+    /// validates the token is unexpired+unused, stamps it used, writes the new
+    /// hash, and revokes every existing session for that user. Returns the user id
+    /// on success, or `None` if the token is unknown/expired/already used.
+    pub async fn reset_password(
+        &self,
+        token: &str,
+        new_password: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Mark used (single-use, race-safe): only a still-valid row updates.
+        let user_id: Option<Uuid> = sqlx::query_scalar(
+            "update password_resets set used_at = now() \
+             where token_hash = $1 and used_at is null and expires_at > now() \
+             returning user_id",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(user_id) = user_id else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query("update users set password_hash = $2 where id = $1")
+            .bind(user_id)
+            .bind(hash_password(new_password))
+            .execute(&mut *tx)
+            .await?;
+        // A reset invalidates existing logins — the user re-authenticates.
+        sqlx::query("delete from sessions where user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(user_id))
     }
 
     /// A SCIM member's `(email, active)` by id within an org.
@@ -4812,6 +4910,98 @@ mod tests {
         );
         let au = cat.resolve_session(&token).await.unwrap().unwrap();
         assert!(au.admin_org_ids.contains(&org_id), "now admin");
+    }
+
+    #[tokio::test]
+    async fn password_reset_round_trip() {
+        let Some((cat, _)) = repo().await else {
+            return;
+        };
+        let email = format!("pr{}@x.io", std::process::id());
+        let uid = cat
+            .create_user(&email, "old-password", false)
+            .await
+            .unwrap();
+        // A live session that the reset must invalidate.
+        let old_session = cat.create_session(uid, 7).await.unwrap();
+        assert!(cat.resolve_session(&old_session).await.unwrap().is_some());
+
+        // Unknown email → None (no enumeration), and a request never errors.
+        assert!(
+            cat.create_password_reset("nobody@x.io", 60)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Real request mints a token bound to the user.
+        let pr = cat
+            .create_password_reset(&email, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pr.user_id, uid);
+        assert!(cat.password_reset_valid(&pr.token).await.unwrap());
+
+        // A second request supersedes the first (one live link).
+        let pr2 = cat
+            .create_password_reset(&email, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cat.password_reset_valid(&pr.token).await.unwrap(),
+            "superseded"
+        );
+        assert!(cat.password_reset_valid(&pr2.token).await.unwrap());
+
+        // Consume: sets the new password, returns the user, is single-use.
+        assert_eq!(
+            cat.reset_password(&pr2.token, "new-password")
+                .await
+                .unwrap(),
+            Some(uid)
+        );
+        assert!(
+            cat.reset_password(&pr2.token, "again")
+                .await
+                .unwrap()
+                .is_none(),
+            "single-use"
+        );
+        assert!(!cat.password_reset_valid(&pr2.token).await.unwrap());
+
+        // New password works, old one doesn't, and the old session was revoked.
+        assert_eq!(
+            cat.verify_credentials(&email, "new-password")
+                .await
+                .unwrap(),
+            Some(uid)
+        );
+        assert!(
+            cat.verify_credentials(&email, "old-password")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cat.resolve_session(&old_session).await.unwrap().is_none(),
+            "reset revokes existing sessions"
+        );
+
+        // An expired token is neither valid nor consumable.
+        let expd = cat
+            .create_password_reset(&email, -1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cat.password_reset_valid(&expd.token).await.unwrap());
+        assert!(
+            cat.reset_password(&expd.token, "x")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

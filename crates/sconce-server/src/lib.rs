@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ci;
+pub mod mail;
 pub mod oidc;
 pub mod ui;
 

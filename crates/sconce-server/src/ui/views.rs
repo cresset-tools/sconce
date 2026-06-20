@@ -301,6 +301,24 @@ pub struct Login {
     pub error: String,
 }
 
+/// `/forgot` — request a password-reset link.
+#[derive(Template)]
+#[template(path = "forgot.html")]
+pub struct Forgot {
+    /// Inline error banner text, or empty.
+    pub error: String,
+}
+
+/// `/reset` — set a new password from a valid reset token.
+#[derive(Template)]
+#[template(path = "reset.html")]
+pub struct Reset {
+    /// The reset token, round-tripped through the form's hidden field.
+    pub token: String,
+    /// Inline error banner text, or empty.
+    pub error: String,
+}
+
 /// A standalone centered status page (404 etc.).
 #[derive(Template)]
 #[template(path = "status.html")]

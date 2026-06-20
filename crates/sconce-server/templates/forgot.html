@@ -1,0 +1,27 @@
+{% import "icons.html" as icons %}
+<div class=authwrap><div class=authcard>
+  <div class=authbrand>
+    <a class=brand href=/><span class=brandmark>{% call icons::mark() %}{% endcall %}</span> <span>Bougie&nbsp;Repo</span></a>
+    <div class=authpitch>
+      <h2>Reset your password.</h2>
+      <ul>
+        <li>Enter the email for your account</li>
+        <li>We email a single-use reset link</li>
+        <li>The link expires in 60 minutes</li>
+      </ul>
+    </div>
+    <div class=authengine>powered by the sconce engine</div>
+  </div>
+  <div class=authpane>
+    <h1>Forgot password</h1><p class=authsub>we'll send you a reset link</p>
+    <form class=authform method=post action=/forgot>
+      {% if !error.is_empty() %}
+        <div class=errbanner><svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#c0362c stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=9></circle><path d="M12 8v5M12 16h0"></path></svg><span>{{ error }}</span></div>
+      {% endif %}
+      <div><label>Email</label>
+        <input class=mono name=email type=email placeholder="you@studio.com" required autofocus></div>
+      <button class=primary type=submit>Send reset link</button>
+    </form>
+    <p class=authsub style="margin-top:18px"><a class=forgot href="/login">Back to sign in</a></p>
+  </div>
+</div></div>
