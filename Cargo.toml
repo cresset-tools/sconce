@@ -43,6 +43,9 @@ sconce-server = { path = "crates/sconce-server", version = "0.1.0" } # x-release
 # Shared external deps.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Composer-flavored version + constraint algebra (normalize, compare, match),
+# shared with bougie. Replaces sconce's hand-rolled version subset.
+composer-semver = "0.1.0"
 sha2 = "0.10"
 sha1 = "0.10"
 thiserror = "2"

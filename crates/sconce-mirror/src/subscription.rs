@@ -1,12 +1,13 @@
-//! Mirror subscriptions: which packages (and from which version) an upstream
+//! Mirror subscriptions: which packages (and which versions) an upstream
 //! mirrors. A subscription is an ordered list of require entries; a package is
-//! mirrored iff it matches **any** entry (OR-union), and a version is kept iff it
-//! satisfies the floor of at least one matching entry. This replaces the old
-//! per-upstream `package_filter` regex — the thing that column expressed is a
-//! `composer.json` require list (name → version floor), so it's modelled as one.
+//! mirrored iff it matches **any** entry (OR-union), and a version is kept iff
+//! it satisfies the Composer version constraint of at least one matching entry.
+//! This models an upstream's `composer.json` require list (name → constraint):
+//! `^3.0` keeps 3.x only, `~2.4` keeps `>=2.4 <3.0`, a bare `2.4` keeps `2.4.*`,
+//! and an empty constraint keeps every version.
 
 use crate::Error;
-use crate::version::normalize_tag;
+use composer_semver::{Constraint, Version};
 use sconce_catalog::UpstreamRequire;
 
 /// How a require entry matches a package name.
@@ -25,8 +26,8 @@ enum Match {
 #[derive(Debug)]
 struct CompiledRequire {
     matcher: Match,
-    /// Minimum version (4-component), `None` = every version.
-    floor: Option<[u64; 4]>,
+    /// Composer version constraint; `None` = every version.
+    constraint: Option<Constraint>,
 }
 
 impl CompiledRequire {
@@ -46,8 +47,8 @@ impl CompiledRequire {
 pub struct Subscription(Vec<CompiledRequire>);
 
 impl Subscription {
-    /// Compile an upstream's stored require-list. Errors only on a malformed
-    /// `regex` entry; a malformed floor is treated as "no floor" (lenient).
+    /// Compile an upstream's stored require-list. Errors on a malformed `regex`
+    /// entry or a malformed version constraint.
     pub fn compile(reqs: &[UpstreamRequire]) -> Result<Self, Error> {
         let compiled = reqs
             .iter()
@@ -64,8 +65,11 @@ impl Subscription {
                         return Err(Error::BadPattern(format!("unknown match kind '{other}'")));
                     }
                 };
-                let floor = r.version_floor.as_deref().and_then(parse_floor);
-                Ok(CompiledRequire { matcher, floor })
+                let constraint = parse_constraint(r.version_floor.as_deref())?;
+                Ok(CompiledRequire {
+                    matcher,
+                    constraint,
+                })
             })
             .collect::<Result<Vec<_>, Error>>()?;
         Ok(Self(compiled))
@@ -85,20 +89,26 @@ impl Subscription {
     }
 
     /// Whether a version should be mirrored for `name`. Entries matching the name
-    /// are OR-ed: keep the version if it passes **any** matching entry's floor (a
-    /// `None` floor passes). If **no** entry matches the name, return `true` — the
-    /// caller mirrored this package explicitly (a single-package sync), so the
-    /// subscription has no opinion on its versions.
+    /// are OR-ed: keep the version if it satisfies **any** matching entry's
+    /// constraint (a `None` constraint always passes). If **no** entry matches
+    /// the name, return `true` — the caller mirrored this package explicitly (a
+    /// single-package sync), so the subscription has no opinion on its versions.
+    ///
+    /// `normalized` is a Composer-normalized version string (e.g. `2.4.0.0`).
     #[must_use]
     pub fn version_allowed(&self, name: &str, normalized: &str) -> bool {
-        let v = components(normalized);
         let mut matched = false;
+        // Parse the candidate once; reused across every matching constraint.
+        let version = Version::parse(normalized);
         for c in self.0.iter().filter(|c| c.matches_name(name)) {
             matched = true;
-            match &c.floor {
-                None => return true,
-                Some(f) if v >= *f => return true,
-                Some(_) => {}
+            match (&c.constraint, &version) {
+                // No constraint keeps every version.
+                (None, _) => return true,
+                (Some(con), Ok(v)) if con.matches(v) => return true,
+                // A constraint that doesn't match (or an unparseable version)
+                // fails this entry; another matching entry may still pass.
+                (Some(_), _) => {}
             }
         }
         !matched
@@ -111,36 +121,27 @@ fn normalize_prefix(pattern: &str) -> String {
     pattern.strip_suffix('*').unwrap_or(pattern).to_owned()
 }
 
-/// Parse a floor like `2.4`, `v2.4`, `>=2.4`, `^2.4`, `~2.4` into its 4-component
-/// core (the operator/upper-bound is ignored — this is a floor, not a range).
-fn parse_floor(s: &str) -> Option<[u64; 4]> {
-    let t = s.trim().trim_start_matches(['>', '=', '<', '^', '~', ' ']);
-    if t.is_empty() {
-        return None;
+/// Parse a stored version constraint. An absent or empty/whitespace string means
+/// "no constraint" (every version); anything else must be a valid Composer
+/// constraint (`^1.2`, `~2.4`, `>=1.0 <2.0`, `1.2.*`, …).
+fn parse_constraint(raw: Option<&str>) -> Result<Option<Constraint>, Error> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => Constraint::parse(s)
+            .map(Some)
+            .map_err(|e| Error::BadPattern(format!("invalid version constraint '{s}': {e}"))),
     }
-    Some(components(&normalize_tag(t)?.normalized))
-}
-
-/// The 4-component numeric core of a normalized version (`2.4.0.0-beta2` → the
-/// `2.4.0.0` part), for ordered comparison. Missing components are zero.
-fn components(normalized: &str) -> [u64; 4] {
-    let core = normalized.split('-').next().unwrap_or(normalized);
-    let mut out = [0u64; 4];
-    for (i, p) in core.split('.').take(4).enumerate() {
-        out[i] = p.parse().unwrap_or(0);
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn req(kind: &str, pattern: &str, floor: Option<&str>) -> UpstreamRequire {
+    fn req(kind: &str, pattern: &str, constraint: Option<&str>) -> UpstreamRequire {
         UpstreamRequire {
             match_kind: kind.to_owned(),
             pattern: pattern.to_owned(),
-            version_floor: floor.map(ToOwned::to_owned),
+            version_floor: constraint.map(ToOwned::to_owned),
         }
     }
 
@@ -178,18 +179,41 @@ mod tests {
     }
 
     #[test]
-    fn floor_filters_versions() {
+    fn bare_version_is_a_wildcard_minor() {
+        // Composer treats a bare `2.4` as `2.4.*` (`>=2.4 <2.5`).
         let sub = Subscription::compile(&[req("prefix", "mage-os/", Some("2.4"))]).unwrap();
-        // Below the floor is dropped; at/above is kept.
         assert!(!sub.version_allowed("mage-os/composer", "2.3.7.0"));
         assert!(sub.version_allowed("mage-os/composer", "2.4.0.0"));
         assert!(sub.version_allowed("mage-os/composer", "2.4.1.0"));
-        assert!(sub.version_allowed("mage-os/composer", "3.0.0.0"));
+        assert!(!sub.version_allowed("mage-os/composer", "2.5.0.0"));
+        assert!(!sub.version_allowed("mage-os/composer", "3.0.0.0"));
     }
 
     #[test]
-    fn floor_union_takes_loosest() {
-        // Same name matched by two entries: the version passes if EITHER floor lets it.
+    fn constraint_operators_are_honored() {
+        // `>=` is an open floor.
+        let ge = Subscription::compile(&[req("prefix", "x/", Some(">=2.4"))]).unwrap();
+        assert!(!ge.version_allowed("x/y", "2.3.0.0"));
+        assert!(ge.version_allowed("x/y", "2.4.0.0"));
+        assert!(ge.version_allowed("x/y", "4.0.0.0"));
+
+        // `^3.0` caps at `<4.0` — the upper bound the old floor model ignored.
+        let caret = Subscription::compile(&[req("prefix", "x/", Some("^3.0"))]).unwrap();
+        assert!(!caret.version_allowed("x/y", "2.9.0.0"));
+        assert!(caret.version_allowed("x/y", "3.1.0.0"));
+        assert!(!caret.version_allowed("x/y", "4.0.0.0"));
+
+        // `~2.4` is `>=2.4 <3.0`.
+        let tilde = Subscription::compile(&[req("prefix", "x/", Some("~2.4"))]).unwrap();
+        assert!(!tilde.version_allowed("x/y", "2.3.0.0"));
+        assert!(tilde.version_allowed("x/y", "2.9.0.0"));
+        assert!(!tilde.version_allowed("x/y", "3.0.0.0"));
+    }
+
+    #[test]
+    fn union_keeps_version_if_any_constraint_passes() {
+        // One entry constrains to 2.4.*, another (exact) has no constraint.
+        // A 1.0 version fails the first but passes the unconstrained one.
         let sub = Subscription::compile(&[
             req("prefix", "mage-os/", Some("2.4")),
             req("exact", "mage-os/composer", None),
@@ -199,20 +223,22 @@ mod tests {
     }
 
     #[test]
-    fn floor_accepts_constraint_operators() {
-        let sub = Subscription::compile(&[req("prefix", "x/", Some(">=2.4"))]).unwrap();
-        assert!(!sub.version_allowed("x/y", "2.3.0.0"));
-        assert!(sub.version_allowed("x/y", "2.4.0.0"));
-        let caret = Subscription::compile(&[req("prefix", "x/", Some("^3.0"))]).unwrap();
-        assert!(!caret.version_allowed("x/y", "2.9.0.0"));
-        assert!(caret.version_allowed("x/y", "3.1.0.0"));
-    }
-
-    #[test]
     fn unmatched_name_has_no_version_opinion() {
         // A package matched by no entry (explicit single-package sync) → all versions.
         let sub = Subscription::compile(&[req("prefix", "mage-os/", Some("2.4"))]).unwrap();
         assert!(sub.version_allowed("other/pkg", "1.0.0.0"));
+    }
+
+    #[test]
+    fn malformed_constraint_is_an_error() {
+        assert!(Subscription::compile(&[req("prefix", "x/", Some("not a version"))]).is_err());
+    }
+
+    #[test]
+    fn empty_constraint_keeps_every_version() {
+        let sub = Subscription::compile(&[req("prefix", "x/", Some("  "))]).unwrap();
+        assert!(sub.version_allowed("x/y", "0.0.1.0"));
+        assert!(sub.version_allowed("x/y", "99.0.0.0"));
     }
 
     #[test]

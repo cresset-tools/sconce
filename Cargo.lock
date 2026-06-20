@@ -535,6 +535,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "composer-semver"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19468a4e1f2390fef462b7f723b1625f052b9a0dbf67d00b6494d496cd338b4a"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3529,6 +3538,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "chacha20poly1305",
+ "composer-semver",
  "serde_json",
  "sha2",
  "sqlx",
@@ -3559,6 +3569,7 @@ dependencies = [
 name = "sconce-mirror"
 version = "0.1.0"
 dependencies = [
+ "composer-semver",
  "regex",
  "sconce-cas",
  "sconce-catalog",

@@ -1242,6 +1242,10 @@ impl Catalog {
              join packages p on p.id = pv.package_id \
              join repositories r on r.id = $1 \
              where p.repo_id = $1 {VERSION_FILTER} \
+             -- Lexicographic on the normalized string (so 1.10 sorts before
+             -- 1.9). Unlike package_versions/visible_versions, this list is
+             -- LIMIT/OFFSET paginated, so it can't be re-sorted in Rust after
+             -- the fetch; a Composer-correct order needs a sort-key column.
              order by p.name, pv.normalized_version \
              limit $4 offset $5"
         ))
@@ -3799,14 +3803,16 @@ impl Catalog {
                     pv.dist_blob_sha256, pv.dist_shasum, pv.source_reference \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             where p.repo_id = $1 and p.name = $2 and pv.yanked_at is null \
-             order by pv.normalized_version",
+             where p.repo_id = $1 and p.name = $2 and pv.yanked_at is null",
         )
         .bind(repo_id)
         .bind(name)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_version).collect()
+        let mut versions: Vec<PackageVersion> =
+            rows.iter().map(row_to_version).collect::<Result<_, _>>()?;
+        sort_versions_ascending(&mut versions);
+        Ok(versions)
     }
 
     /// The versions of a package **visible** under an explicit update policy —
@@ -3853,8 +3859,7 @@ impl Catalog {
                           and coalesce(pv.entitlement_date, pv.released_at) \
                               - make_interval(days => pv.grace_days) <= to_timestamp($5::double precision) ) ) \
                and ( $6::int is null \
-                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 ) \
-             order by pv.normalized_version"
+                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 )"
         ))
         .bind(repo_id)
         .bind(name)
@@ -3864,7 +3869,10 @@ impl Catalog {
         .bind(bound_major)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_version).collect()
+        let mut versions: Vec<PackageVersion> =
+            rows.iter().map(row_to_version).collect::<Result<_, _>>()?;
+        sort_versions_ascending(&mut versions);
+        Ok(versions)
     }
 
     /// A repository's update policy: `(update_mode, cooldown_days)`.
@@ -4080,6 +4088,23 @@ async fn run_migrations(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error
 }
 
 /// Map a row to a [`PackageVersion`] by column name (no derive macros).
+/// Sort versions ascending by Composer version order, so `1.10.0.0` sorts after
+/// `1.9.0.0` (a lexicographic sort on the normalized string gets this wrong).
+/// A value that fails to parse falls back to a string comparison, keeping the
+/// ordering total.
+fn sort_versions_ascending(versions: &mut [PackageVersion]) {
+    use composer_semver::Version;
+    versions.sort_by(|a, b| {
+        match (
+            Version::parse(&a.normalized_version),
+            Version::parse(&b.normalized_version),
+        ) {
+            (Ok(va), Ok(vb)) => va.cmp(&vb),
+            _ => a.normalized_version.cmp(&b.normalized_version),
+        }
+    });
+}
+
 fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<PackageVersion, sqlx::Error> {
     let dist: Option<Vec<u8>> = row.try_get("dist_blob_sha256")?;
     let dist_blob_sha256 = dist.map(|v| {
