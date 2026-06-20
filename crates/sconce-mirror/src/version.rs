@@ -1,84 +1,37 @@
 //! Composer-style version normalization for git tags.
 //!
-//! Not a full reimplementation of Composer's `VersionParser` — it covers the
-//! shapes real package tags use: an optional `v` prefix, a 1–4 component numeric
-//! core, and an optional pre-release modifier (`alpha`/`beta`/`RC`, with an
-//! optional number). Tags that don't fit are returned as `None` and skipped by
-//! the mirror (logged), rather than guessed at. Branch (`dev-*`) versions are a
-//! later addition.
+//! A thin adapter over [`composer_semver`]: a git tag is normalized with
+//! Composer's real `VersionParser`, and only *numeric* versions are kept.
+//! Branch refs (`main`, `nightly`, `dev-*`) and anything unparseable return
+//! `None` so the mirror logs and skips them — the mirror tracks tagged
+//! releases, not branches.
+
+use composer_semver::Version;
+use composer_semver::version::VersionKind;
 
 /// A normalized version + its stability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedVersion {
     /// Composer-style normalized version, e.g. `1.2.0.0` or `1.2.0.0-beta2`.
     pub normalized: String,
-    /// `stable` | `RC` | `beta` | `alpha`.
+    /// Composer stability keyword: `stable` | `RC` | `beta` | `alpha` | `dev`.
     pub stability: String,
 }
 
 /// Normalize a tag like `v1.2.0` or `1.2.3-beta2`. Returns `None` if the tag
-/// isn't a recognizable version.
+/// isn't a recognizable **numeric** version (branch names and unparseable refs
+/// are skipped).
 #[must_use]
 pub fn normalize_tag(tag: &str) -> Option<ParsedVersion> {
-    let s = tag.strip_prefix(['v', 'V']).unwrap_or(tag);
-    let (core, pre) = match s.split_once('-') {
-        Some((c, p)) => (c, Some(p)),
-        None => (s, None),
-    };
-
-    // Numeric core: 1–4 dot-separated integers, padded to 4.
-    let comps: Vec<&str> = core.split('.').collect();
-    if comps.is_empty() || comps.len() > 4 {
+    let version = Version::parse(tag).ok()?;
+    // Tagged releases only: skip branch versions (`dev-*`, default branches).
+    if !matches!(version.kind, VersionKind::Numeric { .. }) {
         return None;
     }
-    let mut nums = [0u64; 4];
-    for (i, c) in comps.iter().enumerate() {
-        nums[i] = c.parse::<u64>().ok()?;
-    }
-    let core_norm = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
-
-    match pre {
-        None => Some(ParsedVersion {
-            normalized: core_norm,
-            stability: "stable".to_owned(),
-        }),
-        Some(p) => {
-            let (stability, norm_pre) = normalize_prerelease(p)?;
-            Some(ParsedVersion {
-                normalized: format!("{core_norm}-{norm_pre}"),
-                stability: stability.to_owned(),
-            })
-        }
-    }
-}
-
-/// Map a pre-release suffix to `(stability, normalized_suffix)`, or `None` if it
-/// isn't a recognized modifier.
-fn normalize_prerelease(pre: &str) -> Option<(&'static str, String)> {
-    let cleaned: String = pre
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| !matches!(c, '.' | '-' | '_'))
-        .collect();
-    let split = cleaned
-        .find(|c: char| c.is_ascii_digit())
-        .unwrap_or(cleaned.len());
-    let (word, num) = (&cleaned[..split], &cleaned[split..]);
-
-    let stability = match word {
-        "alpha" | "a" => "alpha",
-        "beta" | "b" => "beta",
-        "rc" => "RC",
-        // Composer treats patch/pl as stable-equivalent post-releases.
-        "patch" | "pl" | "p" | "stable" => "stable",
-        _ => return None,
-    };
-    let normalized = if num.is_empty() {
-        word.to_owned()
-    } else {
-        format!("{word}{num}")
-    };
-    Some((stability, normalized))
+    Some(ParsedVersion {
+        stability: version.stability().as_str().to_owned(),
+        normalized: version.normalized,
+    })
 }
 
 #[cfg(test)]
@@ -106,16 +59,17 @@ mod tests {
 
     #[test]
     fn prereleases() {
+        // Normalized forms are Composer-canonical: `b`→`beta`, `rc`→`RC`.
         assert_eq!(
             normalize_tag("v1.2.0-beta2"),
             parsed("1.2.0.0-beta2", "beta")
         );
-        assert_eq!(normalize_tag("1.0.0-RC1"), parsed("1.0.0.0-rc1", "RC"));
+        assert_eq!(normalize_tag("1.0.0-RC1"), parsed("1.0.0.0-RC1", "RC"));
         assert_eq!(
             normalize_tag("v3.0.0-alpha"),
             parsed("3.0.0.0-alpha", "alpha")
         );
-        assert_eq!(normalize_tag("1.0.0-b3"), parsed("1.0.0.0-b3", "beta"));
+        assert_eq!(normalize_tag("1.0.0-b3"), parsed("1.0.0.0-beta3", "beta"));
     }
 
     #[test]
@@ -125,5 +79,13 @@ mod tests {
         assert_eq!(normalize_tag("1.2.3.4.5"), None);
         assert_eq!(normalize_tag("1.x"), None);
         assert_eq!(normalize_tag("v1.2.0-wat"), None);
+    }
+
+    #[test]
+    fn skips_branch_tags() {
+        // Composer parses `dev-*` as a branch version; the mirror keeps only
+        // numeric tags, so these are skipped.
+        assert_eq!(normalize_tag("dev-master"), None);
+        assert_eq!(normalize_tag("dev-feature-x"), None);
     }
 }

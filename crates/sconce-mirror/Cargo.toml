@@ -13,6 +13,8 @@ description = "The mirror worker: enumerate a git source's tags, read composer.j
 sconce-git = { workspace = true }
 sconce-cas = { workspace = true }
 sconce-catalog = { workspace = true }
+# Composer version normalization + constraint matching (tags, subscriptions).
+composer-semver = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
 thiserror = { workspace = true }

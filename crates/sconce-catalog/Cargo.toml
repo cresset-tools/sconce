@@ -17,6 +17,8 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+# Composer-correct version ordering for the served/version-list read paths.
+composer-semver = { workspace = true }
 sha2 = { workspace = true }
 argon2 = { workspace = true }
 thiserror = { workspace = true }
