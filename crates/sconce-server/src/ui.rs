@@ -3090,7 +3090,7 @@ async fn add_ci(
         )
         .await
         .map_err(e500)?;
-    Ok(Redirect::to(&format!("/r/{org}/{repo}#ci")))
+    Ok(Redirect::to(&format!("/r/{org}/{repo}#tab-ci")))
 }
 
 #[derive(Deserialize)]
@@ -3112,7 +3112,7 @@ async fn remove_ci(
         .delete_ci_policy(repo_id, id)
         .await
         .map_err(e500)?;
-    Ok(Redirect::to(&format!("/r/{org}/{repo}#ci")))
+    Ok(Redirect::to(&format!("/r/{org}/{repo}#tab-ci")))
 }
 
 #[derive(Deserialize)]

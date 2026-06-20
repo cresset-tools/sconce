@@ -5,29 +5,48 @@ for (const form of document.querySelectorAll('form[data-confirm]')) {
   });
 }
 
-// Remember which repo tab you're on (across reloads and post-action redirects).
-// A package search/filter in the URL still forces the Packages tab.
+// Remember which repo tab you're on via the URL #hash, so it's linkable and
+// survives reloads and post-action redirects. Hashes are prefixed `tab-` so they
+// don't collide with in-page heading anchors (#tokens, #ci, #health). A package
+// search/filter (?q=/?state=/?page=) arrives with no hash and keeps the server's
+// Packages pre-selection.
 {
-  const KEY = 'sconceRepoTab';
-  const tabs = ['rt-overview', 'rt-packages', 'rt-approvals', 'rt-upstreams',
-                'rt-deps', 'rt-policy', 'rt-tokens', 'rt-ci'];
+  const tabs = ['overview', 'packages', 'approvals', 'upstreams', 'deps',
+                'policy', 'tokens', 'ci'];
+  const tabFromHash = () => location.hash.replace(/^#tab-/, '');
 
-  for (const id of tabs) {
-    const radio = document.getElementById(id);
+  // Select the tab named by the current hash. Used on load (deep links and
+  // post-action redirects) and on hashchange (back/forward, a hand-edited hash,
+  // or a same-document #-nav). Setting `.checked` programmatically doesn't fire
+  // `change`, so this never loops with the listener below.
+  const applyHash = () => {
+    const name = tabFromHash();
+    if (!tabs.includes(name)) return;
+    const radio = document.getElementById('rt-' + name);
+    if (radio) radio.checked = true;
+  };
+  applyHash();
+  window.addEventListener('hashchange', applyHash);
+
+  // Reflect tab changes back into the hash (replaceState → no history spam or
+  // scroll jump). Also fires when an in-page label selects a tab.
+  for (const name of tabs) {
+    const radio = document.getElementById('rt-' + name);
     radio?.addEventListener('change', () => {
-      if (radio.checked) {
-        try { localStorage.setItem(KEY, id); } catch {}
-      }
+      if (radio.checked) history.replaceState(null, '', '#tab-' + name);
     });
   }
 
-  if (!/[?&](q|state|page)=/.test(location.search)) {
-    let saved = null;
-    try { saved = localStorage.getItem(KEY); } catch {}
-    if (saved && tabs.includes(saved)) {
-      const radio = document.getElementById(saved);
-      if (radio) radio.checked = true;
-    }
+  // Carry the active tab through a POST → redirect: the browser keeps the
+  // fragment on the form's action URL and reattaches it to the server's
+  // fragment-less redirect, so an action returns you to the same tab.
+  for (const form of document.querySelectorAll('.tabpanel form')) {
+    form.addEventListener('submit', () => {
+      const name = tabFromHash();
+      if (tabs.includes(name) && !form.action.includes('#')) {
+        form.action += '#tab-' + name;
+      }
+    });
   }
 }
 
