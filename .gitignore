@@ -4,5 +4,8 @@
 # `.env.example` instead.
 .env
 
+# Local filesystem CAS blob store created by `sconce serve`/`worker --cas ./cas`.
+/cas/
+
 # Visual Studio workspace state (per-user; not project config).
 .vs/
