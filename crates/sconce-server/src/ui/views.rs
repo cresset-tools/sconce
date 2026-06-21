@@ -876,7 +876,7 @@ mod tests {
         assert!(html.contains("acme/loyalty"));
         assert!(html.contains("HELD"));
         // The selection bulk bar posts the picked versions.
-        assert!(html.contains(r#"name=versions"#));
+        assert!(html.contains(r"name=versions"));
     }
 
     /// With nothing pending, the Approvals tab shows the friendly empty state and
