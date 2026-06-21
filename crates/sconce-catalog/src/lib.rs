@@ -5925,7 +5925,9 @@ mod tests {
                 .unwrap();
             }
         }
-        cat.hold_version(repo_id, "acme/b", "1.1.0.0").await.unwrap();
+        cat.hold_version(repo_id, "acme/b", "1.1.0.0")
+            .await
+            .unwrap();
 
         // 4 versions, 1 held → 3 pending, 1 held (the tab's bucket counts).
         assert_eq!(

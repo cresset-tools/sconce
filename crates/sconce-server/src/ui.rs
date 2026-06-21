@@ -2619,7 +2619,11 @@ async fn repo_page(
             normalized: v.normalized_version.clone(),
             version: v.version.clone(),
             stability: v.stability.clone(),
-            stab_tone: if v.stability == "stable" { "ok" } else { "slate" },
+            stab_tone: if v.stability == "stable" {
+                "ok"
+            } else {
+                "slate"
+            },
             age: rel_date(&v.released_at),
             sha: short_sha(&v.dist_shasum),
         };
@@ -3059,7 +3063,10 @@ async fn approve_bulk(
             if let Some((pkg, norm)) = line.split_once('|') {
                 let (pkg, norm) = (pkg.trim(), norm.trim());
                 if !pkg.is_empty() && !norm.is_empty() {
-                    s.catalog.approve_version(id, pkg, norm).await.map_err(e500)?;
+                    s.catalog
+                        .approve_version(id, pkg, norm)
+                        .await
+                        .map_err(e500)?;
                 }
             }
         }
