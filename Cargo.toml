@@ -117,10 +117,3 @@ strip = "symbols"
 
 [profile.dist]
 inherits = "release"
-
-# TEMPORARY co-develop override (composer-wire extraction): consume the
-# not-yet-published composer-wire crate from the local composer-rs worktree so
-# the stack can be verified end-to-end before publishing. REMOVE before merge —
-# replace with the real crates.io version once composer-rs is published.
-[patch.crates-io]
-composer-wire = { path = "../composer-rs-wt-php-json/crates/composer-wire" }

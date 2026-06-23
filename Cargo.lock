@@ -546,6 +546,8 @@ dependencies = [
 [[package]]
 name = "composer-wire"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc3c59104a94b76561a4f44a4bc48d18770d6b265c75b447ff56079de9b5f9a7"
 dependencies = [
  "serde",
  "serde_json",
