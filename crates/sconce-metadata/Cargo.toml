@@ -11,6 +11,8 @@ description = "Renders Composer v2 repository metadata (packages.json + p2 per-p
 
 [dependencies]
 sconce-catalog = { workspace = true }
+# Composer v2 wire format: RootManifest + PackageDocument document types.
+composer-wire = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

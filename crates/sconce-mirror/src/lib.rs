@@ -19,6 +19,7 @@ pub use subscription::Subscription;
 
 use std::path::Path;
 
+use composer_wire::{PackageDocument, RootManifest};
 use sconce_cas::BlobStore;
 use sconce_catalog::secret::SecretKey;
 use sconce_catalog::{Catalog, Visibility};
@@ -316,21 +317,14 @@ async fn mirror_composer_registry(
 
     let base = up.base.trim_end_matches('/');
     let body = http_get_string(&format!("{base}/packages.json"))?;
-    let root: serde_json::Value = serde_json::from_str(&body).map_err(|_| Error::BadMetadata {
+    let root = RootManifest::parse(body.as_bytes()).map_err(|_| Error::BadMetadata {
         package: "packages.json".to_owned(),
     })?;
     // The full set the registry concretely lists (None for pattern-only
     // registries that publish `available-package-patterns` instead). We need the
     // *unfiltered* set to reconcile removals independently of the sync filter.
-    let available: Option<std::collections::HashSet<String>> = root
-        .get("available-packages")
-        .and_then(serde_json::Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        });
+    let available: Option<std::collections::HashSet<String>> =
+        root.available_packages.map(|names| names.into_iter().collect());
     let names: Vec<String> = available
         .iter()
         .flatten()
@@ -447,19 +441,25 @@ async fn mirror_one_composer_package_inner(
     let base = up.base.trim_end_matches('/');
     let meta_url = format!("{base}/p2/{package}.json");
     let body = http_get_string(&meta_url)?;
-    let meta: serde_json::Value = serde_json::from_str(&body).map_err(|_| Error::BadMetadata {
-        package: package.to_owned(),
-    })?;
-    let versions = meta
-        .get("packages")
-        .and_then(|p| p.get(package))
-        .and_then(serde_json::Value::as_array)
+    // Parse + apply composer/2.0 minified-expansion. Packagist and many mirrors
+    // serve minified p2 documents; the previous hand-rolled parse read the raw
+    // sparse-diff entries verbatim and mis-read every entry after the first.
+    // composer-wire expands them into full version objects first.
+    let versions: Vec<serde_json::Value> = PackageDocument::parse(body.as_bytes())
+        .map_err(|_| Error::BadMetadata {
+            package: package.to_owned(),
+        })?
+        .expand()
+        .remove(package)
         .ok_or_else(|| Error::BadMetadata {
             package: package.to_owned(),
-        })?;
+        })?
+        .into_iter()
+        .map(serde_json::Value::Object)
+        .collect();
 
     let mut report = Report::default();
-    for obj in versions {
+    for obj in &versions {
         let version = obj.get("version").and_then(serde_json::Value::as_str);
         let normalized = obj
             .get("version_normalized")
@@ -653,16 +653,18 @@ fn fetch_p2(base: &str, package: &str) -> Result<Option<Vec<serde_json::Value>>,
     match ureq::get(&url).call() {
         Ok(resp) => {
             let body = resp.into_string().map_err(|e| Error::Http(e.to_string()))?;
-            let v: serde_json::Value =
-                serde_json::from_str(&body).map_err(|_| Error::BadMetadata {
+            // Expand composer/2.0 minified p2 before reading versions (same
+            // reasoning as mirror_one_composer_package_inner).
+            let versions = PackageDocument::parse(body.as_bytes())
+                .map_err(|_| Error::BadMetadata {
                     package: package.to_owned(),
-                })?;
-            let versions = v
-                .get("packages")
-                .and_then(|p| p.get(package))
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+                })?
+                .expand()
+                .remove(package)
+                .unwrap_or_default()
+                .into_iter()
+                .map(serde_json::Value::Object)
+                .collect();
             Ok(Some(versions))
         }
         Err(ureq::Error::Status(404, _)) => Ok(None),

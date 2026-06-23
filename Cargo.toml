@@ -46,6 +46,10 @@ clap = { version = "4", features = ["derive"] }
 # Composer-flavored version + constraint algebra (normalize, compare, match),
 # shared with bougie. Replaces sconce's hand-rolled version subset.
 composer-semver = "0.1.0"
+# Composer v2 repository wire format (p2/packages.json documents + the
+# composer/2.0 minify/expand algorithm), shared with bougie. Replaces sconce's
+# hand-rolled metadata rendering and the (expansion-less) upstream p2 parsing.
+composer-wire = "0.1"
 sha2 = "0.10"
 sha1 = "0.10"
 thiserror = "2"
@@ -113,3 +117,10 @@ strip = "symbols"
 
 [profile.dist]
 inherits = "release"
+
+# TEMPORARY co-develop override (composer-wire extraction): consume the
+# not-yet-published composer-wire crate from the local composer-rs worktree so
+# the stack can be verified end-to-end before publishing. REMOVE before merge —
+# replace with the real crates.io version once composer-rs is published.
+[patch.crates-io]
+composer-wire = { path = "../composer-rs-wt-php-json/crates/composer-wire" }
