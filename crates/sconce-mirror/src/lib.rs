@@ -323,8 +323,9 @@ async fn mirror_composer_registry(
     // The full set the registry concretely lists (None for pattern-only
     // registries that publish `available-package-patterns` instead). We need the
     // *unfiltered* set to reconcile removals independently of the sync filter.
-    let available: Option<std::collections::HashSet<String>> =
-        root.available_packages.map(|names| names.into_iter().collect());
+    let available: Option<std::collections::HashSet<String>> = root
+        .available_packages
+        .map(|names| names.into_iter().collect());
     let names: Vec<String> = available
         .iter()
         .flatten()

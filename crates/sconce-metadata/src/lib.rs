@@ -50,7 +50,8 @@ pub fn render_package(name: &str, versions: &[PackageVersion], base_url: &str) -
         .collect();
     let mut packages = BTreeMap::new();
     packages.insert(name.to_owned(), entries);
-    serde_json::to_value(PackageDocument::flat(packages)).expect("PackageDocument always serializes")
+    serde_json::to_value(PackageDocument::flat(packages))
+        .expect("PackageDocument always serializes")
 }
 
 /// One version entry: the stored `composer.json` with `version`,
