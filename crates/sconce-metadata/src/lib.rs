@@ -16,37 +16,47 @@
 
 #![forbid(unsafe_code)]
 
+use composer_wire::{PackageDocument, RootManifest};
 use sconce_catalog::PackageVersion;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 /// Render the root `packages.json`.
 ///
 /// `base_url` is the repository's public base (no trailing slash needed); the
 /// emitted `metadata-url` is `<base>/p2/%package%.json`, the template Composer
 /// expands per package.
+///
+/// # Panics
+/// Never in practice: serializing a [`RootManifest`] is infallible for its
+/// plain `String`/`Vec`/`Map` fields.
 #[must_use]
 pub fn render_root(package_names: &[String], base_url: &str) -> Value {
-    let base = base_url.trim_end_matches('/');
-    json!({
-        "metadata-url": format!("{base}/p2/%package%.json"),
-        "available-packages": package_names,
-    })
+    let root = RootManifest::v2(base_url, package_names.to_vec());
+    serde_json::to_value(root).expect("RootManifest always serializes")
 }
 
 /// Render the per-package document for `name` at `p2/{name}.json`.
+///
+/// # Panics
+/// Never in practice: serializing a [`PackageDocument`] is infallible for its
+/// plain `String`/`Map` contents.
 #[must_use]
 pub fn render_package(name: &str, versions: &[PackageVersion], base_url: &str) -> Value {
     let base = base_url.trim_end_matches('/');
-    let entries: Vec<Value> = versions
+    let entries: Vec<Map<String, Value>> = versions
         .iter()
         .map(|v| version_entry(name, v, base))
         .collect();
-    json!({ "packages": { name: entries } })
+    let mut packages = BTreeMap::new();
+    packages.insert(name.to_owned(), entries);
+    serde_json::to_value(PackageDocument::flat(packages))
+        .expect("PackageDocument always serializes")
 }
 
 /// One version entry: the stored `composer.json` with `version`,
 /// `version_normalized`, and `dist` injected/overridden.
-fn version_entry(name: &str, v: &PackageVersion, base: &str) -> Value {
+fn version_entry(name: &str, v: &PackageVersion, base: &str) -> Map<String, Value> {
     let mut obj = match &v.composer_json {
         Value::Object(m) => m.clone(),
         // A non-object composer.json is malformed; start from nothing rather
@@ -73,7 +83,7 @@ fn version_entry(name: &str, v: &PackageVersion, base: &str) -> Value {
         obj.insert("dist".to_owned(), Value::Object(dist));
     }
 
-    Value::Object(obj)
+    obj
 }
 
 /// Lowercase hex of a 32-byte digest.

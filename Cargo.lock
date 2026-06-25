@@ -544,6 +544,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "composer-wire"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc3c59104a94b76561a4f44a4bc48d18770d6b265c75b447ff56079de9b5f9a7"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3561,6 +3571,7 @@ dependencies = [
 name = "sconce-metadata"
 version = "0.1.0"
 dependencies = [
+ "composer-wire",
  "sconce-catalog",
  "serde_json",
 ]
@@ -3570,6 +3581,7 @@ name = "sconce-mirror"
 version = "0.1.0"
 dependencies = [
  "composer-semver",
+ "composer-wire",
  "regex",
  "sconce-cas",
  "sconce-catalog",
@@ -3677,6 +3689,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",
