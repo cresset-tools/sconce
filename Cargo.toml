@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0" # x-release-please-version
+version = "0.2.0" # x-release-please-version
 edition = "2024"
 rust-version = "1.96"
 # EUPL-1.2, like the rest of the cresset-tools family. Chosen deliberately over
@@ -32,13 +32,13 @@ repository = "https://github.com/cresset-tools/sconce"
 # lack a version). The trailing release-please marker lets the tool rewrite
 # all of them in lockstep with `[workspace.package].version` above.
 [workspace.dependencies]
-sconce-archive = { path = "crates/sconce-archive", version = "0.1.0" } # x-release-please-version
-sconce-cas = { path = "crates/sconce-cas", version = "0.1.0" } # x-release-please-version
-sconce-catalog = { path = "crates/sconce-catalog", version = "0.1.0" } # x-release-please-version
-sconce-git = { path = "crates/sconce-git", version = "0.1.0" } # x-release-please-version
-sconce-metadata = { path = "crates/sconce-metadata", version = "0.1.0" } # x-release-please-version
-sconce-mirror = { path = "crates/sconce-mirror", version = "0.1.0" } # x-release-please-version
-sconce-server = { path = "crates/sconce-server", version = "0.1.0" } # x-release-please-version
+sconce-archive = { path = "crates/sconce-archive", version = "0.2.0" } # x-release-please-version
+sconce-cas = { path = "crates/sconce-cas", version = "0.2.0" } # x-release-please-version
+sconce-catalog = { path = "crates/sconce-catalog", version = "0.2.0" } # x-release-please-version
+sconce-git = { path = "crates/sconce-git", version = "0.2.0" } # x-release-please-version
+sconce-metadata = { path = "crates/sconce-metadata", version = "0.2.0" } # x-release-please-version
+sconce-mirror = { path = "crates/sconce-mirror", version = "0.2.0" } # x-release-please-version
+sconce-server = { path = "crates/sconce-server", version = "0.2.0" } # x-release-please-version
 
 # Shared external deps.
 anyhow = "1"
