@@ -1,6 +1,23 @@
+# The build context is the repo root, but the image build only needs the cargo
+# workspace sources (Cargo.toml, Cargo.lock, rust-toolchain.toml, crates/) — the
+# embedded assets, Askama templates, and SQL migrations all live under crates/.
+# Keep the context lean: the compiled target dir lives in BuildKit cache mounts,
+# and the local CAS blob store must never be shipped into the build.
 /target
-/.git
+**/target
+/cas
+.git
+.gitignore
+.gitattributes
+.github
+.claude
 .env
+.env.example
 .vs/
-ROADMAP.md
-SSO_PLAN.md
+docker-compose.yml
+flake.nix
+flake.lock
+dist-workspace.toml
+release-please-config.json
+.release-please-manifest.json
+*.md

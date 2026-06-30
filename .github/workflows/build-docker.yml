@@ -1,0 +1,164 @@
+name: build-docker
+
+# Builds and publishes the sconce container image via Depot.
+#
+# Three entry points:
+#
+#   * release (published): release-please publishes a `sconce-v<version>`
+#     GitHub Release; that fires this workflow, which builds the multi-arch
+#     image and pushes versioned + rolling tags to GHCR.
+#
+#   * workflow_dispatch: manually build + push a given `sconce-v<version>` tag,
+#     e.g. to republish or to cut an image outside the release flow.
+#
+#   * pull_request: a push-free smoke build (amd64 only) whenever the Dockerfile
+#     or the cargo sources change, so a broken image build is caught on the PR
+#     rather than at release time.
+#
+# Image (GHCR only for now — Docker Hub can be added later as a second login +
+# push target):
+#
+#   ghcr.io/cresset-tools/sconce:<version>        always
+#   ghcr.io/cresset-tools/sconce:<major>.<minor>  stable releases only
+#   ghcr.io/cresset-tools/sconce:latest           stable releases only
+#
+# Depot builds linux/amd64 and linux/arm64 on its own native per-arch builders
+# — no QEMU, no cross-compile, no arm runner. The Depot project (depot.json,
+# id ngljfb827z) also owns the layer cache, so no GitHub Actions cache is wired.
+#
+# Auth: Depot trusts this repo via OIDC, so each job grants `id-token: write`
+# and no DEPOT_TOKEN secret is needed. The Depot project must list
+# cresset-tools/sconce in its GitHub OIDC trust relationships.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, e.g. sconce-v0.1.0"
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "depot.json"
+      - ".dockerignore"
+      - ".github/workflows/build-docker.yml"
+
+permissions: {}
+
+env:
+  # github.repository is already lowercase for this repo; GHCR requires it.
+  IMAGE: ghcr.io/${{ github.repository }}
+  # Depot project that owns the builders + layer cache (see depot.json).
+  DEPOT_PROJECT: ngljfb827z
+
+jobs:
+  # PR smoke test: prove the image still builds. amd64 only (the arm64 leg is
+  # the same native build, just on an arm64 builder) and never pushed.
+  pr-smoke:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Depot OIDC
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: depot/setup-action@v1
+      - uses: depot/build-push-action@v1
+        with:
+          project: ${{ env.DEPOT_PROJECT }}
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+
+  # Release: build + push the multi-arch image.
+  publish:
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # GHCR login + Depot OIDC + attestations
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Derive version from the release tag
+        id: ver
+        # The tag is `sconce-v<version>`; strip the namespace to get the bare
+        # semver used for image tags. major.minor + latest are only meaningful
+        # for stable releases, so gate them on the prerelease flag — taken from
+        # the release event when present, else inferred from a semver `-` suffix.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag='${{ github.event.release.tag_name }}'
+            prerelease='${{ github.event.release.prerelease }}'
+          else
+            tag='${{ inputs.tag }}'
+            prerelease=''
+          fi
+          version="${tag#sconce-v}"
+          if [ -z "$prerelease" ]; then
+            case "$version" in
+              *-*) prerelease=true ;;
+              *)   prerelease=false ;;
+            esac
+          fi
+          {
+            echo "version=${version}"
+            echo "major_minor=${version%.*}"
+            echo "is_prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: depot/setup-action@v1
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.major_minor }},enable=${{ steps.ver.outputs.is_prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ steps.ver.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push image
+        id: build
+        uses: depot/build-push-action@v1
+        with:
+          project: ${{ env.DEPOT_PROJECT }}
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
