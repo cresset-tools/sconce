@@ -3510,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "sconce"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3529,21 +3529,21 @@ dependencies = [
 
 [[package]]
 name = "sconce-archive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "sconce-cas"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "sconce-catalog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gix",
  "sconce-archive",
@@ -3569,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-metadata"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "composer-wire",
  "sconce-catalog",
@@ -3578,7 +3578,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-mirror"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "composer-semver",
  "composer-wire",
@@ -3597,7 +3597,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "askama",
  "askama_web",
