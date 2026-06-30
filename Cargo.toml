@@ -114,6 +114,3 @@ lto = "fat"
 opt-level = 3
 panic = "abort"
 strip = "symbols"
-
-[profile.dist]
-inherits = "release"

@@ -1,0 +1,86 @@
+name: release-please
+
+# Conventional-commit-driven release automation. On every push to main,
+# release-please scans commits since the last `sconce-v*` tag and opens or
+# updates a release PR that bumps `workspace.package.version` (plus the
+# `# x-release-please-version` markers in Cargo.toml) and prepends to
+# CHANGELOG.md. Merging that PR makes release-please publish the
+# `sconce-v<version>` GitHub Release (which creates the git tag), and the
+# `release: published` event triggers build-docker.yml to build + push the
+# multi-arch image to GHCR.
+#
+# release-please decides "what changed" purely from conventional-commit
+# messages, not per-crate file diffs: a leaf-only change (e.g. a
+# `fix(catalog): ...` touching only `crates/sconce-catalog/`) still drives a
+# top-level release, which is why every member is pinned in lockstep on
+# `workspace.package.version`.
+#
+# Division of labour: release-please owns the WHOLE release — it creates the
+# tag and publishes the GitHub Release itself (a real, non-draft release).
+# Publishing a non-draft release creates the tag *within* the same action step
+# that computes the next candidate PR, so release-please's baseline is always
+# correct; a draft release would not create the tag (GitHub only tags on
+# publish), which reintroduces spurious major-bump PRs.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Don't cancel in-flight runs — a half-written release PR is worse than
+# waiting for the previous run to finish.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # GitHub-App token (not `GITHUB_TOKEN`) so the release PR is authored by
+      # an actor that *can* trigger downstream workflows — events from
+      # `GITHUB_TOKEN` are silenced by GitHub's anti-recursion rule, so a
+      # `release: published` minted with it would never trigger build-docker.yml
+      # (nor would ci.yml run on the release PR). Minted via the app, it does.
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
+      - name: release-please
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # The "simple" release-type bumps the version markers but doesn't
+      # understand Cargo.lock. Refresh the lockfile on the PR branch so CI
+      # builds aren't broken by stale [[package]] entries. `--workspace` scopes
+      # the update to workspace members — external crates aren't bumped. Don't
+      # pass `--offline`: a fresh runner has no registry cache, and cargo needs
+      # the index to verify the dep graph even though no external dep moves.
+      - name: Checkout release PR
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Refresh Cargo.lock
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          cargo update --workspace
+          if ! git diff --quiet Cargo.lock; then
+            git config user.email "${{ vars.BOT_EMAIL || 'noreply@cresset.tools' }}"
+            git config user.name "${{ vars.BOT_NAME || 'cresset-bot' }}"
+            git add Cargo.lock
+            git commit -m "chore(release): refresh Cargo.lock"
+            git push
+          fi
