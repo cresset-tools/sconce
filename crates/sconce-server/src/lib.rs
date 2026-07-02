@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
-use sconce_cas::{BlobId, BlobStore, FsBlobStore};
+use sconce_cas::{AnyBlobStore, BlobId, BlobStore};
 use sconce_catalog::Catalog;
 use serde_json::json;
 use uuid::Uuid;
@@ -41,14 +41,14 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     catalog: Catalog,
-    store: FsBlobStore,
+    store: AnyBlobStore,
     /// Public base URL; each repository is served under `<base>/<org>/<repo>`.
     base_url: String,
 }
 
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
 /// gated by a token valid *for that repository*.
-pub fn router(catalog: Catalog, store: FsBlobStore, base_url: String) -> Router {
+pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router {
     Router::new()
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
@@ -187,7 +187,7 @@ fn unauthorized() -> Response {
 /// Bind `listen` and serve until the process is stopped.
 pub async fn serve(
     catalog: Catalog,
-    store: FsBlobStore,
+    store: AnyBlobStore,
     base_url: String,
     listen: std::net::SocketAddr,
 ) -> std::io::Result<()> {
@@ -292,12 +292,43 @@ async fn dist(
     let file = rest.rsplit('/').next().ok_or(AppError::NotFound)?;
     let hex = file.strip_suffix(".zip").ok_or(AppError::NotFound)?;
     let sha = parse_hex32(hex).ok_or(AppError::NotFound)?;
+    let id = BlobId::from_bytes(sha);
 
-    match s.store.get(&BlobId::from_bytes(sha))? {
+    // Object-store backend: authorize (above), then hand the client a
+    // freshly-minted, short-lived presigned URL and let it pull bytes straight
+    // from the store. The stable sconce URL is what `composer.lock` pins; the
+    // signed URL is never persisted anywhere. (The GitHub release-asset model —
+    // see ROADMAP "Dist serving".) One HEAD first so a dangling sha 404s as
+    // sconce rather than as store XML behind the redirect.
+    if let Some(url) = s.store.presigned_get(&id, DIST_PRESIGN_SECS) {
+        let store = s.store.clone();
+        if !blocking(move || store.exists(&id)).await? {
+            return Err(AppError::NotFound);
+        }
+        return Ok((StatusCode::FOUND, [(header::LOCATION, url)]).into_response());
+    }
+
+    let store = s.store.clone();
+    match blocking(move || store.get(&id)).await? {
         Some(bytes) => Ok(([(header::CONTENT_TYPE, "application/zip")], bytes).into_response()),
         None => Err(AppError::NotFound),
     }
 }
+
+/// Run one blocking store operation (disk or S3 round-trip via ureq) off the
+/// async executor.
+async fn blocking<T: Send + 'static>(
+    op: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, AppError> {
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|e| AppError::Storage(std::io::Error::other(e)))?
+        .map_err(AppError::Storage)
+}
+
+/// Lifetime of a presigned dist redirect. Short — Composer follows the 302
+/// immediately — but with slack for clock skew between sconce and the store.
+const DIST_PRESIGN_SECS: u64 = 300;
 
 /// Parse 64 lowercase/uppercase hex chars into 32 bytes.
 fn parse_hex32(hex: &str) -> Option<[u8; 32]> {

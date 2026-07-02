@@ -3558,7 +3558,9 @@ dependencies = [
 name = "sconce-cas"
 version = "0.2.0"
 dependencies = [
+ "hmac",
  "sha2",
+ "ureq",
 ]
 
 [[package]]

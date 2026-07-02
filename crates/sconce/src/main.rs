@@ -118,9 +118,10 @@ enum Command {
         repo: PathBuf,
         /// Ref to archive (e.g. `HEAD`, `v1.2.0`, a commit sha).
         r#ref: String,
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
     },
 
     /// Mirror every tagged version of a git repository into the CAS + catalog.
@@ -138,9 +139,10 @@ enum Command {
         /// Public source URL recorded for the package (e.g. the git remote).
         #[arg(long)]
         git_url: String,
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
         /// Postgres connection string.
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
@@ -213,9 +215,10 @@ enum Command {
     MirrorUpstream {
         /// Upstream id (see `upstream list`).
         id: uuid::Uuid,
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -229,9 +232,10 @@ enum Command {
         /// Package name, e.g. `mage-os/composer`.
         #[arg(long)]
         package: String,
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -243,9 +247,10 @@ enum Command {
         /// Composer upstream id (see `upstream list`).
         #[arg(long)]
         upstream: uuid::Uuid,
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -265,9 +270,10 @@ enum Command {
     /// Run the background mirror worker: drain the job queue, then wait for
     /// NOTIFY (with a poll backstop) and repeat. Runs until killed.
     Worker {
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -403,9 +409,10 @@ enum Command {
 
     /// Serve the Composer v2 wire API (packages.json, p2 metadata, dist) over HTTP.
     Serve {
-        /// Directory of the content-addressed store.
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
-        cas: PathBuf,
+        cas: Option<PathBuf>,
         /// Postgres connection string.
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
@@ -769,14 +776,14 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Archive { src, out } => archive(&src, &out),
         Command::ArchiveRef { repo, r#ref, out } => archive_ref(&repo, &r#ref, &out),
-        Command::Ingest { repo, r#ref, cas } => ingest(&repo, &r#ref, &cas),
+        Command::Ingest { repo, r#ref, cas } => ingest(&repo, &r#ref, cas.as_deref()),
         Command::Mirror {
             source,
             repo,
             git_url,
             cas,
             database_url,
-        } => mirror(&source, &repo, &git_url, &cas, &database_url),
+        } => mirror(&source, &repo, &git_url, cas.as_deref(), &database_url),
         Command::Serve {
             cas,
             database_url,
@@ -787,7 +794,7 @@ fn main() -> Result<()> {
             single_tenant,
             admin_password,
         } => serve(
-            &cas,
+            cas.as_deref(),
             &database_url,
             listen,
             base_url,
@@ -855,18 +862,18 @@ fn main() -> Result<()> {
             id,
             cas,
             database_url,
-        } => mirror_upstream(id, &cas, &database_url),
+        } => mirror_upstream(id, cas.as_deref(), &database_url),
         Command::MirrorPackage {
             upstream,
             package,
             cas,
             database_url,
-        } => mirror_package(upstream, &package, &cas, &database_url),
+        } => mirror_package(upstream, &package, cas.as_deref(), &database_url),
         Command::MirrorRegistry {
             upstream,
             cas,
             database_url,
-        } => mirror_registry(upstream, &cas, &database_url),
+        } => mirror_registry(upstream, cas.as_deref(), &database_url),
         Command::Deps { action } => match action {
             DepsAction::Resolve { repo, database_url } => deps_resolve(&repo, &database_url),
             DepsAction::Plan { repo, database_url } => deps_plan(&repo, &database_url),
@@ -889,7 +896,7 @@ fn main() -> Result<()> {
                 database_url,
             } => package_set_archived(&repo, &package, false, &database_url),
         },
-        Command::Worker { cas, database_url } => worker(&cas, &database_url),
+        Command::Worker { cas, database_url } => worker(cas.as_deref(), &database_url),
         Command::RepoSettings {
             repo,
             allow_raw_tokens,
@@ -1162,8 +1169,7 @@ fn upstream_remove(repo: &str, id: uuid::Uuid, database_url: &str) -> Result<()>
     })
 }
 
-fn mirror_upstream(id: uuid::Uuid, cas: &Path, database_url: &str) -> Result<()> {
-    use sconce_cas::FsBlobStore;
+fn mirror_upstream(id: uuid::Uuid, cas: Option<&Path>, database_url: &str) -> Result<()> {
     use sconce_catalog::Catalog;
 
     // The key is only needed if the upstream stores a credential; load it
@@ -1171,8 +1177,7 @@ fn mirror_upstream(id: uuid::Uuid, cas: &Path, database_url: &str) -> Result<()>
     let key = sconce_catalog::secret::SecretKey::from_env().ok();
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
     runtime.block_on(async {
-        let store =
-            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let store = open_store(cas)?;
         let catalog = Catalog::connect(database_url)
             .await
             .context("connecting to Postgres")?;
@@ -1202,16 +1207,14 @@ fn mirror_upstream(id: uuid::Uuid, cas: &Path, database_url: &str) -> Result<()>
 fn mirror_package(
     upstream: uuid::Uuid,
     package: &str,
-    cas: &Path,
+    cas: Option<&Path>,
     database_url: &str,
 ) -> Result<()> {
-    use sconce_cas::FsBlobStore;
     use sconce_catalog::Catalog;
 
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
     runtime.block_on(async {
-        let store =
-            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let store = open_store(cas)?;
         let catalog = Catalog::connect(database_url)
             .await
             .context("connecting to Postgres")?;
@@ -1235,14 +1238,12 @@ fn mirror_package(
     })
 }
 
-fn mirror_registry(upstream: uuid::Uuid, cas: &Path, database_url: &str) -> Result<()> {
-    use sconce_cas::FsBlobStore;
+fn mirror_registry(upstream: uuid::Uuid, cas: Option<&Path>, database_url: &str) -> Result<()> {
     use sconce_catalog::Catalog;
 
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
     runtime.block_on(async {
-        let store =
-            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let store = open_store(cas)?;
         let catalog = Catalog::connect(database_url)
             .await
             .context("connecting to Postgres")?;
@@ -1413,7 +1414,7 @@ fn bad_job(message: impl Into<String>) -> JobFailure {
 
 async fn run_job(
     catalog: &sconce_catalog::Catalog,
-    store: &sconce_cas::FsBlobStore,
+    store: &sconce_cas::AnyBlobStore,
     key: Option<&sconce_catalog::secret::SecretKey>,
     job: &sconce_catalog::MirrorJob,
 ) -> std::result::Result<String, JobFailure> {
@@ -1469,14 +1470,12 @@ fn retry_backoff_secs(attempts: i32) -> f64 {
     base * jitter
 }
 
-fn worker(cas: &Path, database_url: &str) -> Result<()> {
-    use sconce_cas::FsBlobStore;
+fn worker(cas: Option<&Path>, database_url: &str) -> Result<()> {
     use sconce_catalog::Catalog;
 
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
     runtime.block_on(async {
-        let store =
-            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let store = open_store(cas)?;
         let catalog = Catalog::connect(database_url)
             .await
             .context("connecting to Postgres")?;
@@ -1491,7 +1490,7 @@ fn worker(cas: &Path, database_url: &str) -> Result<()> {
 /// in-process by `sconce serve`.
 async fn run_worker_loop(
     catalog: sconce_catalog::Catalog,
-    store: sconce_cas::FsBlobStore,
+    store: sconce_cas::AnyBlobStore,
     key: Option<sconce_catalog::secret::SecretKey>,
     database_url: String,
 ) -> Result<()> {
@@ -1565,6 +1564,13 @@ async fn run_worker_loop(
             }
         }
     }
+}
+
+/// Open the configured blob store: S3-compatible when the `SCONCE_S3_*`
+/// environment variables are set (any `--cas` directory is then ignored),
+/// else the filesystem store at `--cas`.
+fn open_store(cas: Option<&Path>) -> Result<sconce_cas::AnyBlobStore> {
+    sconce_cas::AnyBlobStore::open(cas).context("opening blob store")
 }
 
 fn with_catalog<F>(database_url: &str, f: F) -> Result<()>
@@ -2109,7 +2115,7 @@ fn token_revoke(repo: &str, id: uuid::Uuid, database_url: &str) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn serve(
-    cas: &Path,
+    cas: Option<&Path>,
     database_url: &str,
     listen: std::net::SocketAddr,
     base_url: String,
@@ -2118,13 +2124,11 @@ fn serve(
     single_tenant: bool,
     admin_password: Option<String>,
 ) -> Result<()> {
-    use sconce_cas::FsBlobStore;
     use sconce_catalog::Catalog;
 
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
     runtime.block_on(async {
-        let store =
-            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let store = open_store(cas)?;
         let catalog = Catalog::connect(database_url)
             .await
             .context("connecting to Postgres")?;
@@ -2161,7 +2165,10 @@ fn serve(
             });
         }
 
-        tracing::info!("serving on http://{listen} (base url: {base_url})");
+        tracing::info!(
+            store = store.describe(),
+            "serving on http://{listen} (base url: {base_url})"
+        );
         sconce_server::serve(catalog, store, base_url, listen)
             .await
             .context("serving")?;
@@ -2203,16 +2210,20 @@ fn ui(
     })
 }
 
-fn mirror(source: &Path, repo: &str, git_url: &str, cas: &Path, database_url: &str) -> Result<()> {
-    use sconce_cas::FsBlobStore;
+fn mirror(
+    source: &Path,
+    repo: &str,
+    git_url: &str,
+    cas: Option<&Path>,
+    database_url: &str,
+) -> Result<()> {
     use sconce_catalog::Catalog;
 
     // The mirror path is async (Postgres); spin a runtime just for it rather
     // than making the whole CLI async.
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
     runtime.block_on(async {
-        let store =
-            FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+        let store = open_store(cas)?;
         let catalog = Catalog::connect(database_url)
             .await
             .context("connecting to Postgres")?;
@@ -2241,16 +2252,15 @@ fn mirror(source: &Path, repo: &str, git_url: &str, cas: &Path, database_url: &s
     })
 }
 
-fn ingest(repo: &Path, refspec: &str, cas: &Path) -> Result<()> {
-    use sconce_cas::{BlobStore, FsBlobStore};
+fn ingest(repo: &Path, refspec: &str, cas: Option<&Path>) -> Result<()> {
+    use sconce_cas::BlobStore;
 
     let archive = sconce_git::archive_ref(repo, refspec)
         .with_context(|| format!("archiving {} at {refspec}", repo.display()))?;
     let count = archive.len();
     let bytes = archive.into_zip();
 
-    let store =
-        FsBlobStore::open(cas).with_context(|| format!("opening CAS at {}", cas.display()))?;
+    let store = open_store(cas)?;
     let existed = store.exists(&sconce_cas::BlobId::of(&bytes))?;
     let id = store.put(&bytes).context("storing blob")?;
 

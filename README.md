@@ -56,6 +56,17 @@ and `SCONCE_SECRET_KEY` (base64 of 32 bytes; needed only to store *private*
 upstream credentials). Run a dedicated worker instead of the in-process one with
 `sconce serve --no-worker` + `sconce worker --cas …`.
 
+Blob storage is a local directory by default (`--cas <dir>`). To store blobs in
+any **S3-compatible object store** instead — Cloudflare R2, AWS S3,
+[Garage](https://garagehq.deuxfleurs.fr/), MinIO — set `SCONCE_S3_BUCKET`,
+`SCONCE_S3_ENDPOINT`, `SCONCE_S3_ACCESS_KEY`, and `SCONCE_S3_SECRET_KEY`
+(optional: `SCONCE_S3_REGION`, default `auto` as R2 expects — Garage wants its
+configured `s3_region`, default `garage`; `SCONCE_S3_PREFIX`, default `blobs/`).
+`--cas` is then unnecessary. Dist downloads switch from inline serving to a
+**302 redirect onto a short-lived presigned URL**, so package bytes flow
+straight from the object store while `composer.lock` keeps pinning the stable
+sconce URL.
+
 ## Workspace
 
 | Crate | Role |

@@ -11,6 +11,10 @@ description = "Content-addressed blob store for sconce. Blobs keyed by sha256; p
 
 [dependencies]
 sha2 = { workspace = true }
+# S3 backend: SigV4 signing (hmac) + blocking HTTP (ureq, rustls — matching
+# the mirror crate; the store trait stays sync end to end).
+hmac = { workspace = true }
+ureq = { workspace = true }
 
 [lints]
 workspace = true

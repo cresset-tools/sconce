@@ -12,19 +12,25 @@
 //! catalog (which knows what *references* a blob); the store itself just keeps
 //! immutable bytes addressable by hash.
 //!
-//! The [`BlobStore`] trait is the backend seam: [`FsBlobStore`] (filesystem) is
-//! the first impl — zero external deps, ideal for self-hosting — and an
-//! object-store backend (R2/S3) slots in behind the same trait later.
+//! The [`BlobStore`] trait is the backend seam: [`FsBlobStore`] (filesystem,
+//! zero external deps, ideal for self-hosting) and [`S3BlobStore`] (any
+//! S3-compatible store — R2, AWS, Garage, `MinIO`, B2). [`AnyBlobStore`] picks
+//! one at startup from the environment.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
+
+mod s3;
+mod sigv4;
+
+pub use s3::{S3BlobStore, S3Config};
 
 /// A blob's identity: the sha256 of its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -88,6 +94,75 @@ pub trait BlobStore {
 
     /// Read a blob's bytes, or `None` if absent.
     fn get(&self, id: &BlobId) -> io::Result<Option<Vec<u8>>>;
+}
+
+/// The backend picked at startup: filesystem or S3-compatible. An enum, not a
+/// trait object, so the store stays `Clone` + cheap and the server can ask
+/// backend-specific questions (does a presigned redirect exist?).
+#[derive(Debug, Clone)]
+pub enum AnyBlobStore {
+    Fs(FsBlobStore),
+    S3(S3BlobStore),
+}
+
+impl AnyBlobStore {
+    /// Resolve the configured backend: S3 when `SCONCE_S3_BUCKET` (+friends)
+    /// is set — `dir` is then ignored — else the filesystem store at `dir`.
+    /// Erroring when *neither* is configured beats silently writing nowhere.
+    pub fn open(dir: Option<&Path>) -> io::Result<Self> {
+        if let Some(cfg) = S3Config::from_env()? {
+            return Ok(Self::S3(S3BlobStore::new(cfg)?));
+        }
+        match dir {
+            Some(dir) => Ok(Self::Fs(FsBlobStore::open(dir)?)),
+            None => Err(io::Error::other(
+                "no blob store configured: pass --cas <dir> or set the SCONCE_S3_* environment \
+                 variables (SCONCE_S3_BUCKET, SCONCE_S3_ENDPOINT, SCONCE_S3_ACCESS_KEY, \
+                 SCONCE_S3_SECRET_KEY)",
+            )),
+        }
+    }
+
+    /// A presigned, short-lived download URL for a blob — `Some` only on
+    /// backends where clients can fetch bytes directly (S3), letting the dist
+    /// handler 302 instead of proxying. Pure computation, no round-trip.
+    #[must_use]
+    pub fn presigned_get(&self, id: &BlobId, expires_secs: u64) -> Option<String> {
+        match self {
+            Self::Fs(_) => None,
+            Self::S3(s3) => Some(s3.presigned_get(id, expires_secs)),
+        }
+    }
+
+    /// One line for the startup log, secrets-free.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Fs(_) => "filesystem CAS".to_owned(),
+            Self::S3(_) => "S3 CAS".to_owned(),
+        }
+    }
+}
+
+impl BlobStore for AnyBlobStore {
+    fn put(&self, bytes: &[u8]) -> io::Result<BlobId> {
+        match self {
+            Self::Fs(s) => s.put(bytes),
+            Self::S3(s) => s.put(bytes),
+        }
+    }
+    fn exists(&self, id: &BlobId) -> io::Result<bool> {
+        match self {
+            Self::Fs(s) => s.exists(id),
+            Self::S3(s) => s.exists(id),
+        }
+    }
+    fn get(&self, id: &BlobId) -> io::Result<Option<Vec<u8>>> {
+        match self {
+            Self::Fs(s) => s.get(id),
+            Self::S3(s) => s.get(id),
+        }
+    }
 }
 
 /// Filesystem-backed CAS. Blobs live at `<root>/<ab>/<cd>/<full-hex>`, where the
