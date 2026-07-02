@@ -33,6 +33,10 @@ serde_json = { workspace = true }
 dotenvy = { workspace = true }
 # Direct use of PgListener for the worker's LISTEN/NOTIFY wait.
 sqlx = { workspace = true }
+# Server/worker logs go through tracing (stderr, RUST_LOG-filtered); CLI
+# command *output* stays println/stdout.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

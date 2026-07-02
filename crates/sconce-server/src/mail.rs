@@ -81,9 +81,9 @@ impl Mailer {
                         from,
                     },
                     Err(e) => {
-                        eprintln!(
-                            "mail: SCONCE_SMTP_URL is set but unparseable ({e}); \
-                             falling back to stderr delivery"
+                        tracing::warn!(
+                            error = %e,
+                            "SCONCE_SMTP_URL is set but unparseable; falling back to stderr delivery"
                         );
                         Mailer::Stderr { from }
                     }

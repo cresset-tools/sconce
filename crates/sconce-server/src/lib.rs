@@ -54,11 +54,24 @@ pub fn router(catalog: Catalog, store: FsBlobStore, base_url: String) -> Router 
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
         .route("/{org}/{repo}/dist/{*rest}", get(dist))
         .route("/oauth/ci", post(oauth_ci))
+        .route("/healthz", get(healthz))
         .with_state(AppState {
             catalog,
             store,
             base_url,
         })
+}
+
+/// Unauthenticated health probe for load balancers / orchestrators: `200 ok`
+/// when Postgres answers, `503` otherwise. Reveals nothing tenant-scoped.
+async fn healthz(State(s): State<AppState>) -> Response {
+    match s.catalog.ping().await {
+        Ok(()) => (StatusCode::OK, "ok").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "health check failed: database unreachable");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response()
+        }
+    }
 }
 
 /// What a credential is allowed to see in a repository.

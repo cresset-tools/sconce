@@ -96,6 +96,11 @@ lettre = { version = "0.11", default-features = false, features = [
     "tokio1-rustls-tls",
     "webpki-roots",
 ] }
+# Structured logging for the server/worker paths (CLI command output stays on
+# plain stdout). The subscriber lives only in the `sconce` binary; libraries
+# just emit `tracing` events.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

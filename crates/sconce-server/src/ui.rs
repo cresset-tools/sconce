@@ -119,6 +119,7 @@ pub fn router(
         .route("/", get(index))
         .route("/repositories", get(repositories_page))
         .route("/assets/{*path}", get(asset))
+        .route("/healthz", get(ui_healthz))
         .route("/login", get(login_form).post(login))
         .route("/forgot", get(forgot_form).post(forgot_submit))
         .route("/reset", get(reset_form).post(reset_submit))
@@ -246,6 +247,10 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
     if path.starts_with("/scim/") {
         return next.run(req).await;
     }
+    // Health probes come from load balancers, not browsers.
+    if path == "/healthz" {
+        return next.run(req).await;
+    }
     if s.single_tenant {
         if let Some(expected) = &s.admin_password {
             // Throttle *failures* only — every page load re-sends the basic
@@ -289,6 +294,18 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
             next.run(req).await
         }
         None => Redirect::to("/login").into_response(),
+    }
+}
+
+/// Unauthenticated health probe (mirrors the wire server's `/healthz`):
+/// `200 ok` when Postgres answers, `503` otherwise.
+async fn ui_healthz(State(s): State<Ui>) -> Response {
+    match s.catalog.ping().await {
+        Ok(()) => (StatusCode::OK, "ok").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "health check failed: database unreachable");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response()
+        }
     }
 }
 
@@ -1382,7 +1399,7 @@ async fn forgot_submit(
             .send(email, "Reset your Bougie Repo password", &body)
             .await
         {
-            eprintln!("mail: failed to send reset link to {email}: {e}");
+            tracing::error!(email, error = %e, "failed to send password-reset link");
         }
     }
     Ok(forgot_sent_page().into_response())

@@ -769,6 +769,13 @@ impl Catalog {
         Self { pool }
     }
 
+    /// Health probe: one round-trip to Postgres (backs the `/healthz`
+    /// endpoints).
+    pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("select 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Create an organization (idempotent on slug), returning its id.
     pub async fn create_org(&self, slug: &str, name: Option<&str>) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(

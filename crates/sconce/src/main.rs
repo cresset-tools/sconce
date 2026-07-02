@@ -755,6 +755,16 @@ fn main() -> Result<()> {
         Err(e) if e.not_found() => {} // no .env file is fine
         Err(e) => return Err(e).context("loading .env"),
     }
+    // Logs (server/worker events) go to stderr through tracing, filtered by
+    // RUST_LOG (default `info`). CLI command *output* stays on stdout, so
+    // `sconce token create | pbcopy` and friends are unaffected.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Command::Archive { src, out } => archive(&src, &out),
@@ -1499,12 +1509,12 @@ async fn run_worker_loop(
             .listen("mirror_jobs")
             .await
             .context("LISTEN mirror_jobs")?;
-        println!("worker: ready (LISTEN mirror_jobs, poll {POLL:?})");
+        tracing::info!(poll = ?POLL, "worker ready (LISTEN mirror_jobs)");
 
         loop {
             // Drain everything currently claimable before going back to sleep.
             while let Some(job) = catalog.claim_mirror_job().await.context("claiming job")? {
-                println!("worker: {} (attempt {})", job.kind, job.attempts);
+                tracing::info!(kind = %job.kind, attempt = job.attempts, "job claimed");
                 let outcome = run_job(&catalog, &store, key.as_ref(), &job).await;
                 match outcome {
                     Ok(summary) => {
@@ -1512,7 +1522,7 @@ async fn run_worker_loop(
                             .complete_mirror_job(job.id)
                             .await
                             .context("complete")?;
-                        println!("worker: {} ready — {summary}", job.kind);
+                        tracing::info!(kind = %job.kind, %summary, "job ready");
                     }
                     // Terminal: retrying won't help (source gone / access refused
                     // / bad content). Stop — the package (if any) is already
@@ -1522,7 +1532,7 @@ async fn run_worker_loop(
                             .fail_mirror_job(job.id, &fail.message)
                             .await
                             .context("fail")?;
-                        eprintln!("worker: {} failed terminally: {}", job.kind, fail.message);
+                        tracing::error!(kind = %job.kind, error = %fail.message, "job failed terminally");
                     }
                     // Non-terminal (transport / 5xx / our own infra): never give
                     // up — the upstream may recover. Back off exponentially with
@@ -1533,9 +1543,12 @@ async fn run_worker_loop(
                             .retry_mirror_job(job.id, backoff, &fail.message)
                             .await
                             .context("reschedule")?;
-                        eprintln!(
-                            "worker: {} failed (attempt {}), retrying in {backoff:.0}s: {}",
-                            job.kind, job.attempts, fail.message
+                        tracing::warn!(
+                            kind = %job.kind,
+                            attempt = job.attempts,
+                            retry_in_secs = backoff.round(),
+                            error = %fail.message,
+                            "job failed, will retry"
                         );
                     }
                 }
@@ -1544,7 +1557,7 @@ async fn run_worker_loop(
             tokio::select! {
                 res = listener.recv() => {
                     if let Err(e) = res {
-                        eprintln!("worker: listen error, backing off: {e}");
+                        tracing::warn!(error = %e, "LISTEN connection error, backing off");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -2120,7 +2133,7 @@ fn serve(
         // In-process worker (the single-binary story); disable with --no-worker
         // when running a dedicated `sconce worker` instead.
         if no_worker {
-            println!("worker: disabled (--no-worker)");
+            tracing::info!("in-process worker disabled (--no-worker)");
         } else {
             let wcat = catalog.clone();
             let wstore = store.clone();
@@ -2128,7 +2141,7 @@ fn serve(
             let key = sconce_catalog::secret::SecretKey::from_env().ok();
             tokio::spawn(async move {
                 if let Err(e) = run_worker_loop(wcat, wstore, key, durl).await {
-                    eprintln!("worker loop exited: {e:#}");
+                    tracing::error!(error = format!("{e:#}"), "worker loop exited");
                 }
             });
         }
@@ -2139,16 +2152,16 @@ fn serve(
             let ubase = base_url.clone();
             let apw = admin_password;
             tokio::spawn(async move {
-                println!("sconce admin UI on http://{ui_addr}");
+                tracing::info!("admin UI on http://{ui_addr}");
                 if let Err(e) =
                     sconce_server::ui::serve(ucat, ubase, single_tenant, apw, ui_addr).await
                 {
-                    eprintln!("ui server exited: {e}");
+                    tracing::error!(error = %e, "ui server exited");
                 }
             });
         }
 
-        println!("sconce serving on http://{listen} (base url: {base_url})");
+        tracing::info!("serving on http://{listen} (base url: {base_url})");
         sconce_server::serve(catalog, store, base_url, listen)
             .await
             .context("serving")?;
@@ -2173,16 +2186,16 @@ fn ui(
         catalog.migrate().await.context("applying migrations")?;
         if single_tenant {
             if admin_password.is_none() {
-                eprintln!(
-                    "warning: single-tenant with no --admin-password; the admin UI is open (bind to localhost)."
+                tracing::warn!(
+                    "single-tenant with no --admin-password; the admin UI is open (bind to localhost)"
                 );
             }
         } else if catalog.user_count().await? == 0 {
-            eprintln!(
-                "warning: no users exist; create the first one with `sconce user-create --superadmin <email> <password>`."
+            tracing::warn!(
+                "no users exist; create the first one with `sconce user-create --superadmin <email> <password>`"
             );
         }
-        println!("sconce admin UI on http://{listen}");
+        tracing::info!("admin UI on http://{listen}");
         sconce_server::ui::serve(catalog, public_base_url, single_tenant, admin_password, listen)
             .await
             .context("serving UI")?;
