@@ -13,10 +13,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::net::SocketAddr;
+use std::time::Duration;
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{Extension, Form, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Form, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -47,6 +49,15 @@ struct Ui {
     /// Sends transactional email (password-reset links). Configured from the
     /// environment; the dev backend prints to stderr.
     mailer: crate::mail::Mailer,
+    /// Throttles the credential endpoints (login / forgot / reset / basic
+    /// auth) against online brute force and reset-mail bombing. Disable with
+    /// `SCONCE_RATE_LIMIT=off` when a load balancer rate-limits upstream.
+    limiter: crate::ratelimit::RateLimiter,
+    /// Add `Secure` to session cookies. Derived from `dashboard_url`: an
+    /// https dashboard must never have its session sent over plain http, while
+    /// forcing `Secure` on an http deployment (localhost, LAN self-host) would
+    /// make browsers drop the cookie and lock everyone out.
+    cookie_secure: bool,
 }
 
 /// The viewer's access, resolved per request.
@@ -88,17 +99,21 @@ pub fn router(
     single_tenant: bool,
     admin_password: Option<String>,
 ) -> Router {
+    let dashboard_url = std::env::var("SCONCE_UI_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8081".to_owned());
+    let cookie_secure = dashboard_url.starts_with("https://");
     let state = Ui {
         catalog,
         public_base_url,
         single_tenant,
         admin_password,
         secret_key: sconce_catalog::secret::SecretKey::from_env().ok(),
-        dashboard_url: std::env::var("SCONCE_UI_BASE_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:8081".to_owned()),
+        dashboard_url,
         mailer: crate::mail::Mailer::from_env(),
+        limiter: crate::ratelimit::RateLimiter::from_env(),
+        cookie_secure,
     };
     Router::new()
         .route("/", get(index))
@@ -194,6 +209,9 @@ pub fn router(
         .route("/r/{org}/{repo}/ci/remove", post(remove_ci))
         .fallback(not_found_page)
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
+        // Outermost (added last = runs first): reject cross-origin form posts
+        // before auth ever sees them. See [`crate::csrf`].
+        .route_layer(middleware::from_fn(crate::csrf::guard))
         .with_state(state)
 }
 
@@ -207,7 +225,13 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let app = router(catalog, public_base_url, single_tenant, admin_password);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await
+    // Expose the peer address to handlers: rate limiting keys on it whenever
+    // no reverse proxy supplied an `X-Forwarded-For`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 /// Auth gate. Single-tenant: optional HTTP basic, then all-access. Multi-tenant:
@@ -223,10 +247,24 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
     if s.single_tenant {
-        if let Some(expected) = &s.admin_password
-            && basic_password(req.headers()).as_deref() != Some(expected.as_str())
-        {
-            return basic_challenge();
+        if let Some(expected) = &s.admin_password {
+            // Throttle *failures* only — every page load re-sends the basic
+            // password, so counting successful requests would lock the admin
+            // out of normal browsing.
+            let peer = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0);
+            let key = format!("basic:ip:{}", client_ip(req.headers(), peer));
+            if s.limiter
+                .at_limit(&key, BASIC_MAX_FAILURES_PER_IP, BASIC_WINDOW)
+            {
+                return too_many_attempts();
+            }
+            if basic_password(req.headers()).as_deref() != Some(expected.as_str()) {
+                s.limiter.record(&key);
+                return basic_challenge();
+            }
         }
         req.extensions_mut().insert(CurrentUser::all_access());
         return next.run(req).await;
@@ -288,6 +326,71 @@ fn redirect_with_cookie(to: &str, cookie: &str) -> Response {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
+}
+
+/// `Set-Cookie` value establishing a login session (7 days, matching the
+/// server-side `expires_at`). See [`Ui::cookie_secure`] for the `Secure` rule.
+fn session_set_cookie(token: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800{secure}")
+}
+
+/// `Set-Cookie` value clearing the session (logout).
+fn session_clear_cookie(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("sconce_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{secure}")
+}
+
+// ----- credential-endpoint rate limits -----
+//
+// Throttling, not lockout (see [`crate::ratelimit`]): steady-state an attacker
+// gets `max` guesses per window, a blocked legitimate user recovers as soon as
+// an old attempt ages out. Per-key attempt counts, so the per-email caps also
+// bound a *distributed* guessing attack on one account.
+
+/// Login attempts per client address per window.
+const LOGIN_MAX_PER_IP: usize = 10;
+/// Login attempts per target account per window (any address).
+const LOGIN_MAX_PER_EMAIL: usize = 5;
+const LOGIN_WINDOW: Duration = Duration::from_mins(5);
+/// Reset-link requests per client address per window — this endpoint sends
+/// email, so the cap also bounds outbound mail abuse.
+const FORGOT_MAX_PER_IP: usize = 5;
+/// Reset-link requests per target address per window (inbox-bombing bound).
+const FORGOT_MAX_PER_EMAIL: usize = 3;
+const FORGOT_WINDOW: Duration = Duration::from_mins(15);
+/// Reset-form submissions per client address per window (token guessing is
+/// already infeasible — 128-bit tokens — this just keeps it boring).
+const RESET_MAX_PER_IP: usize = 10;
+const RESET_WINDOW: Duration = Duration::from_mins(5);
+/// Wrong single-tenant basic passwords per client address per window.
+const BASIC_MAX_FAILURES_PER_IP: usize = 10;
+const BASIC_WINDOW: Duration = Duration::from_mins(5);
+
+/// Best client identity available for rate limiting: the rightmost
+/// `X-Forwarded-For` entry — the one appended by the *nearest* proxy, the only
+/// hop this server can trust behind the documented TLS-terminating reverse
+/// proxy (earlier entries are client-supplied and spoofable) — else the socket
+/// peer address.
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .map(|ip| ip.trim().to_owned())
+        .filter(|ip| !ip.is_empty())
+        .unwrap_or_else(|| peer.map_or_else(|| "unknown".to_owned(), |p| p.ip().to_string()))
+}
+
+fn too_many_attempts() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        status_page(
+            "Slow down",
+            "Too many attempts. Wait a few minutes and try again.",
+        ),
+    )
+        .into_response()
 }
 
 fn e500<E>(_: E) -> StatusCode {
@@ -1133,7 +1236,25 @@ struct LoginForm {
     password: String,
 }
 
-async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response, StatusCode> {
+async fn login(
+    State(s): State<Ui>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(f): Form<LoginForm>,
+) -> Result<Response, StatusCode> {
+    let ip = client_ip(&headers, Some(peer));
+    let email = f.email.trim().to_ascii_lowercase();
+    if !s
+        .limiter
+        .allow(&format!("login:ip:{ip}"), LOGIN_MAX_PER_IP, LOGIN_WINDOW)
+        || !s.limiter.allow(
+            &format!("login:email:{email}"),
+            LOGIN_MAX_PER_EMAIL,
+            LOGIN_WINDOW,
+        )
+    {
+        return Ok(too_many_attempts());
+    }
     let Some(user_id) = s
         .catalog
         .verify_credentials(&f.email, &f.password)
@@ -1147,8 +1268,10 @@ async fn login(State(s): State<Ui>, Form(f): Form<LoginForm>) -> Result<Response
         );
     };
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
-    let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
-    Ok(redirect_with_cookie("/", &cookie))
+    Ok(redirect_with_cookie(
+        "/",
+        &session_set_cookie(&token, s.cookie_secure),
+    ))
 }
 
 // ----- password reset -----
@@ -1214,12 +1337,26 @@ struct ForgotForm {
 
 async fn forgot_submit(
     State(s): State<Ui>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(f): Form<ForgotForm>,
 ) -> Result<Response, StatusCode> {
     if let Some(r) = reset_disabled(&s) {
         return Ok(r);
     }
     let email = f.email.trim();
+    let ip = client_ip(&headers, Some(peer));
+    if !s
+        .limiter
+        .allow(&format!("forgot:ip:{ip}"), FORGOT_MAX_PER_IP, FORGOT_WINDOW)
+        || !s.limiter.allow(
+            &format!("forgot:email:{}", email.to_ascii_lowercase()),
+            FORGOT_MAX_PER_EMAIL,
+            FORGOT_WINDOW,
+        )
+    {
+        return Ok(too_many_attempts());
+    }
     // Mint a token only if the user exists; either way the response is identical.
     if let Some(reset) = s
         .catalog
@@ -1282,10 +1419,19 @@ struct ResetForm {
 
 async fn reset_submit(
     State(s): State<Ui>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(f): Form<ResetForm>,
 ) -> Result<Response, StatusCode> {
     if let Some(r) = reset_disabled(&s) {
         return Ok(r);
+    }
+    let ip = client_ip(&headers, Some(peer));
+    if !s
+        .limiter
+        .allow(&format!("reset:ip:{ip}"), RESET_MAX_PER_IP, RESET_WINDOW)
+    {
+        return Ok(too_many_attempts());
     }
     // Re-validate on submit (the token could have expired since the form loaded).
     if !s
@@ -1482,13 +1628,15 @@ async fn auth_callback(
             .map_err(e500)?;
     }
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
-    let cookie = format!("sconce_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800");
     let dest = if redirect_to.starts_with('/') {
         redirect_to
     } else {
         "/".to_owned()
     };
-    Ok(redirect_with_cookie(&dest, &cookie))
+    Ok(redirect_with_cookie(
+        &dest,
+        &session_set_cookie(&token, s.cookie_secure),
+    ))
 }
 
 // ----- SCIM provisioning (offboarding) -----
@@ -1749,10 +1897,7 @@ async fn logout(State(s): State<Ui>, headers: HeaderMap) -> Response {
     if let Some(token) = session_cookie(&headers) {
         let _ = s.catalog.delete_session(&token).await;
     }
-    redirect_with_cookie(
-        "/login",
-        "sconce_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
-    )
+    redirect_with_cookie("/login", &session_clear_cookie(s.cookie_secure))
 }
 
 /// A4 — the signed-in user's account: email + active sessions (revocable).
@@ -3902,4 +4047,40 @@ async fn remove_license_set(
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_cookie_secure_only_on_https_dashboards() {
+        let https = session_set_cookie("tok", true);
+        assert!(https.ends_with("; Secure"));
+        assert!(https.contains("HttpOnly") && https.contains("SameSite=Lax"));
+        let http = session_set_cookie("tok", false);
+        assert!(!http.contains("Secure"));
+        assert!(session_clear_cookie(true).ends_with("; Secure"));
+        assert!(session_clear_cookie(false).contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn client_ip_prefers_the_proxy_appended_forwarded_entry() {
+        let peer: SocketAddr = "10.0.0.9:443".parse().unwrap();
+        let mut h = HeaderMap::new();
+        // The client-supplied (spoofable) entry comes first; the nearest proxy
+        // appends the real peer last — that one must win.
+        h.insert("x-forwarded-for", "1.2.3.4, 198.51.100.7".parse().unwrap());
+        assert_eq!(client_ip(&h, Some(peer)), "198.51.100.7");
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_the_socket_peer() {
+        let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        assert_eq!(client_ip(&HeaderMap::new(), Some(peer)), "192.0.2.1");
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "".parse().unwrap());
+        assert_eq!(client_ip(&h, Some(peer)), "192.0.2.1");
+        assert_eq!(client_ip(&HeaderMap::new(), None), "unknown");
+    }
 }
