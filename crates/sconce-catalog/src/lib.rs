@@ -16,9 +16,39 @@
 
 pub mod secret;
 
+use std::time::Duration;
+
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+/// A content-addressed blob's identity + size, as the catalog knows it.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobRef {
+    pub sha256: [u8; 32],
+    pub size_bytes: i64,
+}
+
+impl BlobRef {
+    fn from_row(row: (Vec<u8>, i64)) -> Option<Self> {
+        let (bytes, size_bytes) = row;
+        let sha256 = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+        Some(Self { sha256, size_bytes })
+    }
+}
+
+/// Aggregate blob-storage accounting (see [`Catalog::storage_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// Total blobs in the catalog.
+    pub blob_count: i64,
+    /// Sum of all blob sizes, in bytes.
+    pub total_bytes: i64,
+    /// Bytes held by orphan (refcount 0) blobs — the reclaimable slice.
+    pub orphan_bytes: i64,
+    /// Number of orphan (refcount 0) blobs.
+    pub orphan_count: i64,
+}
 
 /// The error type returned by catalog operations (re-exported so consumers can
 /// handle it without depending on `sqlx` directly).
@@ -152,6 +182,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0035_password_resets",
         include_str!("../migrations/0035_password_resets.sql"),
+    ),
+    (
+        "0036_blob_refcount_gc",
+        include_str!("../migrations/0036_blob_refcount_gc.sql"),
     ),
 ];
 
@@ -2234,16 +2268,89 @@ impl Catalog {
     }
 
     /// Record a blob's presence + size (idempotent — the sha256 is the key).
+    /// Record a blob's presence in the catalog. Called by the mirror worker
+    /// right before it references the blob from a version, so the conflict path
+    /// bumps `last_seen_at` — a blob that is about to be referenced is thereby
+    /// freshly "seen", which is what keeps GC's grace window from racing an
+    /// in-flight mirror job (see [`Self::orphan_blobs`]). `refcount` is left
+    /// alone: it is owned by the `package_versions` triggers.
     pub async fn upsert_blob(&self, sha256: &[u8; 32], size_bytes: i64) -> Result<(), sqlx::Error> {
         sqlx::query(
             "insert into blobs (sha256, size_bytes) values ($1, $2) \
-             on conflict (sha256) do nothing",
+             on conflict (sha256) do update set last_seen_at = now()",
         )
         .bind(&sha256[..])
         .bind(size_bytes)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Aggregate blob-storage accounting: total blobs + bytes, and how much of
+    /// that is currently orphaned (refcount 0) — the reclaimable slice. Backs
+    /// `sconce gc` reporting and storage-metering visibility.
+    pub async fn storage_stats(&self) -> Result<StorageStats, sqlx::Error> {
+        // sum(bigint) is numeric in Postgres — cast back to bigint for decode.
+        let row: (i64, i64, i64, i64) = sqlx::query_as(
+            "select \
+                 count(*), \
+                 coalesce(sum(size_bytes), 0)::bigint, \
+                 coalesce(sum(size_bytes) filter (where refcount = 0), 0)::bigint, \
+                 count(*) filter (where refcount = 0) \
+             from blobs",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(StorageStats {
+            blob_count: row.0,
+            total_bytes: row.1,
+            orphan_bytes: row.2,
+            orphan_count: row.3,
+        })
+    }
+
+    /// Orphan blobs eligible for collection: refcount 0 **and** untouched for at
+    /// least `grace` (so a blob a mirror job just wrote but hasn't referenced
+    /// yet is protected). The caller deletes each from the object store, then
+    /// confirms removal with [`Self::delete_blob_if_orphan`] — which re-checks
+    /// the guard, so a blob re-referenced in between is never collected.
+    pub async fn orphan_blobs(&self, grace: Duration) -> Result<Vec<BlobRef>, sqlx::Error> {
+        let grace_secs = grace.as_secs_f64();
+        let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            "select sha256, size_bytes from blobs \
+             where refcount = 0 \
+               and last_seen_at < now() - make_interval(secs => $1) \
+             order by last_seen_at",
+        )
+        .bind(grace_secs)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(BlobRef::from_row).collect())
+    }
+
+    /// Delete a blob row **iff it is still an orphan** past `grace`: the guard is
+    /// re-evaluated atomically here, so a version inserted since the scan (which
+    /// bumped `refcount` via trigger, or `last_seen_at` via [`Self::upsert_blob`])
+    /// keeps the row. Returns whether the row was deleted. A blob genuinely
+    /// referenced by a `package_versions` row can never be deleted — the foreign
+    /// key would forbid it even if the guard somehow passed.
+    pub async fn delete_blob_if_orphan(
+        &self,
+        sha256: &[u8; 32],
+        grace: Duration,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "delete from blobs \
+             where sha256 = $1 \
+               and refcount = 0 \
+               and last_seen_at < now() - make_interval(secs => $2)",
+        )
+        .bind(&sha256[..])
+        .bind(grace.as_secs_f64())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n == 1)
     }
 
     /// Upsert a package by name **within a repository**, returning its id.
@@ -5979,5 +6086,148 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// Read a blob's refcount directly (test-only introspection).
+    async fn refcount(cat: &Catalog, sha: &[u8; 32]) -> Option<i64> {
+        sqlx::query_scalar("select refcount::bigint from blobs where sha256 = $1")
+            .bind(&sha[..])
+            .fetch_optional(&cat.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A blob sha unique to this test run (the `blobs` table is global — shared
+    /// across every test and prior run — so fixed shas would collide). Seeds
+    /// from the per-run `repo_id`, which is unique per `repo()` call.
+    fn test_sha(repo_id: Uuid, tag: u8) -> [u8; 32] {
+        let mut sha = [tag; 32];
+        sha[..16].copy_from_slice(repo_id.as_bytes());
+        sha
+    }
+
+    async fn add_version_with_blob(
+        cat: &Catalog,
+        pkg: Uuid,
+        version: &str,
+        normalized: &str,
+        sha: &[u8; 32],
+    ) {
+        cat.upsert_blob(sha, 100).await.unwrap();
+        cat.upsert_package_version(
+            pkg,
+            version,
+            normalized,
+            "stable",
+            &serde_json::json!({ "name": "acme/lib" }),
+            Some(sha),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn triggers_maintain_blob_refcount() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let pkg = cat
+            .upsert_package(repo_id, "acme/lib", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let sha = test_sha(repo_id, 7);
+
+        // Insert two versions sharing one blob → refcount 2 (global dedup).
+        add_version_with_blob(&cat, pkg, "v1.0.0", "1.0.0.0", &sha).await;
+        assert_eq!(refcount(&cat, &sha).await, Some(1));
+        add_version_with_blob(&cat, pkg, "v1.0.1", "1.0.1.0", &sha).await;
+        assert_eq!(
+            refcount(&cat, &sha).await,
+            Some(2),
+            "shared blob counts both"
+        );
+
+        // Re-point one version at different bytes → old -1, new +1.
+        let sha2 = test_sha(repo_id, 9);
+        add_version_with_blob(&cat, pkg, "v1.0.1", "1.0.1.0", &sha2).await;
+        assert_eq!(refcount(&cat, &sha).await, Some(1), "old blob decremented");
+        assert_eq!(refcount(&cat, &sha2).await, Some(1), "new blob incremented");
+
+        // Deleting the repo cascades to versions → both blobs drop to 0.
+        assert!(cat.delete_repo(repo_id).await.unwrap());
+        assert_eq!(refcount(&cat, &sha).await, Some(0));
+        assert_eq!(refcount(&cat, &sha2).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn gc_collects_only_orphans_past_grace() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let pkg = cat
+            .upsert_package(repo_id, "acme/lib", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let referenced = test_sha(repo_id, 1);
+        let orphan = test_sha(repo_id, 2);
+        add_version_with_blob(&cat, pkg, "v1.0.0", "1.0.0.0", &referenced).await;
+        // An orphan blob (present, never referenced).
+        cat.upsert_blob(&orphan, 100).await.unwrap();
+
+        // With a long grace, our just-written orphan is protected (last_seen is
+        // fresh). The eligible set is global (other tests' aged orphans may
+        // appear), so assert on membership, not size.
+        let fresh = cat.orphan_blobs(Duration::from_hours(1)).await.unwrap();
+        assert!(
+            !fresh.iter().any(|b| b.sha256 == orphan),
+            "fresh orphan is inside the grace window"
+        );
+
+        // With zero grace our orphan becomes eligible; the referenced blob never
+        // is (refcount 1).
+        let zero = Duration::ZERO;
+        let eligible = cat.orphan_blobs(zero).await.unwrap();
+        assert!(eligible.iter().any(|b| b.sha256 == orphan));
+        assert!(
+            !eligible.iter().any(|b| b.sha256 == referenced),
+            "a referenced blob is never eligible"
+        );
+
+        // The guarded delete removes the orphan but refuses the referenced blob.
+        assert!(cat.delete_blob_if_orphan(&orphan, zero).await.unwrap());
+        assert!(
+            !cat.delete_blob_if_orphan(&referenced, zero).await.unwrap(),
+            "a referenced blob is never collected"
+        );
+        assert_eq!(refcount(&cat, &orphan).await, None, "orphan row gone");
+        assert_eq!(
+            refcount(&cat, &referenced).await,
+            Some(1),
+            "referenced kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_stats_counts_orphans() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let pkg = cat
+            .upsert_package(repo_id, "acme/lib", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let before = cat.storage_stats().await.unwrap();
+
+        add_version_with_blob(&cat, pkg, "v1.0.0", "1.0.0.0", &test_sha(repo_id, 11)).await;
+        cat.upsert_blob(&test_sha(repo_id, 12), 100).await.unwrap(); // orphan
+
+        let after = cat.storage_stats().await.unwrap();
+        assert_eq!(after.blob_count, before.blob_count + 2);
+        assert_eq!(after.total_bytes, before.total_bytes + 200);
+        assert_eq!(after.orphan_count, before.orphan_count + 1);
+        assert_eq!(after.orphan_bytes, before.orphan_bytes + 100);
     }
 }

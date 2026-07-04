@@ -67,6 +67,15 @@ configured `s3_region`, default `garage`; `SCONCE_S3_PREFIX`, default `blobs/`).
 straight from the object store while `composer.lock` keeps pinning the stable
 sconce URL.
 
+Blobs are content-addressed and reference-counted (a version referencing a blob
+is the only thing that keeps it alive; deleting a repo or version drops the
+count via the database). Reclaim unreferenced blobs — on either backend — with
+`sconce gc [--cas <dir>] [--grace-hours N] [--dry-run]`. A blob is collected
+only when nothing references it **and** it has been untouched for the grace
+window (default 24h), which keeps a sweep from racing an in-flight mirror job,
+so `gc` is safe to run against a live server (schedule it off-peak for the least
+contention).
+
 ## Workspace
 
 | Crate | Role |

@@ -236,6 +236,15 @@ impl BlobStore for S3BlobStore {
             }
         }
     }
+
+    fn delete(&self, id: &BlobId) -> io::Result<()> {
+        // DELETE is idempotent on S3 (a missing key still returns 204); the
+        // 404 classification keeps any stricter backend idempotent too.
+        match self.request("DELETE", id, EMPTY_PAYLOAD_SHA256).call() {
+            Ok(_) => Ok(()),
+            Err(e) => classify("DELETE", e),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -94,6 +94,12 @@ pub trait BlobStore {
 
     /// Read a blob's bytes, or `None` if absent.
     fn get(&self, id: &BlobId) -> io::Result<Option<Vec<u8>>>;
+
+    /// Remove a blob. **Idempotent**: deleting an absent blob is `Ok(())`, not
+    /// an error — a GC retry after a crash, or two workers racing the same
+    /// orphan, must both succeed. Only the catalog GC calls this, and only for
+    /// a blob it has confirmed unreferenced (see `Catalog::delete_blob_if_orphan`).
+    fn delete(&self, id: &BlobId) -> io::Result<()>;
 }
 
 /// The backend picked at startup: filesystem or S3-compatible. An enum, not a
@@ -161,6 +167,12 @@ impl BlobStore for AnyBlobStore {
         match self {
             Self::Fs(s) => s.get(id),
             Self::S3(s) => s.get(id),
+        }
+    }
+    fn delete(&self, id: &BlobId) -> io::Result<()> {
+        match self {
+            Self::Fs(s) => s.delete(id),
+            Self::S3(s) => s.delete(id),
         }
     }
 }
@@ -233,6 +245,16 @@ impl BlobStore for FsBlobStore {
         match fs::read(self.paths_for(id).1) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn delete(&self, id: &BlobId) -> io::Result<()> {
+        // Idempotent: an already-absent blob is success. The fanned-out parent
+        // directories are left in place — cheap, and the next put reuses them.
+        match fs::remove_file(self.paths_for(id).1) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -316,6 +338,25 @@ mod tests {
         let id = BlobId::of(b"never stored");
         assert!(!store.exists(&id).unwrap());
         assert!(store.get(&id).unwrap().is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_removes_and_is_idempotent() {
+        let root = tempdir();
+        let store = FsBlobStore::open(&root).unwrap();
+        let id = store.put(b"collect me").unwrap();
+        assert!(store.exists(&id).unwrap());
+
+        store.delete(&id).unwrap();
+        assert!(!store.exists(&id).unwrap());
+        assert!(store.get(&id).unwrap().is_none());
+        // Deleting an already-absent blob is success, not an error.
+        store.delete(&id).unwrap();
+
+        // The content is re-storable afterwards (same id).
+        assert_eq!(store.put(b"collect me").unwrap(), id);
+        assert!(store.exists(&id).unwrap());
         fs::remove_dir_all(&root).ok();
     }
 

@@ -278,6 +278,29 @@ enum Command {
         database_url: String,
     },
 
+    /// Reclaim unreferenced blobs from the store (garbage collection).
+    ///
+    /// A blob is collectable once no package version references it (refcount 0)
+    /// and it has been untouched for the grace period — the grace window keeps
+    /// a sweep from racing a mirror job that is mid-flight. Safe to run against
+    /// a live server; schedule it off-peak for the least contention. Reports
+    /// storage totals and what it freed.
+    Gc {
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
+        #[arg(long)]
+        cas: Option<PathBuf>,
+        /// Only collect blobs unreferenced and untouched for at least this many
+        /// hours. Larger = safer against concurrent mirroring.
+        #[arg(long, default_value_t = 24)]
+        grace_hours: u64,
+        /// Report what would be collected without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Show or change a repo's token-policy overrides (tighten-only vs the org).
     RepoSettings {
         /// Repository, as `<org>/<repo>`.
@@ -897,6 +920,12 @@ fn main() -> Result<()> {
             } => package_set_archived(&repo, &package, false, &database_url),
         },
         Command::Worker { cas, database_url } => worker(cas.as_deref(), &database_url),
+        Command::Gc {
+            cas,
+            grace_hours,
+            dry_run,
+            database_url,
+        } => gc(cas.as_deref(), grace_hours, dry_run, &database_url),
         Command::RepoSettings {
             repo,
             allow_raw_tokens,
@@ -1482,6 +1511,99 @@ fn worker(cas: Option<&Path>, database_url: &str) -> Result<()> {
         catalog.migrate().await.context("applying migrations")?;
         let key = sconce_catalog::secret::SecretKey::from_env().ok();
         run_worker_loop(catalog, store, key, database_url.to_owned()).await
+    })
+}
+
+/// Human-readable byte count (base-1024) for GC reporting.
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut size = bytes.max(0) as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+fn gc(cas: Option<&Path>, grace_hours: u64, dry_run: bool, database_url: &str) -> Result<()> {
+    use sconce_cas::BlobStore;
+    use sconce_catalog::Catalog;
+
+    let grace = std::time::Duration::from_secs(grace_hours * 3600);
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let store = open_store(cas)?;
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        let stats = catalog.storage_stats().await.context("reading storage stats")?;
+        println!(
+            "store: {} — {} blobs, {} total; {} orphaned ({} blobs)",
+            store.describe(),
+            stats.blob_count,
+            human_bytes(stats.total_bytes),
+            human_bytes(stats.orphan_bytes),
+            stats.orphan_count,
+        );
+
+        let orphans = catalog
+            .orphan_blobs(grace)
+            .await
+            .context("scanning for orphan blobs")?;
+        if orphans.is_empty() {
+            println!("nothing to collect (grace {grace_hours}h).");
+            return Ok(());
+        }
+        if dry_run {
+            println!(
+                "would collect {} blob(s), {} (grace {grace_hours}h) — dry run, nothing deleted.",
+                orphans.len(),
+                human_bytes(orphans.iter().map(|b| b.size_bytes).sum()),
+            );
+            return Ok(());
+        }
+
+        // Per blob: delete the store object, then the row under a re-checked
+        // guard (a blob re-referenced since the scan keeps its row and is
+        // skipped). Object delete is idempotent, so a crash mid-run is safe to
+        // re-run. A store error on one blob is logged and skipped, not fatal.
+        let (mut freed_blobs, mut freed_bytes, mut skipped) = (0i64, 0i64, 0i64);
+        for blob in &orphans {
+            let id = sconce_cas::BlobId::from_bytes(blob.sha256);
+            if !catalog
+                .delete_blob_if_orphan(&blob.sha256, grace)
+                .await
+                .context("deleting blob row")?
+            {
+                skipped += 1; // re-referenced since the scan — leave it
+                continue;
+            }
+            if let Err(e) = store.delete(&id) {
+                // Row already gone; the object lingers as a leak. The next GC
+                // finds nothing (no row), so surface it rather than swallow.
+                tracing::error!(blob = %id, error = %e, "blob row removed but object delete failed");
+            }
+            freed_blobs += 1;
+            freed_bytes += blob.size_bytes;
+        }
+        println!(
+            "collected {freed_blobs} blob(s), freed {}{}.",
+            human_bytes(freed_bytes),
+            if skipped > 0 {
+                format!(" ({skipped} re-referenced since scan, kept)")
+            } else {
+                String::new()
+            },
+        );
+        Ok::<_, anyhow::Error>(())
     })
 }
 
