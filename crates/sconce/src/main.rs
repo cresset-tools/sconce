@@ -301,6 +301,20 @@ enum Command {
         database_url: String,
     },
 
+    /// Report metered storage per organization (the storage-tier billing input).
+    ///
+    /// Storage is metered at full logical size: a blob shared across orgs (the
+    /// same public package mirrored by two tenants) is counted in full for each
+    /// — the physical dedup saving is the operator's margin, not a per-tenant
+    /// discount. Without `--org`, lists every org busiest-first.
+    Usage {
+        /// Limit to one organization (by slug). Omit for all orgs.
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Show or change a repo's token-policy overrides (tighten-only vs the org).
     RepoSettings {
         /// Repository, as `<org>/<repo>`.
@@ -926,6 +940,7 @@ fn main() -> Result<()> {
             dry_run,
             database_url,
         } => gc(cas.as_deref(), grace_hours, dry_run, &database_url),
+        Command::Usage { org, database_url } => usage(org.as_deref(), &database_url),
         Command::RepoSettings {
             repo,
             allow_raw_tokens,
@@ -1603,6 +1618,48 @@ fn gc(cas: Option<&Path>, grace_hours: u64, dry_run: bool, database_url: &str) -
                 String::new()
             },
         );
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn usage(org: Option<&str>, database_url: &str) -> Result<()> {
+    use sconce_catalog::Catalog;
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let catalog = Catalog::connect(database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+
+        if let Some(slug) = org {
+            let org_id = catalog
+                .org_id_by_slug(slug)
+                .await?
+                .with_context(|| format!("no such org: {slug}"))?;
+            let u = catalog.org_storage(org_id).await.context("metering org")?;
+            println!(
+                "{slug}: {} across {} blob(s)",
+                human_bytes(u.bytes),
+                u.blob_count
+            );
+        } else {
+            let rows = catalog.storage_by_org().await.context("metering orgs")?;
+            let total: i64 = rows.iter().map(|o| o.usage.bytes).sum();
+            for o in &rows {
+                println!(
+                    "{:<24} {:>10}  ({} blobs)",
+                    o.org_slug,
+                    human_bytes(o.usage.bytes),
+                    o.usage.blob_count
+                );
+            }
+            println!(
+                "{:<24} {:>10}  (metered, dedup not credited)",
+                "TOTAL",
+                human_bytes(total)
+            );
+        }
         Ok::<_, anyhow::Error>(())
     })
 }

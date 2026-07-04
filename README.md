@@ -76,6 +76,12 @@ window (default 24h), which keeps a sweep from racing an in-flight mirror job,
 so `gc` is safe to run against a live server (schedule it off-peak for the least
 contention).
 
+`sconce usage [--org <slug>]` reports metered storage per organization (the
+storage-tier billing input). Storage is metered at **full logical size**: a blob
+shared across orgs (the same public package mirrored by two tenants) is counted
+in full for each — the physical dedup saving is the operator's margin, reflected
+only in a lower overall list price, not a per-tenant discount.
+
 ## Workspace
 
 | Crate | Role |

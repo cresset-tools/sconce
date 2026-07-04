@@ -30,6 +30,8 @@ pub struct RepoRow {
 pub struct OrgOverview {
     pub org: String,
     pub can_admin: bool,
+    /// Metered storage, pre-formatted (e.g. "1.2 GiB across 340 blobs").
+    pub storage: String,
     pub repos: Vec<RepoRow>,
 }
 
@@ -733,6 +735,7 @@ mod tests {
         let html = OrgOverview {
             org: "<script>alert(1)</script>".to_owned(),
             can_admin: true,
+            storage: "0 B across 0 blobs".to_owned(),
             repos: vec![RepoRow {
                 slug: "a\"<b>".to_owned(),
                 private: true,

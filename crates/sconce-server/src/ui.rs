@@ -414,6 +414,23 @@ fn e500<E>(_: E) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
+/// Human-readable byte count (base-1024) for the storage-usage display.
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut size = bytes.max(0) as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
 /// Full HTML scaffold shared by every page. The stylesheet is served from
 /// `/assets/app.css` and the Geist woff2 from `/assets/fonts` (embedded, no CDN).
 fn doc(title: &str, inner: &str) -> Html<String> {
@@ -617,9 +634,16 @@ async fn org_overview_page(
         .org_repo_overview(summary.id)
         .await
         .map_err(e500)?;
+    let usage = s.catalog.org_storage(summary.id).await.map_err(e500)?;
     let view = views::OrgOverview {
         org: org.clone(),
         can_admin: user.can_admin(summary.id),
+        storage: format!(
+            "{} across {} blob{}",
+            human_bytes(usage.bytes),
+            usage.blob_count,
+            if usage.blob_count == 1 { "" } else { "s" }
+        ),
         repos: repos
             .into_iter()
             .map(|r| views::RepoRow {

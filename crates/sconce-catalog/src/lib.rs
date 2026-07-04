@@ -50,6 +50,31 @@ pub struct StorageStats {
     pub orphan_count: i64,
 }
 
+/// Storage metered to a tenant (see [`Catalog::org_storage`]).
+///
+/// **Full logical size — dedup is not credited to tenants.** A blob shared
+/// across orgs (e.g. the same public package both mirror) is counted *in full*
+/// for each org that references it; the physical single-copy saving stays the
+/// operator's margin (reflected only in the overall list price, per ROADMAP
+/// pricing). Distinct *within* an org, so an org isn't billed twice for one
+/// file two of its own versions happen to share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageUsage {
+    /// Summed size of the distinct blobs the org's versions reference.
+    pub bytes: i64,
+    /// Number of distinct blobs.
+    pub blob_count: i64,
+}
+
+/// One org's metered storage, with its identity (see [`Catalog::storage_by_org`]).
+#[derive(Debug, Clone)]
+pub struct OrgStorage {
+    pub org_id: Uuid,
+    pub org_slug: String,
+    pub org_name: Option<String>,
+    pub usage: StorageUsage,
+}
+
 /// The error type returned by catalog operations (re-exported so consumers can
 /// handle it without depending on `sqlx` directly).
 pub use sqlx::Error as SqlxError;
@@ -968,6 +993,14 @@ impl Catalog {
         .bind(slug)
         .fetch_one(&self.pool)
         .await
+    }
+
+    /// Resolve a live org slug to its id (`None` if no such org).
+    pub async fn org_id_by_slug(&self, slug: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("select id from organizations where slug = $1")
+            .bind(slug)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     /// As [`Self::org_slug_unavailable`], scoped within an org for a repo slug.
@@ -2351,6 +2384,62 @@ impl Catalog {
         .await?
         .rows_affected();
         Ok(n == 1)
+    }
+
+    /// Storage metered to one org — the summed size of the **distinct** blobs
+    /// its package versions reference. Full logical size: a blob shared with
+    /// other orgs is counted here in full (no cross-tenant dedup credit). See
+    /// [`StorageUsage`].
+    pub async fn org_storage(&self, org_id: Uuid) -> Result<StorageUsage, sqlx::Error> {
+        let (bytes, blob_count): (i64, i64) = sqlx::query_as(
+            "select coalesce(sum(size_bytes), 0)::bigint, count(*) from ( \
+                 select distinct pv.dist_blob_sha256, b.size_bytes \
+                 from package_versions pv \
+                 join packages p on p.id = pv.package_id \
+                 join repositories r on r.id = p.repo_id \
+                 join blobs b on b.sha256 = pv.dist_blob_sha256 \
+                 where r.org_id = $1 and pv.dist_blob_sha256 is not null \
+             ) t",
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(StorageUsage { bytes, blob_count })
+    }
+
+    /// Metered storage for **every** org (including those with none), busiest
+    /// first — the billing/admin sweep. Same full-logical-size rule as
+    /// [`Self::org_storage`]; summing this across orgs deliberately exceeds the
+    /// physically-stored bytes, which is the dedup margin.
+    pub async fn storage_by_org(&self) -> Result<Vec<OrgStorage>, sqlx::Error> {
+        let rows: Vec<(Uuid, String, Option<String>, i64, i64)> = sqlx::query_as(
+            "select o.id, o.slug, o.name, \
+                    coalesce(sum(t.size_bytes), 0)::bigint, count(t.sha) \
+             from organizations o \
+             left join ( \
+                 select distinct r.org_id, pv.dist_blob_sha256 as sha, b.size_bytes \
+                 from package_versions pv \
+                 join packages p on p.id = pv.package_id \
+                 join repositories r on r.id = p.repo_id \
+                 join blobs b on b.sha256 = pv.dist_blob_sha256 \
+                 where pv.dist_blob_sha256 is not null \
+             ) t on t.org_id = o.id \
+             group by o.id, o.slug, o.name \
+             order by 4 desc, o.slug",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(org_id, org_slug, org_name, bytes, blob_count)| OrgStorage {
+                    org_id,
+                    org_slug,
+                    org_name,
+                    usage: StorageUsage { bytes, blob_count },
+                },
+            )
+            .collect())
     }
 
     /// Upsert a package by name **within a repository**, returning its id.
@@ -6097,6 +6186,14 @@ mod tests {
             .unwrap()
     }
 
+    async fn org_of_repo(cat: &Catalog, repo_id: Uuid) -> Uuid {
+        sqlx::query_scalar("select org_id from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap()
+    }
+
     /// A blob sha unique to this test run (the `blobs` table is global — shared
     /// across every test and prior run — so fixed shas would collide). Seeds
     /// from the per-run `repo_id`, which is unique per `repo()` call.
@@ -6208,6 +6305,52 @@ mod tests {
             Some(1),
             "referenced kept"
         );
+    }
+
+    #[tokio::test]
+    async fn org_storage_meters_full_size_without_dedup_credit() {
+        let Some((cat, repo_a)) = repo().await else {
+            return;
+        };
+        let (_, repo_b) = repo().await.unwrap(); // a different org
+        let org_a = org_of_repo(&cat, repo_a).await;
+        let org_b = org_of_repo(&cat, repo_b).await;
+
+        // A blob shared by both orgs' repos + a second blob only in org A.
+        let shared = test_sha(repo_a, 1);
+        let solo = test_sha(repo_a, 2);
+        let pkg_a = cat
+            .upsert_package(repo_a, "acme/lib", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        cat.upsert_blob(&shared, 1000).await.unwrap();
+        cat.upsert_blob(&solo, 500).await.unwrap();
+        add_version_with_blob(&cat, pkg_a, "v1.0.0", "1.0.0.0", &shared).await;
+        add_version_with_blob(&cat, pkg_a, "v2.0.0", "2.0.0.0", &solo).await;
+
+        let pkg_b = cat
+            .upsert_package(repo_b, "acme/lib", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        add_version_with_blob(&cat, pkg_b, "v1.0.0", "1.0.0.0", &shared).await;
+
+        // Org A: both blobs (1000 + 500). Org B: the shared blob counted in full
+        // (1000) — no cross-tenant dedup credit even though it is stored once.
+        let a = cat.org_storage(org_a).await.unwrap();
+        assert_eq!((a.bytes, a.blob_count), (1500, 2));
+        let b = cat.org_storage(org_b).await.unwrap();
+        assert_eq!(
+            (b.bytes, b.blob_count),
+            (1000, 1),
+            "shared blob billed in full"
+        );
+
+        // The sweep lists both orgs; summing exceeds the ~1500 physically stored.
+        let by_org = cat.storage_by_org().await.unwrap();
+        let a_row = by_org.iter().find(|o| o.org_id == org_a).unwrap();
+        let b_row = by_org.iter().find(|o| o.org_id == org_b).unwrap();
+        assert_eq!(a_row.usage.bytes, 1500);
+        assert_eq!(b_row.usage.bytes, 1000);
     }
 
     #[tokio::test]
