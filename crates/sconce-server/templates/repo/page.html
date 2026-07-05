@@ -486,6 +486,44 @@
   <form class=row method=post action="/r/{{ org }}/{{ repo }}/token">
     name <input name=label placeholder="e.g. ci-deploy"> expires in <input name=expires_days type=number min=1 placeholder=days style="width:6em"> days <button>Create token</button></form>
 
+  <h2>Editions (SKUs)</h2>
+  <p class=muted>An edition is a reusable sellable unit — a <strong>package set</strong> plus an <strong>update-bound template</strong> — that keys are issued against. Define it once, issue many keys; the bound and entitlements are resolved onto each key at issue time, so serving is unchanged.</p>
+  <table>
+    <tr><th>Edition</th><th>Target set</th><th>Update bound</th><th>Membership</th><th>Status</th><th></th></tr>
+    {% for e in editions %}
+      <tr>
+        <td>{{ e.name }}{% if !e.slug.is_empty() %} <span class=muted>({{ e.slug }})</span>{% endif %}</td>
+        <td>{{ e.set_name }}</td>
+        <td>{{ e.bound }}</td>
+        <td>{% if e.snapshot %}snapshot{% else %}by-reference{% endif %}</td>
+        <td>{% if e.active %}<span class="badge ok">active</span>{% else %}<span class="badge slate">inactive</span>{% endif %}</td>
+        <td>{% if e.active %}<form class=inline method=post action="/r/{{ org }}/{{ repo }}/editions/deactivate" data-confirm="Deactivate this edition? Already-issued keys keep working; no new keys can be issued from it, and its SKU slot is freed."><input type=hidden name=id value="{{ e.id }}"><button>Deactivate</button></form>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan=6 class=muted>No editions yet — create one below to sell a package or set as a SKU.</td></tr>
+    {% endfor %}
+  </table>
+  <form class=row method=post action="/r/{{ org }}/{{ repo }}/editions">
+    name <input name=name placeholder="e.g. Pro" required>
+    slug <input name=slug placeholder="optional" style="width:8em">
+    target
+    {% if org_sets_empty %}
+      <input name=package placeholder="single package, e.g. vendor/pkg" required>
+    {% else %}
+      <select name=set_id><option value="">— single package —</option>{% for o in org_set_opts %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}</select>
+      or <input name=package placeholder="single package" style="width:12em">
+    {% endif %}
+    bound <select name=bound_kind id=ed-bound>
+      <option value=perpetual>perpetual</option>
+      <option value=time>time (months)</option>
+      <option value=version>≤ major</option>
+    </select>
+    <input name=period_months id=ed-months type=number min=1 placeholder=months style="width:6em">
+    <input name=major id=ed-major type=number min=0 placeholder=major style="width:5em">
+    <label style="font-size:11.5px"><input type=checkbox name=snapshot> snapshot</label>
+    <button>Create edition</button>
+  </form>
+
   <h2>License keys</h2>
   <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs (a date = “updates until”, or ≤ a major version) — it keeps everything in-window forever. Entitling a key to a <strong>set</strong> unlocks every package it resolves to, by reference (auto-grows).</p>
   <table>
@@ -527,7 +565,18 @@
       <tr><td colspan=6 class=muted>none</td></tr>
     {% endfor %}
   </table>
-  <form class=row method=post action="/r/{{ org }}/{{ repo }}/license">buyer <input name=buyer> packages <input name=packages placeholder="vendor/a vendor/b" required> <button>Issue license</button></form>
+  {% if edition_opts.is_empty() %}
+    <form class=row method=post action="/r/{{ org }}/{{ repo }}/license">buyer <input name=buyer> packages <input name=packages placeholder="vendor/a vendor/b" required> <button>Issue license</button></form>
+    <p class=muted style="font-size:11.5px">Tip: define an <strong>edition</strong> above to issue keys with a preset bound and entitlements in one step.</p>
+  {% else %}
+    <form class=row method=post action="/r/{{ org }}/{{ repo }}/license/issue">
+      issue <select name=edition_id required>{% for o in edition_opts %}<option value="{{ o.id }}">{{ o.label }}</option>{% endfor %}</select>
+      to buyer <input name=buyer placeholder="email / order id"> <button>Issue from edition</button></form>
+    <details style="margin-top:.4rem">
+      <summary class=muted style="cursor:pointer;font-size:11.5px">Advanced: issue an ad-hoc key (pick packages directly, no edition)</summary>
+      <form class=row method=post action="/r/{{ org }}/{{ repo }}/license" style="margin-top:.5rem">buyer <input name=buyer> packages <input name=packages placeholder="vendor/a vendor/b" required> <button>Issue ad-hoc license</button></form>
+    </details>
+  {% endif %}
 </div>
 
 {# ---------- CI ---------- #}

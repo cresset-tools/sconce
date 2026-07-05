@@ -164,6 +164,22 @@ for (const form of document.querySelectorAll('form[data-confirm]')) {
   }
 }
 
+// Editions add-form: show only the input relevant to the chosen bound kind
+// (months for a time bound, major for a version bound; perpetual needs neither).
+{
+  const kind = document.getElementById('ed-bound');
+  if (kind) {
+    const months = document.getElementById('ed-months');
+    const major = document.getElementById('ed-major');
+    const sync = () => {
+      months.style.display = kind.value === 'time' ? '' : 'none';
+      major.style.display = kind.value === 'version' ? '' : 'none';
+    };
+    kind.addEventListener('change', sync);
+    sync();
+  }
+}
+
 // Upstreams add-form: reveal the credential fields only for a private source.
 {
   const vis = document.getElementById('upvis');

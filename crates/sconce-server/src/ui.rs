@@ -188,6 +188,12 @@ pub fn router(
             "/r/{org}/{repo}/license/set/remove",
             post(remove_license_set),
         )
+        .route("/r/{org}/{repo}/license/issue", post(issue_license_edition))
+        .route("/r/{org}/{repo}/editions", post(create_edition_action))
+        .route(
+            "/r/{org}/{repo}/editions/deactivate",
+            post(deactivate_edition),
+        )
         .route("/r/{org}/{repo}/license", post(create_license))
         .route("/r/{org}/{repo}/grant", post(create_grant))
         .route(
@@ -415,10 +421,12 @@ fn e500<E>(_: E) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-/// Map an entitlement-gated failure: a plan denial is `403`, a query error `500`.
+/// Map an entitlement-gated failure: a plan denial or SKU-cap is `403`, a query
+/// error `500`.
 fn ent_status(e: &sconce_catalog::EntitlementError) -> StatusCode {
     match e {
-        sconce_catalog::EntitlementError::Denied(_) => StatusCode::FORBIDDEN,
+        sconce_catalog::EntitlementError::Denied(_)
+        | sconce_catalog::EntitlementError::SkuCapReached(_) => StatusCode::FORBIDDEN,
         sconce_catalog::EntitlementError::Sqlx(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -2606,6 +2614,7 @@ async fn repo_page(
         .map_err(e500)?;
     let tokens = s.catalog.list_tokens(summary.id).await.map_err(e500)?;
     let licenses = s.catalog.list_licenses(summary.id).await.map_err(e500)?;
+    let editions = s.catalog.list_editions(summary.id).await.map_err(e500)?;
     let grants = s.catalog.list_grants(summary.id).await.map_err(e500)?;
     let grant_rules = s.catalog.list_grant_rules(summary.id).await.map_err(e500)?;
     let org_sets = s
@@ -3031,6 +3040,27 @@ async fn repo_page(
             major: l.bound.major.map_or_else(String::new, |m| m.to_string()),
         })
         .collect();
+    let edition_rows: Vec<views::EditionRow> = editions
+        .iter()
+        .map(|e| views::EditionRow {
+            id: e.id.to_string(),
+            name: e.name.clone(),
+            slug: e.slug.clone().unwrap_or_default(),
+            set_name: e.set_name.clone(),
+            bound: e.bound.label(),
+            snapshot: e.snapshot,
+            active: e.active,
+        })
+        .collect();
+    // Only active editions are offered in the issue picker.
+    let edition_opts: Vec<views::EditionOpt> = editions
+        .iter()
+        .filter(|e| e.active)
+        .map(|e| views::EditionOpt {
+            id: e.id.to_string(),
+            label: format!("{} — {}", e.name, e.bound.label()),
+        })
+        .collect();
     let token_rows: Vec<views::TokenRow> = tokens
         .iter()
         .map(|t| views::TokenRow {
@@ -3196,6 +3226,8 @@ async fn repo_page(
         deps,
         licenses: license_rows,
         org_set_opts,
+        editions: edition_rows,
+        edition_opts,
         tokens: token_rows,
         ci,
     };
@@ -3912,6 +3944,200 @@ async fn create_license(
         "License created",
         &view.render().map_err(e500)?,
     ))
+}
+
+/// Parse a required, non-empty integer form field with a minimum → `400` on
+/// missing/blank/unparseable/too-small input.
+fn form_int(v: Option<&str>, min: i32) -> Result<i32, StatusCode> {
+    let raw = v
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let n: i32 = raw.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if n < min {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(n)
+}
+
+#[derive(Deserialize)]
+struct IssueEditionForm {
+    edition_id: String,
+    buyer: Option<String>,
+}
+
+/// Issue a license key against an edition — resolves the edition's bound,
+/// entitlements, and policy onto the new key, then shows it once.
+async fn issue_license_edition(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<IssueEditionForm>,
+) -> Result<Html<String>, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let edition_id = f
+        .edition_id
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let buyer = f.buyer.as_deref().map(str::trim).filter(|b| !b.is_empty());
+    let ed = s
+        .catalog
+        .edition(repo_id, edition_id)
+        .await
+        .map_err(e500)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let key = s
+        .catalog
+        .issue_from_edition(repo_id, edition_id, buyer)
+        .await
+        .map_err(e500)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let view = views::LicenseCreated {
+        packages: format!("edition “{}”", ed.name),
+        key,
+        org: org.clone(),
+        repo: repo.clone(),
+    };
+    Ok(shell(
+        &s,
+        &user,
+        "License created",
+        &view.render().map_err(e500)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct EditionForm {
+    name: String,
+    slug: Option<String>,
+    /// An existing org package set (by id), used when `package` is blank.
+    set_id: Option<String>,
+    /// A single package name — creates/reuses a singleton set (takes precedence).
+    package: Option<String>,
+    /// `perpetual` | `time` | `version`.
+    bound_kind: String,
+    period_months: Option<String>,
+    major: Option<String>,
+    /// Checkbox: present (`on`) = snapshot at issue.
+    snapshot: Option<String>,
+    /// Optional policy override stamped on issued keys (absent = inherit repo).
+    mode: Option<String>,
+    cooldown_days: Option<String>,
+}
+
+/// Create an edition. The target is a single package (singleton set) if given,
+/// else an existing org set. Gated on `max_skus`.
+async fn create_edition_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<EditionForm>,
+) -> Result<Response, StatusCode> {
+    let summary = lookup_admin(&s, &user, &org, &repo).await?;
+    let name = f.name.trim();
+    if name.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let slug = f.slug.as_deref().map(str::trim).filter(|x| !x.is_empty());
+    let back = format!("/r/{org}/{repo}");
+
+    // Resolve the target set: a single package (singleton set) takes precedence
+    // over a chosen set. Exactly one path must produce a set.
+    let set_id = if let Some(pkg) = f.package.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        match s.catalog.singleton_set(summary.org_id, pkg).await.map_err(e500)? {
+            Some(id) => id,
+            None => {
+                return Ok(error_card(
+                    &s,
+                    &user,
+                    "Package not found",
+                    "No package with that name in this organization.",
+                    &back,
+                ));
+            }
+        }
+    } else if let Some(sid) = f.set_id.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        let sid = sid.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+        // The set must belong to this repo's org.
+        match s.catalog.package_set(sid).await.map_err(e500)? {
+            Some((_, set_org)) if set_org == summary.org_id => sid,
+            _ => return Err(StatusCode::BAD_REQUEST),
+        }
+    } else {
+        return Ok(error_card(
+            &s,
+            &user,
+            "No target",
+            "Pick a package set or enter a single package for the edition.",
+            &back,
+        ));
+    };
+
+    // Build the bound template from the chosen kind + its one relevant field
+    // (months ≥ 1 for time; major ≥ 0 for version — v0.x is a valid cap).
+    let bound = match f.bound_kind.as_str() {
+        "time" => sconce_catalog::EditionBound::Time {
+            period_months: form_int(f.period_months.as_deref(), 1)?,
+        },
+        "version" => sconce_catalog::EditionBound::Version {
+            major: form_int(f.major.as_deref(), 0)?,
+        },
+        _ => sconce_catalog::EditionBound::Perpetual,
+    };
+    let snapshot = f.snapshot.is_some();
+    let update_mode = match f.mode.as_deref() {
+        Some(m @ ("auto" | "manual" | "delayed")) => Some(m.to_owned()),
+        _ => None,
+    };
+    let cooldown_days = match f.cooldown_days.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
+    };
+    let policy = sconce_catalog::PolicyOverride {
+        update_mode,
+        cooldown_days,
+    };
+    match s
+        .catalog
+        .create_edition(summary.id, name, slug, set_id, &bound, snapshot, &policy)
+        .await
+    {
+        Ok(Some(_)) => Ok(Redirect::to(&back).into_response()),
+        Ok(None) => Err(StatusCode::BAD_REQUEST),
+        Err(sconce_catalog::EntitlementError::SkuCapReached(cap)) => Ok(error_card(
+            &s,
+            &user,
+            "SKU limit reached",
+            &format!(
+                "This organization's plan allows at most {cap} editions. Deactivate one or upgrade the plan."
+            ),
+            &back,
+        )),
+        Err(_) => Ok(error_card(
+            &s,
+            &user,
+            "Couldn't create edition",
+            "An edition with that name may already exist (names are unique per repo).",
+            &back,
+        )),
+    }
+}
+
+async fn deactivate_edition(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<IdForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let id =
+        f.id.parse::<Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.catalog
+        .set_edition_active(repo_id, id, false)
+        .await
+        .map_err(e500)?;
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
 
 #[derive(serde::Deserialize)]

@@ -208,6 +208,10 @@ impl Entitlements {
 pub enum EntitlementError {
     #[error("the '{0}' feature is not available on this organization's plan")]
     Denied(Feature),
+    /// The org is at its `max_skus` cap (argument = the cap). Raised by
+    /// [`Catalog::create_edition`]; deactivate an edition or raise the plan.
+    #[error("this organization's plan allows at most {0} editions (SKUs)")]
+    SkuCapReached(i32),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
 }
@@ -353,6 +357,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0037_org_entitlements",
         include_str!("../migrations/0037_org_entitlements.sql"),
     ),
+    ("0038_editions", include_str!("../migrations/0038_editions.sql")),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -770,6 +775,108 @@ pub struct LicenseBound {
     pub until: Option<String>,
     pub until_unix: Option<i64>,
     pub major: Option<i32>,
+}
+
+/// An edition's update-bound **template** — resolved to concrete per-key values
+/// at issue time (see [`Catalog::issue_from_edition`]). Mirrors [`LicenseBound`],
+/// but a time bound is a relative *period*, not an absolute date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditionBound {
+    /// Perpetual / unbounded — the key never stops receiving updates.
+    Perpetual,
+    /// Updates for a period: resolves to `update_until = issue_date + months`.
+    Time { period_months: i32 },
+    /// Updates up to a major version (inclusive): resolves to `version_cap_major`.
+    Version { major: i32 },
+}
+
+impl EditionBound {
+    /// The `(kind, period_months, major)` triple stored in the `editions` row.
+    #[must_use]
+    fn columns(&self) -> (&'static str, Option<i32>, Option<i32>) {
+        match self {
+            EditionBound::Perpetual => ("perpetual", None, None),
+            EditionBound::Time { period_months } => ("time", Some(*period_months), None),
+            EditionBound::Version { major } => ("version", None, Some(*major)),
+        }
+    }
+
+    /// Reconstruct from the stored columns (an unknown kind falls back to
+    /// perpetual, so a malformed row is unbounded rather than an error).
+    #[must_use]
+    fn from_columns(kind: &str, period_months: Option<i32>, major: Option<i32>) -> Self {
+        match kind {
+            "time" => EditionBound::Time {
+                period_months: period_months.unwrap_or(0),
+            },
+            "version" => EditionBound::Version {
+                major: major.unwrap_or(0),
+            },
+            _ => EditionBound::Perpetual,
+        }
+    }
+
+    /// Parse the CLI `--bound` spec: `perpetual` (or empty), `time:<n>` / `<n>m`
+    /// (n months), `version:<n>` / `v<n>` (max major). Human message on error.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let s = spec.trim().to_lowercase();
+        let months = |v: &str| {
+            v.trim_end_matches('m')
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|n| *n > 0)
+        };
+        let major = |v: &str| v.trim().parse::<i32>().ok().filter(|n| *n >= 0);
+        if s.is_empty() || s == "perpetual" {
+            Ok(EditionBound::Perpetual)
+        } else if let Some(v) = s.strip_prefix("time:").map(str::to_owned).or_else(|| {
+            s.strip_suffix('m')
+                .filter(|r| r.chars().all(|c| c.is_ascii_digit()))
+                .map(|_| s.clone())
+        }) {
+            months(&v)
+                .map(|period_months| EditionBound::Time { period_months })
+                .ok_or_else(|| format!("invalid time bound '{spec}' (want e.g. time:12 or 12m)"))
+        } else if let Some(v) = s.strip_prefix("version:").or_else(|| s.strip_prefix('v')) {
+            major(v)
+                .map(|major| EditionBound::Version { major })
+                .ok_or_else(|| format!("invalid version bound '{spec}' (want e.g. version:3 or v3)"))
+        } else {
+            Err(format!(
+                "unknown bound '{spec}' (want perpetual, time:<months>, or version:<major>)"
+            ))
+        }
+    }
+
+    /// A compact human label for listings ("perpetual", "12 months", "≤ v3").
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            EditionBound::Perpetual => "perpetual".to_owned(),
+            EditionBound::Time { period_months } => format!("{period_months} months"),
+            EditionBound::Version { major } => format!("≤ v{major}"),
+        }
+    }
+}
+
+/// A seller **edition** (SKU): a reusable issuance template — a package set plus
+/// an update-bound template and optional policy, that license keys are issued
+/// against. See `SKU_PLAN.md`.
+#[derive(Debug, Clone)]
+pub struct Edition {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: Option<String>,
+    pub set_id: Uuid,
+    /// The target set's name (joined for display).
+    pub set_name: String,
+    pub bound: EditionBound,
+    /// Freeze set membership at issue (snapshot) vs unlock by reference (auto-grow).
+    pub snapshot: bool,
+    /// Supply-chain policy stamped onto issued keys (empty = inherit the repo).
+    pub policy: PolicyOverride,
+    pub active: bool,
 }
 
 /// A package set (named, org-scoped group of packages) in a listing.
@@ -4223,6 +4330,298 @@ impl Catalog {
             .collect()
     }
 
+    // ----- Editions (SKUs) -------------------------------------------------
+    // A reusable issuance template (target set + bound template + policy). Keys
+    // are issued *against* an edition, which resolves the template into the
+    // existing per-key columns/tables. Serving never reads editions. See
+    // SKU_PLAN.md.
+
+    /// Count an org's **active** editions across all its repos — the number the
+    /// `max_skus` cap constrains.
+    pub async fn count_active_editions(&self, org_id: Uuid) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "select count(*)::bigint from editions e \
+             join repositories r on r.id = e.repo_id \
+             where r.org_id = $1 and e.active",
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Gate edition creation on the org's `max_skus` cap. `Ok(())` when under the
+    /// cap (or uncapped — the self-host / unlimited default);
+    /// [`EntitlementError::SkuCapReached`] when at it.
+    async fn require_sku_capacity(&self, org_id: Uuid) -> Result<(), EntitlementError> {
+        if let Some(cap) = self.entitlements(org_id).await?.max_skus
+            && self.count_active_editions(org_id).await? >= i64::from(cap)
+        {
+            return Err(EntitlementError::SkuCapReached(cap));
+        }
+        Ok(())
+    }
+
+    /// Get-or-create an org-scoped **singleton** package set holding exactly
+    /// `package`, so a single-package edition can reuse the set primitive. Named
+    /// after the package (an existing set of that name is reused). `None` if the
+    /// package isn't found in the org.
+    pub async fn singleton_set(
+        &self,
+        org_id: Uuid,
+        package: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let Some(package_id) = self.find_package_in_org(org_id, package).await? else {
+            return Ok(None);
+        };
+        // `do update` (a no-op) so RETURNING yields the id on conflict too.
+        let set_id: Uuid = sqlx::query_scalar(
+            "insert into package_sets (org_id, name) values ($1, $2) \
+             on conflict (org_id, name) do update set name = excluded.name \
+             returning id",
+        )
+        .bind(org_id)
+        .bind(package.trim())
+        .fetch_one(&self.pool)
+        .await?;
+        self.add_set_member(set_id, package_id).await?;
+        Ok(Some(set_id))
+    }
+
+    /// Create an edition in a repo. Gated on the org's `max_skus`. The target
+    /// `set_id` must belong to the repo's org — returns `Ok(None)` if it doesn't
+    /// (so callers can report "unknown set" without a DB error). A duplicate
+    /// `(repo, name)` surfaces as a `Sqlx` unique violation.
+    // The fields (name, slug, set, bound, snapshot, policy) are all independent
+    // edition attributes; a params struct would just add indirection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_edition(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+        slug: Option<&str>,
+        set_id: Uuid,
+        bound: &EditionBound,
+        snapshot: bool,
+        policy: &PolicyOverride,
+    ) -> Result<Option<Uuid>, EntitlementError> {
+        let org_id = self.org_of_repo(repo_id).await?;
+        self.require_sku_capacity(org_id).await?;
+        let set_ok: bool = sqlx::query_scalar(
+            "select exists(select 1 from package_sets where id = $1 and org_id = $2)",
+        )
+        .bind(set_id)
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !set_ok {
+            return Ok(None);
+        }
+        let (kind, period_months, major) = bound.columns();
+        let id: Uuid = sqlx::query_scalar(
+            "insert into editions \
+                 (repo_id, name, slug, set_id, bound_kind, bound_period_months, bound_major, \
+                  snapshot_at_issue, update_mode, cooldown_days) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning id",
+        )
+        .bind(repo_id)
+        .bind(name.trim())
+        .bind(slug.map(str::trim).filter(|s| !s.is_empty()))
+        .bind(set_id)
+        .bind(kind)
+        .bind(period_months)
+        .bind(major)
+        .bind(snapshot)
+        .bind(policy.update_mode.as_deref())
+        .bind(policy.cooldown_days)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Some(id))
+    }
+
+    /// A repo's editions (active first, then by name), for the manager UI.
+    pub async fn list_editions(&self, repo_id: Uuid) -> Result<Vec<Edition>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select e.id, e.name, e.slug, e.set_id, ps.name as set_name, \
+                    e.bound_kind, e.bound_period_months, e.bound_major, \
+                    e.snapshot_at_issue, e.update_mode, e.cooldown_days, e.active \
+             from editions e join package_sets ps on ps.id = e.set_id \
+             where e.repo_id = $1 order by e.active desc, e.name",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::edition_from_row).collect()
+    }
+
+    /// One edition by id, scoped to its repo. `None` if it doesn't exist there.
+    pub async fn edition(
+        &self,
+        repo_id: Uuid,
+        edition_id: Uuid,
+    ) -> Result<Option<Edition>, sqlx::Error> {
+        let row = sqlx::query(
+            "select e.id, e.name, e.slug, e.set_id, ps.name as set_name, \
+                    e.bound_kind, e.bound_period_months, e.bound_major, \
+                    e.snapshot_at_issue, e.update_mode, e.cooldown_days, e.active \
+             from editions e join package_sets ps on ps.id = e.set_id \
+             where e.repo_id = $1 and e.id = $2",
+        )
+        .bind(repo_id)
+        .bind(edition_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::edition_from_row).transpose()
+    }
+
+    /// Resolve an edition id by name or slug within a repo (for the CLI). Prefers
+    /// a slug match, then a name match.
+    pub async fn find_edition(
+        &self,
+        repo_id: Uuid,
+        name_or_slug: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "select id from editions where repo_id = $1 and (slug = $2 or name = $2) \
+             order by (slug = $2) desc limit 1",
+        )
+        .bind(repo_id)
+        .bind(name_or_slug.trim())
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Activate or deactivate an edition (deactivating stops new sales and frees a
+    /// `max_skus` slot without touching already-issued keys). Returns whether a
+    /// row matched.
+    pub async fn set_edition_active(
+        &self,
+        repo_id: Uuid,
+        edition_id: Uuid,
+        active: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query("update editions set active = $3 where id = $1 and repo_id = $2")
+            .bind(edition_id)
+            .bind(repo_id)
+            .bind(active)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Delete an edition. Already-issued keys keep working — their `edition_id` is
+    /// set null (they retain their resolved entitlements/bound). Returns whether a
+    /// row was removed.
+    pub async fn delete_edition(
+        &self,
+        repo_id: Uuid,
+        edition_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query("delete from editions where id = $1 and repo_id = $2")
+            .bind(edition_id)
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Issue a license key **against an edition**: the edition's bound template and
+    /// policy are resolved onto the key, and its target set entitles the key —
+    /// frozen as per-package rows (`snapshot`) or unlocked by reference
+    /// (auto-grow). Returns the plaintext key (shown once), or `Ok(None)` if the
+    /// edition doesn't exist in the repo or is inactive. Serving is unchanged: it
+    /// reads the resolved key exactly as for an ad-hoc one.
+    pub async fn issue_from_edition(
+        &self,
+        repo_id: Uuid,
+        edition_id: Uuid,
+        buyer: Option<&str>,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Insert the key with the bound resolved inline from the edition (time ->
+        // now()+months, version -> cap), so no clock/date handling in Rust. A
+        // missing/inactive edition yields no row.
+        let key = generate_secret("sclk_");
+        let row = sqlx::query(
+            "insert into license_keys \
+                 (repo_id, key_hash, buyer_ref, edition_id, update_until, version_cap_major, \
+                  update_mode, cooldown_days) \
+             select $1, $2, $3, ed.id, \
+                    case when ed.bound_kind = 'time' \
+                         then now() + make_interval(months => ed.bound_period_months) end, \
+                    case when ed.bound_kind = 'version' then ed.bound_major end, \
+                    ed.update_mode, ed.cooldown_days \
+             from editions ed where ed.id = $4 and ed.repo_id = $1 and ed.active \
+             returning id, (select set_id from editions where id = $4) as set_id, \
+                       (select snapshot_at_issue from editions where id = $4) as snapshot",
+        )
+        .bind(repo_id)
+        .bind(token_hash(&key))
+        .bind(buyer)
+        .bind(edition_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let license_id: Uuid = row.try_get("id")?;
+        let set_id: Uuid = row.try_get("set_id")?;
+        let snapshot: bool = row.try_get("snapshot")?;
+        if snapshot {
+            // Freeze current set membership as explicit per-package entitlements.
+            sqlx::query(
+                "insert into entitlements (license_key_id, package_id) \
+                 select $1, p.id from packages p \
+                 where p.id in (select package_id from package_set_members where set_id = $2) \
+                    or ( p.repo_id in (select id from repositories \
+                                       where org_id = (select org_id from package_sets where id = $2)) \
+                         and exists (select 1 from package_set_rules sr \
+                                     where sr.set_id = $2 \
+                                       and p.name like replace(sr.glob, '*', '%')) ) \
+                 on conflict do nothing",
+            )
+            .bind(license_id)
+            .bind(set_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            // Unlock by reference — auto-grows with the set.
+            sqlx::query(
+                "insert into license_set_entitlements (license_key_id, set_id) values ($1, $2) \
+                 on conflict do nothing",
+            )
+            .bind(license_id)
+            .bind(set_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(key))
+    }
+
+    /// Build an [`Edition`] from a listing row (shared by `list_editions` /
+    /// `edition`).
+    fn edition_from_row(row: &sqlx::postgres::PgRow) -> Result<Edition, sqlx::Error> {
+        Ok(Edition {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            slug: row.try_get("slug").ok().flatten(),
+            set_id: row.try_get("set_id")?,
+            set_name: row.try_get("set_name")?,
+            bound: EditionBound::from_columns(
+                row.try_get("bound_kind")?,
+                row.try_get("bound_period_months").ok().flatten(),
+                row.try_get("bound_major").ok().flatten(),
+            ),
+            snapshot: row.try_get("snapshot_at_issue")?,
+            policy: PolicyOverride {
+                update_mode: row.try_get("update_mode").ok().flatten(),
+                cooldown_days: row.try_get("cooldown_days").ok().flatten(),
+            },
+            active: row.try_get("active")?,
+        })
+    }
+
     /// Grant `package` (owned by `source_repo`) into `target_repo`, so the target
     /// exposes it without owning it. Returns `false` if no such package exists in
     /// the source.
@@ -6651,6 +7050,192 @@ mod tests {
         assert!(cat.clear_org_entitlements(org_id).await.unwrap());
         assert!(!cat.has_entitlements(org_id).await.unwrap());
         cat.add_grant_rule(repo_id, set_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edition_issue_resolves_bound_and_entitlements() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of_repo(&cat, repo_id).await;
+        for n in ["acme/a", "acme/b"] {
+            cat.upsert_package(repo_id, n, "git", None, Visibility::Private)
+                .await
+                .unwrap();
+        }
+        let set = cat.create_package_set(org_id, "Pro").await.unwrap();
+        cat.add_set_rule(set, "acme/*").await.unwrap();
+
+        // A by-reference, time-bounded edition (12 months of updates).
+        let ed = cat
+            .create_edition(
+                repo_id,
+                "Pro Annual",
+                Some("pro-annual"),
+                set,
+                &EditionBound::Time { period_months: 12 },
+                false,
+                &PolicyOverride::default(),
+            )
+            .await
+            .unwrap()
+            .expect("set belongs to org");
+
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let key = cat
+            .issue_from_edition(repo_id, ed, Some("buyer@x"))
+            .await
+            .unwrap()
+            .expect("issued");
+        let lic = cat.resolve_license(repo_id, &key).await.unwrap().unwrap();
+
+        // Entitled by reference to the set's packages, and auto-grows.
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a", "acme/b"]
+        );
+        cat.upsert_package(repo_id, "acme/c", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        assert!(
+            cat.entitled_package_names(lic)
+                .await
+                .unwrap()
+                .contains(&"acme/c".to_owned()),
+            "by-reference edition auto-grows with the set"
+        );
+
+        // The time template resolved to an absolute ~12-month bound on the key.
+        let bound = cat.license_bound(lic).await.unwrap();
+        let until = bound.until_unix.expect("time bound resolved");
+        assert!(bound.major.is_none());
+        assert!(
+            (now + 360 * 86_400..now + 372 * 86_400).contains(&until),
+            "until {until} should be ~now + 12 months"
+        );
+
+        // The key remembers the edition it was minted from.
+        let ed_link: Option<Uuid> =
+            sqlx::query_scalar("select edition_id from license_keys where id = $1")
+                .bind(lic)
+                .fetch_one(&cat.pool)
+                .await
+                .unwrap();
+        assert_eq!(ed_link, Some(ed));
+    }
+
+    #[tokio::test]
+    async fn edition_snapshot_freezes_and_version_bound_resolves() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of_repo(&cat, repo_id).await;
+        cat.upsert_package(repo_id, "acme/a", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let set = cat.create_package_set(org_id, "Bundle").await.unwrap();
+        cat.add_set_rule(set, "acme/*").await.unwrap();
+
+        // A snapshot edition, version-bounded (<= v2).
+        let ed = cat
+            .create_edition(
+                repo_id,
+                "Perpetual v2",
+                None,
+                set,
+                &EditionBound::Version { major: 2 },
+                true,
+                &PolicyOverride::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let key = cat
+            .issue_from_edition(repo_id, ed, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let lic = cat.resolve_license(repo_id, &key).await.unwrap().unwrap();
+
+        // Frozen membership: only what the set resolved to at issue time.
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a"]
+        );
+        cat.upsert_package(repo_id, "acme/b", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a"],
+            "a new matching package does not reach a snapshot key"
+        );
+
+        // The version template resolved to a major cap, with no time bound.
+        let bound = cat.license_bound(lic).await.unwrap();
+        assert_eq!(bound.major, Some(2));
+        assert!(bound.until_unix.is_none());
+    }
+
+    #[tokio::test]
+    async fn edition_creation_gated_by_max_skus() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of_repo(&cat, repo_id).await;
+        cat.upsert_package(repo_id, "acme/only", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        // Single-package convenience: a singleton set is created (and reused).
+        let set = cat
+            .singleton_set(org_id, "acme/only")
+            .await
+            .unwrap()
+            .expect("package exists in org");
+        assert_eq!(cat.resolve_set(set).await.unwrap(), vec!["acme/only"]);
+        assert_eq!(
+            cat.singleton_set(org_id, "acme/only").await.unwrap(),
+            Some(set),
+            "singleton set is reused, not duplicated"
+        );
+
+        // Cap the org at a single SKU.
+        let mut ent = Entitlements::unlimited();
+        ent.max_skus = Some(1);
+        cat.set_org_entitlements(org_id, &ent).await.unwrap();
+
+        let mk = |name: &'static str| {
+            let cat = &cat;
+            async move {
+                cat.create_edition(
+                    repo_id,
+                    name,
+                    None,
+                    set,
+                    &EditionBound::Perpetual,
+                    false,
+                    &PolicyOverride::default(),
+                )
+                .await
+            }
+        };
+
+        let first = mk("Solo").await.unwrap().unwrap();
+        // The second is refused at the cap.
+        assert!(matches!(
+            mk("Solo2").await,
+            Err(EntitlementError::SkuCapReached(1))
+        ));
+        // Deactivating the first frees the slot.
+        assert!(cat.set_edition_active(repo_id, first, false).await.unwrap());
+        assert_eq!(cat.count_active_editions(org_id).await.unwrap(), 0);
+        mk("Solo2").await.unwrap().unwrap();
     }
 
     #[tokio::test]

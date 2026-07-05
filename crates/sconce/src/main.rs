@@ -433,6 +433,29 @@ enum Command {
         database_url: String,
     },
 
+    /// Issue a license key against an **edition** (SKU): resolves the edition's
+    /// packages, update bound, and policy onto the key in one step.
+    LicenseIssue {
+        /// Seller repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Edition to issue against (its name or slug).
+        #[arg(long)]
+        edition: String,
+        /// Buyer reference (email / order id).
+        #[arg(long)]
+        buyer: Option<String>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Manage editions (SKUs): reusable sellable units that license keys are
+    /// issued against (a package set + an update-bound template).
+    Edition {
+        #[command(subcommand)]
+        action: EditionAction,
+    },
+
     /// Grant a package from one repository into another (agency curation).
     ///
     /// The target repo then exposes the package without owning it — mirror a
@@ -735,6 +758,65 @@ enum EntitlementsAction {
     Clear {
         #[arg(long)]
         org: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EditionAction {
+    /// Create an edition. Its target is either an existing package set
+    /// (`--set <name>`) or a single package (`--package <name>`, which reuses a
+    /// singleton set). Gated on the org's `max_skus` cap.
+    Create {
+        /// Seller repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Edition name (unique within the repo), e.g. `Pro`.
+        #[arg(long)]
+        name: String,
+        /// Stable external id for product/API mapping (defaults to none).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Target: an existing org package set, by name.
+        #[arg(long, conflicts_with = "package")]
+        set: Option<String>,
+        /// Target: a single package (a singleton set is created/reused).
+        #[arg(long, conflicts_with = "set")]
+        package: Option<String>,
+        /// Update-bound template: `perpetual`, `time:<months>` (e.g. `time:12`),
+        /// or `version:<major>` (e.g. `version:3`).
+        #[arg(long, default_value = "perpetual")]
+        bound: String,
+        /// Freeze set membership at issue (snapshot) instead of by-reference.
+        #[arg(long)]
+        snapshot: bool,
+        /// Optional policy stamped on issued keys: update mode
+        /// (`auto`|`delayed`|`manual`).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Optional policy stamped on issued keys: cooldown days.
+        #[arg(long)]
+        cooldown_days: Option<i32>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// List a repo's editions.
+    List {
+        /// Seller repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Deactivate an edition (stops new sales and frees a SKU slot; already-
+    /// issued keys keep working). By name or slug.
+    Deactivate {
+        /// Seller repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Edition name or slug.
+        edition: String,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -1076,6 +1158,43 @@ fn main() -> Result<()> {
             packages,
             database_url,
         } => license_create(&repo, buyer.as_deref(), &packages, &database_url),
+        Command::LicenseIssue {
+            repo,
+            edition,
+            buyer,
+            database_url,
+        } => license_issue(&repo, &edition, buyer.as_deref(), &database_url),
+        Command::Edition { action } => match action {
+            EditionAction::Create {
+                repo,
+                name,
+                slug,
+                set,
+                package,
+                bound,
+                snapshot,
+                mode,
+                cooldown_days,
+                database_url,
+            } => edition_create(
+                &repo,
+                &name,
+                slug.as_deref(),
+                set.as_deref(),
+                package.as_deref(),
+                &bound,
+                snapshot,
+                mode.as_deref(),
+                cooldown_days,
+                &database_url,
+            ),
+            EditionAction::List { repo, database_url } => edition_list(&repo, &database_url),
+            EditionAction::Deactivate {
+                repo,
+                edition,
+                database_url,
+            } => edition_deactivate(&repo, &edition, &database_url),
+        },
         Command::Grant {
             repo,
             from,
@@ -2273,6 +2392,131 @@ fn license_create(
             packages.join(", ")
         );
         Ok(())
+    })
+}
+
+fn license_issue(
+    repo: &str,
+    edition: &str,
+    buyer: Option<&str>,
+    database_url: &str,
+) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let ed = catalog
+            .find_edition(repo_id, edition)
+            .await?
+            .with_context(|| format!("no edition '{edition}' in {repo}"))?;
+        let key = catalog
+            .issue_from_edition(repo_id, ed, buyer)
+            .await
+            .context("issuing license")?
+            .with_context(|| format!("edition '{edition}' is inactive"))?;
+        // The key goes to stdout (scriptable); the notice to stderr.
+        println!("{key}");
+        eprintln!(
+            "License issued for {repo} against edition '{edition}'. Store the key — shown once."
+        );
+        Ok(())
+    })
+}
+
+// The flags (name, slug, target, bound, snapshot, policy) are independent edition
+// attributes; a params struct would just add indirection at the one call site.
+#[allow(clippy::too_many_arguments)]
+fn edition_create(
+    repo: &str,
+    name: &str,
+    slug: Option<&str>,
+    set: Option<&str>,
+    package: Option<&str>,
+    bound_spec: &str,
+    snapshot: bool,
+    mode: Option<&str>,
+    cooldown_days: Option<i32>,
+    database_url: &str,
+) -> Result<()> {
+    let bound = sconce_catalog::EditionBound::parse(bound_spec).map_err(|e| anyhow::anyhow!(e))?;
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let (org_slug, _) = repo
+            .split_once('/')
+            .with_context(|| format!("--repo must be <org>/<repo>, got '{repo}'"))?;
+        let org_id = catalog
+            .org_id_by_slug(org_slug)
+            .await?
+            .with_context(|| format!("no such org: {org_slug}"))?;
+        // Resolve the target set: an existing named set, or a singleton for one
+        // package. Exactly one of --set / --package is required.
+        let set_id = match (set, package) {
+            (Some(s), None) => catalog
+                .list_package_sets(org_id)
+                .await?
+                .into_iter()
+                .find(|ps| ps.name == s)
+                .map(|ps| ps.id)
+                .with_context(|| format!("no package set '{s}' in {org_slug}"))?,
+            (None, Some(p)) => catalog
+                .singleton_set(org_id, p)
+                .await?
+                .with_context(|| format!("no package '{p}' in {org_slug}"))?,
+            _ => anyhow::bail!("specify exactly one of --set or --package"),
+        };
+        let policy = sconce_catalog::PolicyOverride {
+            update_mode: mode.map(str::to_owned),
+            cooldown_days,
+        };
+        match catalog
+            .create_edition(repo_id, name, slug, set_id, &bound, snapshot, &policy)
+            .await
+        {
+            Ok(Some(id)) => {
+                println!("{id}");
+                eprintln!("Edition '{name}' created in {repo} (bound: {}).", bound.label());
+                Ok(())
+            }
+            Ok(None) => anyhow::bail!("target set does not belong to {org_slug}"),
+            Err(e) => Err(e.into()),
+        }
+    })
+}
+
+fn edition_list(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let editions = catalog.list_editions(repo_id).await?;
+        if editions.is_empty() {
+            println!("no editions in {repo}");
+            return Ok(());
+        }
+        for e in editions {
+            println!(
+                "{}{}  set={}  bound={}  {}{}",
+                e.name,
+                e.slug.map(|s| format!(" ({s})")).unwrap_or_default(),
+                e.set_name,
+                e.bound.label(),
+                if e.snapshot { "snapshot" } else { "by-ref" },
+                if e.active { "" } else { "  [inactive]" },
+            );
+        }
+        Ok(())
+    })
+}
+
+fn edition_deactivate(repo: &str, edition: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let ed = catalog
+            .find_edition(repo_id, edition)
+            .await?
+            .with_context(|| format!("no edition '{edition}' in {repo}"))?;
+        if catalog.set_edition_active(repo_id, ed, false).await? {
+            println!("edition '{edition}' deactivated");
+            Ok(())
+        } else {
+            anyhow::bail!("edition '{edition}' not found")
+        }
     })
 }
 
