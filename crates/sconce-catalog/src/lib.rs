@@ -381,6 +381,8 @@ pub struct UpstreamSummary {
 pub struct PackageStatus {
     pub name: String,
     pub visibility: String,
+    /// The upstream this package is mirrored from (`None` = added directly).
+    pub upstream_id: Option<Uuid>,
     pub sync_health: String,
     pub broken_reason: Option<String>,
     pub broken_at: Option<String>,
@@ -2488,7 +2490,8 @@ impl Catalog {
     /// lifecycle).
     pub async fn list_packages(&self, repo_id: Uuid) -> Result<Vec<PackageStatus>, sqlx::Error> {
         let rows = sqlx::query(
-            "select p.name as name, p.visibility as visibility, p.sync_health as sync_health, \
+            "select p.name as name, p.visibility as visibility, p.upstream_id as upstream_id, \
+                    p.sync_health as sync_health, \
                     p.broken_reason as broken_reason, \
                     to_char(p.broken_at,       'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as broken_at, \
                     to_char(p.last_success_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as last_success_at, \
@@ -2506,6 +2509,7 @@ impl Catalog {
                 Ok(PackageStatus {
                     name: r.try_get("name")?,
                     visibility: r.try_get("visibility")?,
+                    upstream_id: r.try_get("upstream_id")?,
                     sync_health: r.try_get("sync_health")?,
                     broken_reason: r.try_get("broken_reason")?,
                     broken_at: r.try_get("broken_at")?,

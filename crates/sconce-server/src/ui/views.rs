@@ -465,12 +465,15 @@ pub struct ApprovalGroup {
     pub package: String,
     /// Total pending versions in this package (the "Approve all N").
     pub count: usize,
-    /// The first few rows, shown when expanded.
+    /// Every fetched row; the template collapses rows past the first few
+    /// behind an inline "Show all N".
     pub rows: Vec<ApprovalVer>,
-    /// Versions beyond `rows` (`count - rows.len()`).
+    /// Rows hidden until "Show all N" (`count - visible rows`).
     pub more: usize,
     /// Render expanded on load (the first / largest batch).
     pub expanded: bool,
+    /// Provenance line — "via {upstream} · {visibility}", or empty.
+    pub via: String,
 }
 
 /// A delayed-cooldown version card in the Approvals tab (countdown + progress).
@@ -480,6 +483,10 @@ pub struct CooldownCard {
     pub normalized: String,
     /// Whole days until it clears cooldown and auto-exposes.
     pub days_left: i64,
+    /// Whole days since release (the cooldown window minus what's left).
+    pub days_ago: i64,
+    /// The repo's full cooldown window in days.
+    pub days_total: i64,
     /// Percent of the cooldown window already elapsed (0–100).
     pub pct: i64,
 }
@@ -655,6 +662,9 @@ pub struct RepoPage {
     pub ap_held: usize,
     /// "synced 2m ago" pill text from the freshest upstream, or empty.
     pub ap_synced: String,
+    /// Upstreams that completed a sync within the last hour — drives the
+    /// "N upstreams synced" banner (0 = no banner).
+    pub ap_fresh_ups: usize,
     /// True when the queue exceeds the per-bucket display cap (lists truncated).
     pub ap_capped: bool,
     pub ap_groups: Vec<ApprovalGroup>,
@@ -798,6 +808,7 @@ mod tests {
             ap_cooldown,
             ap_held,
             ap_synced: "2m".to_owned(),
+            ap_fresh_ups: 0,
             ap_capped: false,
             ap_groups,
             ap_cooldowns,
@@ -843,12 +854,15 @@ mod tests {
                 }],
                 more: 2,
                 expanded: true,
+                via: "via mage-os · public".to_owned(),
             }],
             vec![CooldownCard {
                 package: "acme/blocks".to_owned(),
                 version: "v3.3.0".to_owned(),
                 normalized: "3.3.0.0".to_owned(),
                 days_left: 2,
+                days_ago: 1,
+                days_total: 3,
                 pct: 33,
             }],
             vec![HeldCard {

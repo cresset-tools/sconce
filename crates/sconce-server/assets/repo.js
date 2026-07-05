@@ -96,17 +96,48 @@ for (const form of document.querySelectorAll('form[data-confirm]')) {
       });
     }
 
-    // Selection → bulk-approve bar.
+    // "Show all N" reveals the rows collapsed past the first few.
+    for (const btn of queue.querySelectorAll('.apmore .showall')) {
+      btn.addEventListener('click', () => {
+        btn.closest('.apgroup').classList.add('showall');
+      });
+    }
+
+    // Just-synced banner: scroll to the queue, or dismiss for this session.
+    const banner = document.getElementById('ap-banner');
+    if (banner) {
+      const key = 'ap-banner:' + banner.dataset.key;
+      if (sessionStorage.getItem(key)) banner.remove();
+      document.getElementById('ap-review')?.addEventListener('click', () => {
+        queue.querySelector('.apbody')?.scrollIntoView({ behavior: 'smooth' });
+      });
+      document.getElementById('ap-banner-x')?.addEventListener('click', () => {
+        sessionStorage.setItem(key, '1');
+        banner.remove();
+      });
+    }
+
+    // Selection → bulk approve/hold bar.
     const bulk = document.getElementById('ap-bulk');
     const selVals = document.getElementById('ap-selvals');
+    const selValsHold = document.getElementById('ap-selvals-hold');
     const selN = document.getElementById('ap-seln');
+    const selNBtn = document.getElementById('ap-selnb');
+    const selAcross = document.getElementById('ap-across');
     const clear = document.getElementById('ap-clear');
     const boxes = [...queue.querySelectorAll('.apvcheck')];
 
     const refresh = () => {
       const picked = boxes.filter((b) => b.checked);
       selVals.value = picked.map((b) => b.dataset.val).join('\n');
+      if (selValsHold) selValsHold.value = selVals.value;
       selN.textContent = picked.length;
+      if (selNBtn) selNBtn.textContent = picked.length;
+      if (selAcross) {
+        const pkgs = new Set(picked.map((b) => b.dataset.val.split('|')[0]));
+        selAcross.textContent =
+          pkgs.size > 1 ? `across ${pkgs.size} packages` : '';
+      }
       bulk.hidden = picked.length === 0;
       // Reflect each group's row selection in its header checkbox.
       for (const head of queue.querySelectorAll('.apgcheck')) {

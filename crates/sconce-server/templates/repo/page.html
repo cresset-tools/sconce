@@ -138,6 +138,16 @@
       {% if !ap_synced.is_empty() %}<span class=apsync><span class=dot></span>synced {{ ap_synced }} ago</span>{% endif %}
     </div>
 
+    {# just-synced banner: upstreams completed a sync in the last hour #}
+    {% if ap_fresh_ups > 0 && ap_pending + ap_cooldown > 0 %}
+    <div class=apbanner id=ap-banner data-key="{{ org }}/{{ repo }}">
+      <span class=ico><svg width=15 height=15 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M21 12a9 9 0 0 1-15 6.7L3 16M3 12a9 9 0 0 1 15-6.7L21 8"></path></svg></span>
+      <div class=txt><strong>{{ ap_fresh_ups }} upstream(s) synced</strong> — <span>{{ ap_pending + ap_cooldown }} version(s) are awaiting a decision. Review them in package groups and approve in bulk.</span></div>
+      <button type=button class=review id=ap-review>Review newest</button>
+      <button type=button class=x id=ap-banner-x aria-label="Dismiss"><svg width=15 height=15 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.2 stroke-linecap=round><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
+    </div>
+    {% endif %}
+
     {# toolbar: filter chips + package search #}
     <div class=aptool>
       <div class=apfilters id=ap-filters>
@@ -155,10 +165,15 @@
     {# bulk action bar (revealed by JS when versions are ticked) #}
     <div class=apbulk id=ap-bulk hidden>
       <span class=mark><svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=3 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg></span>
-      <span class=n><strong id=ap-seln>0</strong> selected</span>
+      <span class=n><strong id=ap-seln>0</strong> pending selected</span>
+      <span class=across id=ap-across></span>
       <form method=post action="/r/{{ org }}/{{ repo }}/approve-bulk" class=inline>
         <input type=hidden name=versions id=ap-selvals>
-        <button class="ok" type=submit><svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>Approve selected</button>
+        <button class="ok" type=submit><svg width=14 height=14 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>Approve <span id=ap-selnb>0</span></button>
+      </form>
+      <form method=post action="/r/{{ org }}/{{ repo }}/hold-bulk" class=inline>
+        <input type=hidden name=versions id=ap-selvals-hold>
+        <button class=holdb type=submit><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><rect x=5 y=11 width=14 height=9 rx=2></rect><path d="M8 11V8a4 4 0 0 1 8 0v3"></path></svg>Hold</button>
       </form>
       <button type=button id=ap-clear>Clear</button>
     </div>
@@ -175,14 +190,16 @@
             <button type=button class=apchev aria-label="Expand"><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M9 6l6 6-6 6"></path></svg></button>
             <code class=pkg><a href="/r/{{ org }}/{{ repo }}/p/{{ g.package }}">{{ g.package }}</a></code>
             <span class="badge violet">{{ g.count }} pending</span>
+            {% if !g.via.is_empty() %}<span class=via>{{ g.via }}</span>{% endif %}
             <form class="apall inline" method=post action="/r/{{ org }}/{{ repo }}/approve-bulk">
               <input type=hidden name=package value="{{ g.package }}">
               <button class=approveall type=submit><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M5 12l4 4 10-10"></path></svg>Approve all {{ g.count }}</button>
             </form>
           </div>
           <div class=apgrows>
+            {# rows past the first 4 (the handler's AP_ROWS) collapse behind "Show all" #}
             {% for v in g.rows %}
-            <div class=aprow>
+            <div class="aprow{% if loop.index0 >= 4 %} xtra{% endif %}">
               <input type=checkbox class=apvcheck data-val="{{ v.package }}|{{ v.normalized }}" aria-label="Select {{ v.version }}">
               <code class=ver>{{ v.version }}</code>
               <span class="badge {{ v.stab_tone }}">{{ v.stability }}</span>
@@ -194,7 +211,7 @@
               </span>
             </div>
             {% endfor %}
-            {% if g.more > 0 %}<div class=apmore><span></span>+ {{ g.more }} more version(s) in this batch<a href="/r/{{ org }}/{{ repo }}/p/{{ g.package }}">View package</a></div>{% endif %}
+            {% if g.more > 0 %}<div class=apmore><span></span>+ {{ g.more }} more version(s) in this batch<button type=button class=showall>Show all {{ g.count }}</button></div>{% endif %}
           </div>
         </div>
         {% endfor %}
@@ -213,6 +230,7 @@
             <span class=left>{{ c.days_left }}d left</span>
             <form class="apearly inline" method=post action="/r/{{ org }}/{{ repo }}/version"><input type=hidden name=package value="{{ c.package }}"><input type=hidden name=normalized value="{{ c.normalized }}"><button name=action value=approve>Approve early</button></form>
           </div>
+          <div class=cap><span>released {{ c.days_ago }}d ago</span><span>auto-exposes in {{ c.days_left }}d · {{ c.days_total }}-day cooldown</span></div>
           <div class=bar><span style="width:{{ c.pct }}%"></span></div>
         </div>
         {% endfor %}

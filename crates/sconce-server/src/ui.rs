@@ -174,6 +174,7 @@ pub fn router(
         .route("/r/{org}/{repo}/policy", post(set_policy))
         .route("/r/{org}/{repo}/version", post(version_action))
         .route("/r/{org}/{repo}/approve-bulk", post(approve_bulk))
+        .route("/r/{org}/{repo}/hold-bulk", post(hold_bulk))
         .route("/r/{org}/{repo}/token", post(create_token))
         .route("/r/{org}/{repo}/token/revoke", post(revoke_token))
         .route("/r/{org}/{repo}/token/policy", post(set_token_policy))
@@ -2791,13 +2792,40 @@ async fn repo_page(
                 version: v.version.clone(),
                 normalized: v.normalized_version.clone(),
                 days_left: left,
+                days_ago: (total - left).max(0),
+                days_total: total,
                 pct: (((total - left).max(0) * 100) / total).clamp(0, 100),
             }
         })
         .collect();
 
+    // "via {upstream} · {visibility}" provenance for a group header.
+    let upstream_name = |id: Uuid| {
+        upstreams.iter().find(|u| u.id == id).map(|u| {
+            u.label.clone().unwrap_or_else(|| {
+                u.base
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .to_owned()
+            })
+        })
+    };
+    let group_via = |pkg: &str| {
+        packages
+            .iter()
+            .find(|p| p.name == pkg)
+            .map_or_else(String::new, |p| {
+                p.upstream_id.and_then(upstream_name).map_or_else(
+                    || p.visibility.clone(),
+                    |up| format!("via {up} · {}", p.visibility),
+                )
+            })
+    };
+
     // Pending versions (awaiting approval) grouped by package. They arrive
-    // ordered by (package, version), so consecutive runs share a package.
+    // ordered by (package, version), so consecutive runs share a package. Every
+    // row is rendered; the template collapses rows past the first few behind an
+    // inline "Show all N".
     let mut ap_groups: Vec<views::ApprovalGroup> = Vec::new();
     for v in pending_versions.iter().filter(|v| !is_cooling(v)) {
         let row = views::ApprovalVer {
@@ -2816,11 +2844,10 @@ async fn repo_page(
         match ap_groups.last_mut() {
             Some(g) if g.package == v.package => {
                 g.count += 1;
-                if g.rows.len() < AP_ROWS {
-                    g.rows.push(row);
-                } else {
+                if g.rows.len() >= AP_ROWS {
                     g.more += 1;
                 }
+                g.rows.push(row);
             }
             _ => ap_groups.push(views::ApprovalGroup {
                 package: v.package.clone(),
@@ -2828,12 +2855,14 @@ async fn repo_page(
                 rows: vec![row],
                 more: 0,
                 expanded: false,
+                via: group_via(&v.package),
             }),
         }
     }
-    // Expand the largest batch by default (matches the design's open group).
-    if let Some((i, _)) = ap_groups.iter().enumerate().max_by_key(|(_, g)| g.count) {
-        ap_groups[i].expanded = true;
+    // Largest batch first and expanded by default (the design's open group).
+    ap_groups.sort_by(|a, b| b.count.cmp(&a.count).then(a.package.cmp(&b.package)));
+    if let Some(g) = ap_groups.first_mut() {
+        g.expanded = true;
     }
     let ap_pending: usize = ap_groups.iter().map(|g| g.count).sum();
 
@@ -2857,6 +2886,12 @@ async fn repo_page(
         .filter_map(|u| u.last_sync_age)
         .min()
         .map_or_else(String::new, ago);
+    // "N upstreams synced" banner: upstreams whose last sync completed within
+    // the past hour (only worth announcing while there's something to review).
+    let ap_fresh_ups = upstreams
+        .iter()
+        .filter(|u| matches!(u.last_sync_age, Some(a) if a < 3600))
+        .count();
 
     // ---- Policy: grants + autogrant rules ----
     let grant_rows: Vec<views::GrantRow> = grants
@@ -3129,6 +3164,7 @@ async fn repo_page(
         pager,
         ap_total,
         ap_pending,
+        ap_fresh_ups,
         ap_cooldown,
         ap_held,
         ap_synced,
@@ -3260,6 +3296,29 @@ async fn approve_bulk(
         // No `versions` field → a whole-package or repo-wide "Approve all".
         let pkg = f.package.as_deref().filter(|x| !x.is_empty());
         s.catalog.approve_all_pending(id, pkg).await.map_err(e500)?;
+    }
+    Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+/// Bulk-hold the ticked versions from the Approvals selection bar. Only an
+/// explicit selection is accepted — there is deliberately no repo-wide
+/// "hold everything".
+async fn hold_bulk(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<ApproveBulkForm>,
+) -> Result<Redirect, StatusCode> {
+    let id = lookup(&s, &user, &org, &repo).await?.id;
+    if let Some(list) = f.versions.as_deref() {
+        for line in list.lines() {
+            if let Some((pkg, norm)) = line.split_once('|') {
+                let (pkg, norm) = (pkg.trim(), norm.trim());
+                if !pkg.is_empty() && !norm.is_empty() {
+                    s.catalog.hold_version(id, pkg, norm).await.map_err(e500)?;
+                }
+            }
+        }
     }
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
 }
