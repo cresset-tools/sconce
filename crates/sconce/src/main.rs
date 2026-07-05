@@ -315,6 +315,13 @@ enum Command {
         database_url: String,
     },
 
+    /// Show or set an org's entitlements — the neutral per-org resource throttle
+    /// the hosted control plane drives (self-host leaves it unset = unlimited).
+    Entitlements {
+        #[command(subcommand)]
+        action: EntitlementsAction,
+    },
+
     /// Show or change a repo's token-policy overrides (tighten-only vs the org).
     RepoSettings {
         /// Repository, as `<org>/<repo>`.
@@ -695,6 +702,45 @@ enum DepsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum EntitlementsAction {
+    /// Show an org's effective entitlements (and whether they're the unlimited
+    /// self-host default or an explicit control-plane row).
+    Show {
+        #[arg(long)]
+        org: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Set an org's entitlements. `--features` is the *complete* set of enabled
+    /// features (comma-separated machine names); any not listed are disabled.
+    /// Omit a cap flag to leave it unlimited.
+    Set {
+        #[arg(long)]
+        org: String,
+        /// Enabled features, comma-separated (e.g. `agency,sso,scim`). Empty
+        /// disables all. Known: `agency`, `sso`, `multi_oidc`, `repo_access`,
+        /// `scim`, `audit_log`, `custom_hostname`, `white_label`.
+        #[arg(long, default_value = "")]
+        features: String,
+        /// Hard SKU cap (sellable editions). Omit for unlimited.
+        #[arg(long)]
+        max_skus: Option<i32>,
+        /// Advisory storage limit in GB (drives a UI warning; never blocks).
+        #[arg(long)]
+        storage_soft_gb: Option<i64>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Remove an org's entitlements row → back to the unlimited default.
+    Clear {
+        #[arg(long)]
+        org: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum PackageAction {
     /// List packages with their lifecycle (healthy / broken / archived / stale).
     List {
@@ -941,6 +987,7 @@ fn main() -> Result<()> {
             database_url,
         } => gc(cas.as_deref(), grace_hours, dry_run, &database_url),
         Command::Usage { org, database_url } => usage(org.as_deref(), &database_url),
+        Command::Entitlements { action } => entitlements(action),
         Command::RepoSettings {
             repo,
             allow_raw_tokens,
@@ -1662,6 +1709,115 @@ fn usage(org: Option<&str>, database_url: &str) -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     })
+}
+
+fn entitlements(action: EntitlementsAction) -> Result<()> {
+    use sconce_catalog::{Catalog, Entitlements, Feature};
+
+    let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    runtime.block_on(async {
+        let (org, database_url) = match &action {
+            EntitlementsAction::Show { org, database_url }
+            | EntitlementsAction::Set {
+                org, database_url, ..
+            }
+            | EntitlementsAction::Clear { org, database_url } => {
+                (org.clone(), database_url.clone())
+            }
+        };
+        let catalog = Catalog::connect(&database_url)
+            .await
+            .context("connecting to Postgres")?;
+        catalog.migrate().await.context("applying migrations")?;
+        let org_id = catalog
+            .org_id_by_slug(&org)
+            .await?
+            .with_context(|| format!("no such org: {org}"))?;
+
+        match action {
+            EntitlementsAction::Show { .. } => {
+                let e = catalog.entitlements(org_id).await?;
+                let explicit = catalog.has_entitlements(org_id).await?;
+                println!(
+                    "{org}: {}",
+                    if explicit {
+                        "explicit entitlements (control-plane set)"
+                    } else {
+                        "unlimited (no row — self-host default)"
+                    }
+                );
+                for f in Feature::all() {
+                    println!(
+                        "  {:<16} {}",
+                        f.as_str(),
+                        if e.allows(f) { "on" } else { "off" }
+                    );
+                }
+                println!(
+                    "  {:<16} {}",
+                    "max_skus",
+                    e.max_skus
+                        .map_or_else(|| "unlimited".to_owned(), |n| n.to_string())
+                );
+                println!(
+                    "  {:<16} {}",
+                    "storage_soft",
+                    e.storage_soft_bytes
+                        .map_or_else(|| "none".to_owned(), human_bytes)
+                );
+            }
+            EntitlementsAction::Set {
+                features,
+                max_skus,
+                storage_soft_gb,
+                ..
+            } => {
+                let mut e = Entitlements::unlimited();
+                // --features is the complete enabled set; everything else off.
+                for f in Feature::all() {
+                    let on = false;
+                    set_feature(&mut e, f, on);
+                }
+                for name in features.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let f =
+                        Feature::parse(name).with_context(|| format!("unknown feature: {name}"))?;
+                    set_feature(&mut e, f, true);
+                }
+                e.max_skus = max_skus;
+                e.storage_soft_bytes =
+                    storage_soft_gb.map(|gb| gb.saturating_mul(1024 * 1024 * 1024));
+                catalog.set_org_entitlements(org_id, &e).await?;
+                println!("entitlements set for {org}.");
+            }
+            EntitlementsAction::Clear { .. } => {
+                let removed = catalog.clear_org_entitlements(org_id).await?;
+                println!(
+                    "{org}: {}",
+                    if removed {
+                        "entitlements cleared → unlimited"
+                    } else {
+                        "no entitlements row (already unlimited)"
+                    }
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+/// Toggle one feature flag on an [`Entitlements`] in place.
+fn set_feature(e: &mut sconce_catalog::Entitlements, f: sconce_catalog::Feature, on: bool) {
+    use sconce_catalog::Feature;
+    match f {
+        Feature::Agency => e.agency = on,
+        Feature::Sso => e.sso = on,
+        Feature::MultiOidc => e.multi_oidc = on,
+        Feature::RepoAccess => e.repo_access = on,
+        Feature::Scim => e.scim = on,
+        Feature::AuditLog => e.audit_log = on,
+        Feature::CustomHostname => e.custom_hostname = on,
+        Feature::WhiteLabel => e.white_label = on,
+    }
 }
 
 /// The worker loop: claim and run jobs, then wait on NOTIFY (with a poll

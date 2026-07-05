@@ -415,6 +415,14 @@ fn e500<E>(_: E) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
+/// Map an entitlement-gated failure: a plan denial is `403`, a query error `500`.
+fn ent_status(e: &sconce_catalog::EntitlementError) -> StatusCode {
+    match e {
+        sconce_catalog::EntitlementError::Denied(_) => StatusCode::FORBIDDEN,
+        sconce_catalog::EntitlementError::Sqlx(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Human-readable byte count (base-1024) for the storage-usage display.
 fn human_bytes(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -778,7 +786,7 @@ async fn save_oidc(
     s.catalog
         .set_oidc_connection(Some(&org), &conn)
         .await
-        .map_err(e500)?;
+        .map_err(|e| ent_status(&e))?;
     Ok(Redirect::to(&format!("/o/{org}/settings")))
 }
 
@@ -793,7 +801,7 @@ async fn gen_scim_token(
         .catalog
         .create_scim_token(&org)
         .await
-        .map_err(e500)?
+        .map_err(|e| ent_status(&e))?
         .ok_or(StatusCode::NOT_FOUND)?;
     let view = views::ScimToken {
         org: org.clone(),
@@ -3562,7 +3570,7 @@ async fn add_autogrant(
             s.catalog
                 .add_grant_rule(summary.id, set_id)
                 .await
-                .map_err(e500)?;
+                .map_err(|e| ent_status(&e))?;
             Ok(Redirect::to(&format!("/r/{org}/{repo}")))
         }
         _ => Err(StatusCode::BAD_REQUEST),

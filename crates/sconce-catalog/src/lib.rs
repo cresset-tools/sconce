@@ -75,6 +75,143 @@ pub struct OrgStorage {
     pub usage: StorageUsage,
 }
 
+/// A gate-able capability. The hosted control plane turns these off per org to
+/// match a plan; the open engine only asks "is it allowed here?" (see
+/// [`Entitlements`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    Agency,
+    Sso,
+    MultiOidc,
+    RepoAccess,
+    Scim,
+    AuditLog,
+    CustomHostname,
+    WhiteLabel,
+}
+
+impl Feature {
+    /// Stable machine name (CLI input, error text).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Feature::Agency => "agency",
+            Feature::Sso => "sso",
+            Feature::MultiOidc => "multi_oidc",
+            Feature::RepoAccess => "repo_access",
+            Feature::Scim => "scim",
+            Feature::AuditLog => "audit_log",
+            Feature::CustomHostname => "custom_hostname",
+            Feature::WhiteLabel => "white_label",
+        }
+    }
+
+    /// Parse a machine name (for the CLI); `None` if unknown.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "agency" => Feature::Agency,
+            "sso" => Feature::Sso,
+            "multi_oidc" => Feature::MultiOidc,
+            "repo_access" => Feature::RepoAccess,
+            "scim" => Feature::Scim,
+            "audit_log" => Feature::AuditLog,
+            "custom_hostname" => Feature::CustomHostname,
+            "white_label" => Feature::WhiteLabel,
+            _ => return None,
+        })
+    }
+
+    /// Every feature, in a stable order (for `entitlements show` and setters).
+    #[must_use]
+    pub fn all() -> [Feature; 8] {
+        [
+            Feature::Agency,
+            Feature::Sso,
+            Feature::MultiOidc,
+            Feature::RepoAccess,
+            Feature::Scim,
+            Feature::AuditLog,
+            Feature::CustomHostname,
+            Feature::WhiteLabel,
+        ]
+    }
+}
+
+impl std::fmt::Display for Feature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The resource limits + feature switches in force for one org. **Unlimited /
+/// all-on by default** ([`Entitlements::unlimited`]): the resolver returns that
+/// when no `org_entitlements` row exists, so a self-hosted instance — which
+/// never writes one — is unconstrained.
+// A flat bag of independent feature flags; enums would just add indirection.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entitlements {
+    /// Advisory storage limit for UI warnings (null = none). Never blocks.
+    pub storage_soft_bytes: Option<i64>,
+    /// Hard cap on sellable editions/SKUs (null = unlimited).
+    pub max_skus: Option<i32>,
+    pub agency: bool,
+    pub sso: bool,
+    pub multi_oidc: bool,
+    pub repo_access: bool,
+    pub scim: bool,
+    pub audit_log: bool,
+    pub custom_hostname: bool,
+    pub white_label: bool,
+}
+
+impl Entitlements {
+    /// The permissive default: every feature on, no caps. What a missing row
+    /// resolves to (self-host, and fail-open per `BILLING_PLAN` P2).
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self {
+            storage_soft_bytes: None,
+            max_skus: None,
+            agency: true,
+            sso: true,
+            multi_oidc: true,
+            repo_access: true,
+            scim: true,
+            audit_log: true,
+            custom_hostname: true,
+            white_label: true,
+        }
+    }
+
+    /// Whether `feature` is enabled.
+    #[must_use]
+    pub fn allows(&self, feature: Feature) -> bool {
+        match feature {
+            Feature::Agency => self.agency,
+            Feature::Sso => self.sso,
+            Feature::MultiOidc => self.multi_oidc,
+            Feature::RepoAccess => self.repo_access,
+            Feature::Scim => self.scim,
+            Feature::AuditLog => self.audit_log,
+            Feature::CustomHostname => self.custom_hostname,
+            Feature::WhiteLabel => self.white_label,
+        }
+    }
+}
+
+/// Failure from an entitlement-gated mutation: either the org's plan doesn't
+/// include the [`Feature`], or the underlying query failed. `From<sqlx::Error>`
+/// lets gated methods keep using `?` on their existing queries.
+#[derive(Debug, thiserror::Error)]
+pub enum EntitlementError {
+    #[error("the '{0}' feature is not available on this organization's plan")]
+    Denied(Feature),
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+}
+
 /// The error type returned by catalog operations (re-exported so consumers can
 /// handle it without depending on `sqlx` directly).
 pub use sqlx::Error as SqlxError;
@@ -211,6 +348,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0036_blob_refcount_gc",
         include_str!("../migrations/0036_blob_refcount_gc.sql"),
+    ),
+    (
+        "0037_org_entitlements",
+        include_str!("../migrations/0037_org_entitlements.sql"),
     ),
 ];
 
@@ -1495,7 +1636,10 @@ impl Catalog {
         &self,
         target_repo_id: Uuid,
         set_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), EntitlementError> {
+        // Autogrant (a shared-repo "house bundle") is the agency-mode feature.
+        let org_id = self.org_of_repo(target_repo_id).await?;
+        self.require_feature(org_id, Feature::Agency).await?;
         sqlx::query(
             "insert into repository_grant_rules (target_repo_id, set_id) values ($1, $2) \
              on conflict do nothing",
@@ -1790,7 +1934,7 @@ impl Catalog {
         &self,
         org_slug: Option<&str>,
         c: &OidcConnection,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), EntitlementError> {
         let mut tx = self.pool.begin().await?;
         // Resolve the org (if any) up front so an unknown slug is a clean error.
         let org_id: Option<Uuid> = match org_slug {
@@ -1802,6 +1946,11 @@ impl Catalog {
                     .await?,
             ),
         };
+        // Org-scoped SSO is the gated tenant feature; the instance default
+        // (org_slug None) is the operator's own login and always allowed.
+        if let Some(id) = org_id {
+            self.require_feature(id, Feature::Sso).await?;
+        }
         match org_id {
             None => {
                 sqlx::query("delete from oidc_connections where org_id is null")
@@ -1997,7 +2146,10 @@ impl Catalog {
 
     /// Create (replace) an org's SCIM bearer token; returns the plaintext once.
     /// `None` if the org is unknown.
-    pub async fn create_scim_token(&self, org_slug: &str) -> Result<Option<String>, sqlx::Error> {
+    pub async fn create_scim_token(
+        &self,
+        org_slug: &str,
+    ) -> Result<Option<String>, EntitlementError> {
         let Some(org_id): Option<Uuid> =
             sqlx::query_scalar("select id from organizations where slug = $1")
                 .bind(org_slug)
@@ -2006,6 +2158,7 @@ impl Catalog {
         else {
             return Ok(None);
         };
+        self.require_feature(org_id, Feature::Scim).await?;
         let token = generate_secret("scim_");
         sqlx::query(
             "insert into scim_tokens (org_id, token_hash) values ($1, $2) \
@@ -2442,6 +2595,129 @@ impl Catalog {
                 },
             )
             .collect())
+    }
+
+    /// The entitlements in force for an org. **Returns [`Entitlements::unlimited`]
+    /// when no row exists** — so a self-hosted instance, which never writes one,
+    /// is unconstrained, and a gate failure-mode is open (`BILLING_PLAN` P2).
+    pub async fn entitlements(&self, org_id: Uuid) -> Result<Entitlements, sqlx::Error> {
+        // (storage_soft_bytes, max_skus, then the 8 feature flags in column order).
+        type Row = (
+            Option<i64>,
+            Option<i32>,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "select storage_soft_bytes, max_skus, feat_agency, feat_sso, feat_multi_oidc, \
+                    feat_repo_access, feat_scim, feat_audit_log, feat_custom_hostname, feat_white_label \
+             from org_entitlements where org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map_or_else(Entitlements::unlimited, |r| Entitlements {
+            storage_soft_bytes: r.0,
+            max_skus: r.1,
+            agency: r.2,
+            sso: r.3,
+            multi_oidc: r.4,
+            repo_access: r.5,
+            scim: r.6,
+            audit_log: r.7,
+            custom_hostname: r.8,
+            white_label: r.9,
+        }))
+    }
+
+    /// Whether an org even has an explicit entitlements row (vs. the unlimited
+    /// default). For display — "self-host / unlimited" vs "constrained".
+    pub async fn has_entitlements(&self, org_id: Uuid) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("select exists(select 1 from org_entitlements where org_id = $1)")
+            .bind(org_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Set (upsert) an org's entitlements — the control plane's write path.
+    pub async fn set_org_entitlements(
+        &self,
+        org_id: Uuid,
+        e: &Entitlements,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into org_entitlements \
+                 (org_id, storage_soft_bytes, max_skus, feat_agency, feat_sso, feat_multi_oidc, \
+                  feat_repo_access, feat_scim, feat_audit_log, feat_custom_hostname, feat_white_label, \
+                  updated_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now()) \
+             on conflict (org_id) do update set \
+                 storage_soft_bytes = excluded.storage_soft_bytes, \
+                 max_skus = excluded.max_skus, \
+                 feat_agency = excluded.feat_agency, \
+                 feat_sso = excluded.feat_sso, \
+                 feat_multi_oidc = excluded.feat_multi_oidc, \
+                 feat_repo_access = excluded.feat_repo_access, \
+                 feat_scim = excluded.feat_scim, \
+                 feat_audit_log = excluded.feat_audit_log, \
+                 feat_custom_hostname = excluded.feat_custom_hostname, \
+                 feat_white_label = excluded.feat_white_label, \
+                 updated_at = now()",
+        )
+        .bind(org_id)
+        .bind(e.storage_soft_bytes)
+        .bind(e.max_skus)
+        .bind(e.agency)
+        .bind(e.sso)
+        .bind(e.multi_oidc)
+        .bind(e.repo_access)
+        .bind(e.scim)
+        .bind(e.audit_log)
+        .bind(e.custom_hostname)
+        .bind(e.white_label)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove an org's entitlements row → back to the unlimited default.
+    pub async fn clear_org_entitlements(&self, org_id: Uuid) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query("delete from org_entitlements where org_id = $1")
+            .bind(org_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Gate a mutation on a feature: `Ok(())` if the org's plan includes it,
+    /// [`EntitlementError::Denied`] otherwise. Called at the top of gated
+    /// catalog methods so both the UI and CLI paths are covered at one choke
+    /// point.
+    async fn require_feature(
+        &self,
+        org_id: Uuid,
+        feature: Feature,
+    ) -> Result<(), EntitlementError> {
+        if self.entitlements(org_id).await?.allows(feature) {
+            Ok(())
+        } else {
+            Err(EntitlementError::Denied(feature))
+        }
+    }
+
+    /// Resolve the org that owns a repo (helper for repo-scoped feature gates).
+    async fn org_of_repo(&self, repo_id: Uuid) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar("select org_id from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
     }
 
     /// Upsert a package by name **within a repository**, returning its id.
@@ -6190,6 +6466,16 @@ mod tests {
             .unwrap()
     }
 
+    /// `storage_stats` aggregates the **global** blob table, so its before/after
+    /// deltas race any parallel test that inserts or deletes blobs. Serialize the
+    /// blob-touching tests behind one lock. (`#[tokio::test]` is current-thread,
+    /// so holding this std guard across awaits is fine.)
+    fn serial_blobs() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn org_of_repo(cat: &Catalog, repo_id: Uuid) -> Uuid {
         sqlx::query_scalar("select org_id from repositories where id = $1")
             .bind(repo_id)
@@ -6231,7 +6517,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds `serial_blobs()` across awaits by design (current-thread test rt).
+    #[allow(clippy::await_holding_lock)]
     async fn triggers_maintain_blob_refcount() {
+        let _serial = serial_blobs();
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
@@ -6264,7 +6553,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds `serial_blobs()` across awaits by design (current-thread test rt).
+    #[allow(clippy::await_holding_lock)]
     async fn gc_collects_only_orphans_past_grace() {
+        let _serial = serial_blobs();
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
@@ -6312,7 +6604,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entitlements_default_unlimited_and_gate_after_disable() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of_repo(&cat, repo_id).await;
+
+        // No row → unlimited default; every feature allowed.
+        assert!(!cat.has_entitlements(org_id).await.unwrap());
+        let e = cat.entitlements(org_id).await.unwrap();
+        assert!(e.allows(Feature::Agency) && e.allows(Feature::Scim) && e.allows(Feature::Sso));
+        assert_eq!(e.max_skus, None);
+
+        // A gated mutation succeeds while unlimited.
+        let set_id = cat.create_package_set(org_id, "bundle").await.unwrap();
+        let slug = sqlx::query_scalar::<_, String>("select slug from organizations where id = $1")
+            .bind(org_id)
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap();
+        cat.add_grant_rule(repo_id, set_id).await.unwrap();
+        assert!(cat.create_scim_token(&slug).await.unwrap().is_some());
+
+        // Constrain the org: agency + scim off (sso left on).
+        let mut ent = Entitlements::unlimited();
+        ent.agency = false;
+        ent.scim = false;
+        ent.max_skus = Some(15);
+        cat.set_org_entitlements(org_id, &ent).await.unwrap();
+        assert!(cat.has_entitlements(org_id).await.unwrap());
+
+        // Both gates now deny with the specific feature; sso would still pass.
+        assert!(
+            matches!(
+                cat.add_grant_rule(repo_id, set_id).await,
+                Err(EntitlementError::Denied(Feature::Agency))
+            ),
+            "autogrant gated once agency is off"
+        );
+        assert!(matches!(
+            cat.create_scim_token(&slug).await,
+            Err(EntitlementError::Denied(Feature::Scim))
+        ));
+
+        // Clearing restores unlimited and the gate reopens.
+        assert!(cat.clear_org_entitlements(org_id).await.unwrap());
+        assert!(!cat.has_entitlements(org_id).await.unwrap());
+        cat.add_grant_rule(repo_id, set_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    // Holds `serial_blobs()` across awaits by design (current-thread test rt).
+    #[allow(clippy::await_holding_lock)]
     async fn org_storage_meters_full_size_without_dedup_credit() {
+        let _serial = serial_blobs();
         let Some((cat, repo_a)) = repo().await else {
             return;
         };
@@ -6358,7 +6703,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds `serial_blobs()` across awaits by design (current-thread test rt).
+    #[allow(clippy::await_holding_lock)]
     async fn storage_stats_counts_orphans() {
+        let _serial = serial_blobs();
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
