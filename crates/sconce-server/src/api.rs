@@ -107,6 +107,9 @@ fn license_json(s: &AppState, org: &str, repo: &str, d: &LicenseDetail) -> Value
         "status": d.status,
         "edition": d.edition,
         "packages": d.packages,
+        // Recovered plaintext key (null if no secret key is configured). Auth
+        // never uses this — it's for showing the buyer their key.
+        "key": d.key,
         "bound": { "until": d.bound.until, "major": d.bound.major },
         "install": {
             "repository_url": url,

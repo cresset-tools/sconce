@@ -362,6 +362,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0039_service_tokens",
         include_str!("../migrations/0039_service_tokens.sql"),
     ),
+    (
+        "0040_license_key_ciphertext",
+        include_str!("../migrations/0040_license_key_ciphertext.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -372,6 +376,9 @@ const MIGRATE_LOCK: i64 = 6_927_654_321;
 #[derive(Debug, Clone)]
 pub struct Catalog {
     pool: PgPool,
+    /// At-rest key for recoverable secrets (license keys), from `SCONCE_SECRET_KEY`.
+    /// `None` ⇒ keys are hash-only (not recoverable), same policy as credentials.
+    secret_key: Option<secret::SecretKey>,
 }
 
 /// An organization (tenant) in the admin listing.
@@ -905,6 +912,9 @@ pub struct LicenseDetail {
     /// Package names the key currently resolves to (by-reference sets included).
     pub packages: Vec<String>,
     pub bound: LicenseBound,
+    /// The plaintext key, recovered from at-rest ciphertext — `None` if no secret
+    /// key is configured or the key predates encrypted storage.
+    pub key: Option<String>,
 }
 
 /// A management-API service token in a listing (the token itself is never
@@ -1108,13 +1118,32 @@ impl Catalog {
     /// `postgres://user:pass@host:5432/db`).
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = PgPool::connect(database_url).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            secret_key: secret::SecretKey::from_env().ok(),
+        })
     }
 
-    /// Build from an existing pool.
+    /// Build from an existing pool (loads `SCONCE_SECRET_KEY` from the env).
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            secret_key: secret::SecretKey::from_env().ok(),
+        }
+    }
+
+    /// Build from a pool with an explicit at-rest key (for tests / callers that
+    /// load the key themselves rather than from the environment).
+    #[must_use]
+    pub fn with_secret(pool: PgPool, secret_key: Option<secret::SecretKey>) -> Self {
+        Self { pool, secret_key }
+    }
+
+    /// Encrypt an issued key for at-rest storage — `None` when no secret key is
+    /// configured (then the key is hash-only and unrecoverable).
+    fn encrypt_key(&self, key: &str) -> Option<Vec<u8>> {
+        self.secret_key.as_ref().map(|k| k.encrypt(key.as_bytes()))
     }
 
     /// Health probe: one round-trip to Postgres (backs the `/healthz`
@@ -4070,12 +4099,13 @@ impl Catalog {
     ) -> Result<(String, Uuid), sqlx::Error> {
         let key = generate_secret("sclk_");
         let id: Uuid = sqlx::query_scalar(
-            "insert into license_keys (repo_id, key_hash, buyer_ref) values ($1, $2, $3) \
-             returning id",
+            "insert into license_keys (repo_id, key_hash, buyer_ref, key_ciphertext) \
+             values ($1, $2, $3, $4) returning id",
         )
         .bind(repo_id)
         .bind(token_hash(&key))
         .bind(buyer_ref)
+        .bind(self.encrypt_key(&key))
         .fetch_one(&self.pool)
         .await?;
         Ok((key, id))
@@ -4108,11 +4138,13 @@ impl Catalog {
         }
         let key = generate_secret("sclk_");
         let license_id: Uuid = sqlx::query_scalar(
-            "insert into license_keys (repo_id, key_hash, buyer_ref) values ($1, $2, $3) returning id",
+            "insert into license_keys (repo_id, key_hash, buyer_ref, key_ciphertext) \
+             values ($1, $2, $3, $4) returning id",
         )
         .bind(repo_id)
         .bind(token_hash(&key))
         .bind(buyer)
+        .bind(self.encrypt_key(&key))
         .fetch_one(&mut *tx)
         .await?;
         for id in ids {
@@ -4585,9 +4617,11 @@ impl Catalog {
         if let Some(idem) = idempotency_key
             && let Some(id) = self.license_id_for_idempotency(repo_id, idem).await?
         {
+            // Replay: return the existing key (recovered from at-rest ciphertext,
+            // if a secret key is configured), so the caller isn't stuck without it.
             return Ok(Some(IssuedLicense {
+                key: self.license_key_plaintext(repo_id, id).await?,
                 id,
-                key: None,
                 created: false,
             }));
         }
@@ -4598,9 +4632,9 @@ impl Catalog {
         let key = generate_secret("sclk_");
         let inserted = sqlx::query(
             "insert into license_keys \
-                 (repo_id, key_hash, buyer_ref, edition_id, idempotency_key, update_until, \
-                  version_cap_major, update_mode, cooldown_days) \
-             select $1, $2, $3, ed.id, $5, \
+                 (repo_id, key_hash, key_ciphertext, buyer_ref, edition_id, idempotency_key, \
+                  update_until, version_cap_major, update_mode, cooldown_days) \
+             select $1, $2, $6, $3, ed.id, $5, \
                     case when ed.bound_kind = 'time' \
                          then now() + make_interval(months => ed.bound_period_months) end, \
                     case when ed.bound_kind = 'version' then ed.bound_major end, \
@@ -4614,6 +4648,7 @@ impl Catalog {
         .bind(buyer)
         .bind(edition_id)
         .bind(idempotency_key)
+        .bind(self.encrypt_key(&key))
         .fetch_optional(&mut *tx)
         .await;
         // Lost the race with a concurrent replay: the partial unique index on
@@ -4623,10 +4658,12 @@ impl Catalog {
             Err(e) if is_unique_violation(&e) => {
                 tx.rollback().await?;
                 let Some(idem) = idempotency_key else { return Err(e) };
-                let id = self.license_id_for_idempotency(repo_id, idem).await?;
-                return Ok(id.map(|id| IssuedLicense {
+                let Some(id) = self.license_id_for_idempotency(repo_id, idem).await? else {
+                    return Ok(None);
+                };
+                return Ok(Some(IssuedLicense {
+                    key: self.license_key_plaintext(repo_id, id).await?,
                     id,
-                    key: None,
                     created: false,
                 }));
             }
@@ -4688,6 +4725,31 @@ impl Catalog {
         .bind(idempotency_key)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// Recover a license key's plaintext from its at-rest ciphertext. `Ok(None)`
+    /// if no secret key is configured, the key wasn't stored encrypted (issued
+    /// before this / with no secret key), the license doesn't exist, or the
+    /// ciphertext fails to decrypt. Auth never uses this — only recovery/display.
+    pub async fn license_key_plaintext(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let Some(secret) = self.secret_key.as_ref() else {
+            return Ok(None);
+        };
+        let ciphertext: Option<Vec<u8>> = sqlx::query_scalar(
+            "select key_ciphertext from license_keys where id = $1 and repo_id = $2",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(ciphertext
+            .and_then(|bytes| secret.decrypt(&bytes).ok())
+            .and_then(|plain| String::from_utf8(plain).ok()))
     }
 
     /// Extend a license key's **time** bound by its edition's period (renewal):
@@ -4755,6 +4817,7 @@ impl Catalog {
         .await?;
         let Some(row) = row else { return Ok(None) };
         let packages = self.entitled_package_names(license_id).await?;
+        let key = self.license_key_plaintext(repo_id, license_id).await?;
         Ok(Some(LicenseDetail {
             id: license_id,
             buyer: row.try_get("buyer").ok().flatten(),
@@ -4766,6 +4829,7 @@ impl Catalog {
                 until_unix: row.try_get("until_unix").ok().flatten(),
                 major: row.try_get("major").ok().flatten(),
             },
+            key,
         }))
     }
 
@@ -7570,6 +7634,91 @@ mod tests {
                 .unwrap()
                 .status,
             "revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_key_is_recoverable_when_secret_configured() {
+        use base64::Engine as _;
+        let Some((base, repo_id)) = repo().await else {
+            return;
+        };
+        // A catalog sharing the DB but with an at-rest key configured.
+        let secret = secret::SecretKey::from_base64(
+            &base64::engine::general_purpose::STANDARD.encode([42u8; 32]),
+        )
+        .unwrap();
+        let cat = Catalog::with_secret(base.pool.clone(), Some(secret));
+        let org_id = org_of_repo(&cat, repo_id).await;
+        cat.upsert_package(repo_id, "acme/a", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let set = cat.singleton_set(org_id, "acme/a").await.unwrap().unwrap();
+        let ed = cat
+            .create_edition(
+                repo_id,
+                "Ann",
+                None,
+                set,
+                &EditionBound::Perpetual,
+                false,
+                &PolicyOverride::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let first = cat
+            .issue_from_edition(repo_id, ed, Some("b"), Some("ord-9"))
+            .await
+            .unwrap()
+            .unwrap();
+        let key = first.key.clone().expect("key on first create");
+        assert!(key.starts_with("sclk_"));
+
+        // Stored encrypted at rest, not as plaintext.
+        let ct: Option<Vec<u8>> =
+            sqlx::query_scalar("select key_ciphertext from license_keys where id = $1")
+                .bind(first.id)
+                .fetch_one(&cat.pool)
+                .await
+                .unwrap();
+        let ct = ct.expect("ciphertext stored");
+        assert_ne!(ct.as_slice(), key.as_bytes(), "key is not plaintext at rest");
+
+        // Recover it directly, on idempotent replay, and via inspect.
+        assert_eq!(
+            cat.license_key_plaintext(repo_id, first.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(key.as_str())
+        );
+        let replay = cat
+            .issue_from_edition(repo_id, ed, Some("b"), Some("ord-9"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!replay.created && replay.id == first.id);
+        assert_eq!(replay.key.as_deref(), Some(key.as_str()), "replay returns the key");
+        assert_eq!(
+            cat.license_detail(repo_id, first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .key
+                .as_deref(),
+            Some(key.as_str())
+        );
+
+        // Without the secret key, the same row is not recoverable.
+        let nosecret = Catalog::with_secret(base.pool.clone(), None);
+        assert!(
+            nosecret
+                .license_key_plaintext(repo_id, first.id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
