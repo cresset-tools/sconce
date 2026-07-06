@@ -2497,6 +2497,18 @@ fn edition_create(
     database_url: &str,
 ) -> Result<()> {
     let bound = sconce_catalog::EditionBound::parse(bound_spec).map_err(|e| anyhow::anyhow!(e))?;
+    // Validate the policy up front, so an invalid value fails here with a clear
+    // message rather than at every later issuance (the license_keys/editions CHECK
+    // constraints would otherwise reject it as an opaque DB error).
+    if let Some(m) = mode {
+        anyhow::ensure!(
+            matches!(m, "auto" | "manual" | "delayed"),
+            "--mode must be auto, manual, or delayed"
+        );
+    }
+    if let Some(d) = cooldown_days {
+        anyhow::ensure!(d >= 0, "--cooldown-days must be >= 0");
+    }
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
         let (org_slug, _) = repo
@@ -2516,10 +2528,16 @@ fn edition_create(
                 .find(|ps| ps.name == s)
                 .map(|ps| ps.id)
                 .with_context(|| format!("no package set '{s}' in {org_slug}"))?,
-            (None, Some(p)) => catalog
-                .singleton_set(org_id, p)
-                .await?
-                .with_context(|| format!("no package '{p}' in {org_slug}"))?,
+            (None, Some(p)) => match catalog.singleton_set(org_id, p).await? {
+                sconce_catalog::SingletonSet::Set(id) => id,
+                sconce_catalog::SingletonSet::UnknownPackage => {
+                    anyhow::bail!("no package '{p}' in {org_slug}")
+                }
+                sconce_catalog::SingletonSet::NameCollision => anyhow::bail!(
+                    "a package set named '{p}' already exists in {org_slug} and isn't a \
+                     singleton — pass --set to sell it, or rename it"
+                ),
+            },
             _ => anyhow::bail!("specify exactly one of --set or --package"),
         };
         let policy = sconce_catalog::PolicyOverride {

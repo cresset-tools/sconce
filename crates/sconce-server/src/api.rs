@@ -12,11 +12,13 @@
 //! - `POST license-keys/{id}/renew` — extend the update bound.
 //! - `DELETE license-keys/{id}` — revoke.
 
-use axum::extract::{Path, State};
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::{AppState, extract_token, repo_base};
@@ -90,6 +92,33 @@ async fn authed_repo(
     }
 }
 
+/// The repository a management-API request is authenticated for, as an axum
+/// extractor. Taking `AuthedRepo(repo_id)` as a handler argument performs the
+/// full bearer-token check ([`authed_repo`]) before the handler body runs — so a
+/// handler on this surface **cannot** serve a request without authenticating: the
+/// auth is in the type signature, not a line each handler must remember to call.
+pub(crate) struct AuthedRepo(pub(crate) Uuid);
+
+impl FromRequestParts<AppState> for AuthedRepo {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Read `{org}`/`{repo}` by name so this works for every /api/v1 route
+        // regardless of whether it also has an `{id}` segment.
+        let Path(params) = Path::<HashMap<String, String>>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError::NotFound("repository"))?;
+        let org = params.get("org").ok_or(ApiError::NotFound("repository"))?;
+        let repo = params.get("repo").ok_or(ApiError::NotFound("repository"))?;
+        authed_repo(state, &parts.headers, org, repo)
+            .await
+            .map(AuthedRepo)
+    }
+}
+
 /// The JSON body for a license — shared by issue / inspect / renew. Carries the
 /// Composer install info so the front-end can render buyer instructions.
 fn license_json(s: &AppState, org: &str, repo: &str, d: &LicenseDetail) -> Value {
@@ -148,10 +177,10 @@ pub(crate) struct IssueReq {
 pub(crate) async fn issue_license(
     State(s): State<AppState>,
     Path((org, repo)): Path<(String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
     headers: HeaderMap,
     Json(req): Json<IssueReq>,
 ) -> Result<Response, ApiError> {
-    let repo_id = authed_repo(&s, &headers, &org, &repo).await?;
     let idem = idempotency_key(&headers);
     let edition_id = s
         .catalog
@@ -187,9 +216,8 @@ pub(crate) async fn issue_license(
 pub(crate) async fn inspect_license(
     State(s): State<AppState>,
     Path((org, repo, id)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    AuthedRepo(repo_id): AuthedRepo,
 ) -> Result<Json<Value>, ApiError> {
-    let repo_id = authed_repo(&s, &headers, &org, &repo).await?;
     let detail = s
         .catalog
         .license_detail(repo_id, parse_license_id(&id)?)
@@ -200,21 +228,27 @@ pub(crate) async fn inspect_license(
 
 /// `POST /api/v1/repos/{org}/{repo}/license-keys/{id}/renew` — extend the time
 /// bound by the edition's period (subscription renewal). `400` if the key isn't
-/// time-bounded (version/perpetual editions renew by issuing a new edition).
+/// time-bounded (version/perpetual editions renew by issuing a new edition) or is
+/// revoked. Idempotent on the `Idempotency-Key` header: a retried renewal webhook
+/// returns the current bound instead of extending the key a second time.
 pub(crate) async fn renew_license(
     State(s): State<AppState>,
     Path((org, repo, id)): Path<(String, String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let repo_id = authed_repo(&s, &headers, &org, &repo).await?;
+    let idem = idempotency_key(&headers);
     let lic = parse_license_id(&id)?;
-    s.catalog.renew_license(repo_id, lic).await?.ok_or_else(|| {
-        ApiError::BadRequest(
-            "license not found, or not issued from a time-bounded edition \
-             (renew a version/perpetual key by issuing a new edition)"
-                .to_owned(),
-        )
-    })?;
+    s.catalog
+        .renew_license(repo_id, lic, idem)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "license not found, revoked, or not issued from a time-bounded edition \
+                 (renew a version/perpetual key by issuing a new edition)"
+                    .to_owned(),
+            )
+        })?;
     let detail = s
         .catalog
         .license_detail(repo_id, lic)
@@ -226,10 +260,9 @@ pub(crate) async fn renew_license(
 /// `DELETE /api/v1/repos/{org}/{repo}/license-keys/{id}` — revoke a key.
 pub(crate) async fn revoke_license(
     State(s): State<AppState>,
-    Path((org, repo, id)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_org, _repo, id)): Path<(String, String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
 ) -> Result<Response, ApiError> {
-    let repo_id = authed_repo(&s, &headers, &org, &repo).await?;
     if s.catalog.revoke_license(repo_id, parse_license_id(&id)?).await? {
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
@@ -241,10 +274,9 @@ pub(crate) async fn revoke_license(
 /// commerce product to a SKU.
 pub(crate) async fn list_editions(
     State(s): State<AppState>,
-    Path((org, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_org, _repo)): Path<(String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
 ) -> Result<Json<Value>, ApiError> {
-    let repo_id = authed_repo(&s, &headers, &org, &repo).await?;
     let editions: Vec<Value> = s
         .catalog
         .list_editions(repo_id)

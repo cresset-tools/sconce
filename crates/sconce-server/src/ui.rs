@@ -4047,13 +4047,24 @@ async fn create_edition_action(
     // over a chosen set. Exactly one path must produce a set.
     let set_id = if let Some(pkg) = f.package.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         match s.catalog.singleton_set(summary.org_id, pkg).await.map_err(e500)? {
-            Some(id) => id,
-            None => {
+            sconce_catalog::SingletonSet::Set(id) => id,
+            sconce_catalog::SingletonSet::UnknownPackage => {
                 return Ok(error_card(
                     &s,
                     &user,
                     "Package not found",
                     "No package with that name in this organization.",
+                    &back,
+                ));
+            }
+            sconce_catalog::SingletonSet::NameCollision => {
+                return Ok(error_card(
+                    &s,
+                    &user,
+                    "Name already in use",
+                    "A package set already has that exact name and holds more than this \
+                     one package. Select it under \u{201c}Package set\u{201d} instead, or \
+                     rename it.",
                     &back,
                 ));
             }
@@ -4093,7 +4104,13 @@ async fn create_edition_action(
     };
     let cooldown_days = match f.cooldown_days.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(d) => Some(d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?),
+        Some(d) => {
+            let n = d.parse::<i32>().map_err(|_| StatusCode::BAD_REQUEST)?;
+            if n < 0 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Some(n)
+        }
     };
     let policy = sconce_catalog::PolicyOverride {
         update_mode,
