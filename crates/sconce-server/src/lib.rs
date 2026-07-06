@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod api;
 pub mod ci;
 pub mod csrf;
 pub mod mail;
@@ -54,6 +55,24 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
         .route("/{org}/{repo}/dist/{*rest}", get(dist))
         .route("/oauth/ci", post(oauth_ci))
+        // Management API (service-token auth) — provisioning for commerce
+        // front-ends like the Magento module. See `api`.
+        .route(
+            "/api/v1/repos/{org}/{repo}/editions",
+            get(api::list_editions),
+        )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys",
+            post(api::issue_license),
+        )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys/{id}",
+            get(api::inspect_license).delete(api::revoke_license),
+        )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys/{id}/renew",
+            post(api::renew_license),
+        )
         .route("/healthz", get(healthz))
         .with_state(AppState {
             catalog,

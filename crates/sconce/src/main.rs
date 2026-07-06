@@ -456,6 +456,13 @@ enum Command {
         action: EditionAction,
     },
 
+    /// Manage management-API service tokens: repo-scoped bearer credentials a
+    /// commerce front-end (e.g. the Magento module) uses to provision keys.
+    ServiceToken {
+        #[command(subcommand)]
+        action: ServiceTokenAction,
+    },
+
     /// Grant a package from one repository into another (agency curation).
     ///
     /// The target repo then exposes the package without owning it — mirror a
@@ -817,6 +824,40 @@ enum EditionAction {
         repo: String,
         /// Edition name or slug.
         edition: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceTokenAction {
+    /// Mint a service token for a repository and print it once.
+    Create {
+        /// Seller repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Optional human label (so it can be identified and revoked).
+        #[arg(long)]
+        label: Option<String>,
+        /// Days until expiry; omit for a non-expiring token.
+        #[arg(long)]
+        expires_days: Option<i64>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// List a repository's service tokens (never the tokens themselves).
+    List {
+        #[arg(long)]
+        repo: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Revoke a service token by id.
+    Revoke {
+        #[arg(long)]
+        repo: String,
+        /// Service-token id (from `service-token list`).
+        id: String,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -1194,6 +1235,22 @@ fn main() -> Result<()> {
                 edition,
                 database_url,
             } => edition_deactivate(&repo, &edition, &database_url),
+        },
+        Command::ServiceToken { action } => match action {
+            ServiceTokenAction::Create {
+                repo,
+                label,
+                expires_days,
+                database_url,
+            } => service_token_create(&repo, label.as_deref(), expires_days, &database_url),
+            ServiceTokenAction::List { repo, database_url } => {
+                service_token_list(&repo, &database_url)
+            }
+            ServiceTokenAction::Revoke {
+                repo,
+                id,
+                database_url,
+            } => service_token_revoke(&repo, &id, &database_url),
         },
         Command::Grant {
             repo,
@@ -2407,11 +2464,14 @@ fn license_issue(
             .find_edition(repo_id, edition)
             .await?
             .with_context(|| format!("no edition '{edition}' in {repo}"))?;
-        let key = catalog
-            .issue_from_edition(repo_id, ed, buyer)
+        let issued = catalog
+            .issue_from_edition(repo_id, ed, buyer, None)
             .await
             .context("issuing license")?
             .with_context(|| format!("edition '{edition}' is inactive"))?;
+        let key = issued
+            .key
+            .context("expected a freshly-minted key (no idempotency replay from the CLI)")?;
         // The key goes to stdout (scriptable); the notice to stderr.
         println!("{key}");
         eprintln!(
@@ -2516,6 +2576,65 @@ fn edition_deactivate(repo: &str, edition: &str, database_url: &str) -> Result<(
             Ok(())
         } else {
             anyhow::bail!("edition '{edition}' not found")
+        }
+    })
+}
+
+fn service_token_create(
+    repo: &str,
+    label: Option<&str>,
+    expires_days: Option<i64>,
+    database_url: &str,
+) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let (token, _id) = catalog
+            .create_service_token(repo_id, label, expires_days)
+            .await
+            .context("creating service token")?;
+        // The token goes to stdout (scriptable); the notice to stderr.
+        println!("{token}");
+        eprintln!(
+            "Service token for {repo} created. Store it — shown once. Use it as the \
+             Authorization: Bearer credential for /api/v1."
+        );
+        Ok(())
+    })
+}
+
+fn service_token_list(repo: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let tokens = catalog.list_service_tokens(repo_id).await?;
+        if tokens.is_empty() {
+            println!("no service tokens for {repo}");
+            return Ok(());
+        }
+        for t in tokens {
+            println!(
+                "{}  {}  created={}  last_used={}  expires={}",
+                t.id,
+                t.label.unwrap_or_else(|| "-".to_owned()),
+                t.created,
+                t.last_used.unwrap_or_else(|| "never".to_owned()),
+                t.expires.unwrap_or_else(|| "never".to_owned()),
+            );
+        }
+        Ok(())
+    })
+}
+
+fn service_token_revoke(repo: &str, id: &str, database_url: &str) -> Result<()> {
+    let token_id = id
+        .parse::<uuid::Uuid>()
+        .with_context(|| format!("'{id}' is not a valid service-token id"))?;
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        if catalog.revoke_service_token(repo_id, token_id).await? {
+            println!("service token {id} revoked");
+            Ok(())
+        } else {
+            anyhow::bail!("no service token {id} in {repo}")
         }
     })
 }

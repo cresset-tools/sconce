@@ -3988,10 +3988,12 @@ async fn issue_license_edition(
         .ok_or(StatusCode::BAD_REQUEST)?;
     let key = s
         .catalog
-        .issue_from_edition(repo_id, edition_id, buyer)
+        .issue_from_edition(repo_id, edition_id, buyer, None)
         .await
         .map_err(e500)?
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .key
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     let view = views::LicenseCreated {
         packages: format!("edition “{}”", ed.name),
         key,

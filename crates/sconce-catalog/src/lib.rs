@@ -358,6 +358,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0037_org_entitlements.sql"),
     ),
     ("0038_editions", include_str!("../migrations/0038_editions.sql")),
+    (
+        "0039_service_tokens",
+        include_str!("../migrations/0039_service_tokens.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -877,6 +881,41 @@ pub struct Edition {
     /// Supply-chain policy stamped onto issued keys (empty = inherit the repo).
     pub policy: PolicyOverride,
     pub active: bool,
+}
+
+/// The result of issuing a license against an edition. `key` (the plaintext,
+/// shown once) is `Some` only when a key was **newly created**; on an idempotent
+/// replay (same `Idempotency-Key`) it is `None` and `created` is false — the
+/// caller already holds the key from the first success.
+#[derive(Debug, Clone)]
+pub struct IssuedLicense {
+    pub id: Uuid,
+    pub key: Option<String>,
+    pub created: bool,
+}
+
+/// A license key's full detail for the management API's inspect endpoint.
+#[derive(Debug, Clone)]
+pub struct LicenseDetail {
+    pub id: Uuid,
+    pub buyer: Option<String>,
+    pub status: String,
+    /// The edition this key was issued from, if any (`None` = ad-hoc key).
+    pub edition: Option<String>,
+    /// Package names the key currently resolves to (by-reference sets included).
+    pub packages: Vec<String>,
+    pub bound: LicenseBound,
+}
+
+/// A management-API service token in a listing (the token itself is never
+/// recoverable — only its hash is stored).
+#[derive(Debug, Clone)]
+pub struct ServiceTokenSummary {
+    pub id: Uuid,
+    pub label: Option<String>,
+    pub created: String,
+    pub last_used: Option<String>,
+    pub expires: Option<String>,
 }
 
 /// A package set (named, org-scoped group of packages) in a listing.
@@ -4527,25 +4566,41 @@ impl Catalog {
     /// Issue a license key **against an edition**: the edition's bound template and
     /// policy are resolved onto the key, and its target set entitles the key —
     /// frozen as per-package rows (`snapshot`) or unlocked by reference
-    /// (auto-grow). Returns the plaintext key (shown once), or `Ok(None)` if the
-    /// edition doesn't exist in the repo or is inactive. Serving is unchanged: it
-    /// reads the resolved key exactly as for an ad-hoc one.
+    /// (auto-grow). Serving is unchanged: it reads the resolved key exactly as for
+    /// an ad-hoc one.
+    ///
+    /// `Ok(None)` if the edition doesn't exist in the repo or is inactive. When
+    /// `idempotency_key` is set (the commerce order id), a repeated call returns
+    /// the **existing** key's [`IssuedLicense`] with `key: None, created: false`
+    /// instead of minting a duplicate — so a retried checkout webhook is a no-op.
     pub async fn issue_from_edition(
         &self,
         repo_id: Uuid,
         edition_id: Uuid,
         buyer: Option<&str>,
-    ) -> Result<Option<String>, sqlx::Error> {
+        idempotency_key: Option<&str>,
+    ) -> Result<Option<IssuedLicense>, sqlx::Error> {
+        // Fast path: a prior issue for this (repo, idempotency_key) is a replay —
+        // return its id without a secret (we never stored the plaintext).
+        if let Some(idem) = idempotency_key
+            && let Some(id) = self.license_id_for_idempotency(repo_id, idem).await?
+        {
+            return Ok(Some(IssuedLicense {
+                id,
+                key: None,
+                created: false,
+            }));
+        }
         let mut tx = self.pool.begin().await?;
         // Insert the key with the bound resolved inline from the edition (time ->
         // now()+months, version -> cap), so no clock/date handling in Rust. A
         // missing/inactive edition yields no row.
         let key = generate_secret("sclk_");
-        let row = sqlx::query(
+        let inserted = sqlx::query(
             "insert into license_keys \
-                 (repo_id, key_hash, buyer_ref, edition_id, update_until, version_cap_major, \
-                  update_mode, cooldown_days) \
-             select $1, $2, $3, ed.id, \
+                 (repo_id, key_hash, buyer_ref, edition_id, idempotency_key, update_until, \
+                  version_cap_major, update_mode, cooldown_days) \
+             select $1, $2, $3, ed.id, $5, \
                     case when ed.bound_kind = 'time' \
                          then now() + make_interval(months => ed.bound_period_months) end, \
                     case when ed.bound_kind = 'version' then ed.bound_major end, \
@@ -4558,8 +4613,25 @@ impl Catalog {
         .bind(token_hash(&key))
         .bind(buyer)
         .bind(edition_id)
+        .bind(idempotency_key)
         .fetch_optional(&mut *tx)
-        .await?;
+        .await;
+        // Lost the race with a concurrent replay: the partial unique index on
+        // (repo, idempotency_key) rejected this insert — resolve to the winner.
+        let row = match inserted {
+            Ok(row) => row,
+            Err(e) if is_unique_violation(&e) => {
+                tx.rollback().await?;
+                let Some(idem) = idempotency_key else { return Err(e) };
+                let id = self.license_id_for_idempotency(repo_id, idem).await?;
+                return Ok(id.map(|id| IssuedLicense {
+                    id,
+                    key: None,
+                    created: false,
+                }));
+            }
+            Err(e) => return Err(e),
+        };
         let Some(row) = row else {
             tx.rollback().await?;
             return Ok(None);
@@ -4596,7 +4668,188 @@ impl Catalog {
             .await?;
         }
         tx.commit().await?;
-        Ok(Some(key))
+        Ok(Some(IssuedLicense {
+            id: license_id,
+            key: Some(key),
+            created: true,
+        }))
+    }
+
+    /// The license id previously issued for a `(repo, idempotency_key)`, if any.
+    async fn license_id_for_idempotency(
+        &self,
+        repo_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "select id from license_keys where repo_id = $1 and idempotency_key = $2",
+        )
+        .bind(repo_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Extend a license key's **time** bound by its edition's period (renewal):
+    /// `update_until = greatest(update_until, now()) + period`, so a renewal
+    /// before expiry stacks and one after expiry restarts from today. Returns the
+    /// new `YYYY-MM-DD` bound, or `Ok(None)` if the key isn't found or wasn't
+    /// issued from a time-bounded edition (version/perpetual editions renew by
+    /// issuing against a new edition, not by extension).
+    pub async fn renew_license(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "update license_keys l \
+                set update_until = greatest(l.update_until, now()) \
+                                   + make_interval(months => e.bound_period_months) \
+             from editions e \
+             where l.id = $2 and l.repo_id = $1 and l.edition_id = e.id \
+               and e.bound_kind = 'time' \
+             returning to_char(l.update_until, 'YYYY-MM-DD')",
+        )
+        .bind(repo_id)
+        .bind(license_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Revoke a license key (status → `revoked`); serving stops honoring it
+    /// immediately. Returns whether a key matched. Idempotent.
+    pub async fn revoke_license(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "update license_keys set status = 'revoked' where id = $1 and repo_id = $2",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Full detail of one license key (management-API inspect): buyer, status, the
+    /// edition it came from, the packages it currently resolves to, and its bound.
+    /// `None` if the key isn't in the repo.
+    pub async fn license_detail(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+    ) -> Result<Option<LicenseDetail>, sqlx::Error> {
+        let row = sqlx::query(
+            "select l.buyer_ref as buyer, l.status as status, e.name as edition, \
+                    to_char(l.update_until, 'YYYY-MM-DD') as until, \
+                    extract(epoch from l.update_until)::bigint as until_unix, \
+                    l.version_cap_major as major \
+             from license_keys l left join editions e on e.id = l.edition_id \
+             where l.id = $1 and l.repo_id = $2",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let packages = self.entitled_package_names(license_id).await?;
+        Ok(Some(LicenseDetail {
+            id: license_id,
+            buyer: row.try_get("buyer").ok().flatten(),
+            status: row.try_get("status")?,
+            edition: row.try_get("edition").ok().flatten(),
+            packages,
+            bound: LicenseBound {
+                until: row.try_get("until").ok().flatten(),
+                until_unix: row.try_get("until_unix").ok().flatten(),
+                major: row.try_get("major").ok().flatten(),
+            },
+        }))
+    }
+
+    // ----- Management-API service tokens -----------------------------------
+
+    /// Mint a repo-scoped service token for the management API. Returns the
+    /// plaintext (shown once); only its hash is stored. `expires_days`, when set,
+    /// bounds its lifetime.
+    pub async fn create_service_token(
+        &self,
+        repo_id: Uuid,
+        label: Option<&str>,
+        expires_days: Option<i64>,
+    ) -> Result<(String, Uuid), sqlx::Error> {
+        let token = generate_secret("scst_");
+        let id: Uuid = sqlx::query_scalar(
+            "insert into service_tokens (repo_id, token_hash, label, expires_at) \
+             values ($1, $2, $3, \
+                     case when $4::bigint is null then null \
+                          else now() + make_interval(days => $4::int) end) \
+             returning id",
+        )
+        .bind(repo_id)
+        .bind(token_hash(&token))
+        .bind(label)
+        .bind(expires_days)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((token, id))
+    }
+
+    /// Validate a service token and return the repo it authorizes, stamping
+    /// `last_used_at`. `None` if unknown, revoked (deleted), or expired.
+    pub async fn resolve_service_token(&self, token: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "update service_tokens set last_used_at = now() \
+             where token_hash = $1 and (expires_at is null or expires_at > now()) \
+             returning repo_id",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// A repo's service tokens (never the tokens themselves), newest first.
+    pub async fn list_service_tokens(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<Vec<ServiceTokenSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select id, label, to_char(created_at, 'YYYY-MM-DD') as created, \
+                    to_char(last_used_at, 'YYYY-MM-DD') as last_used, \
+                    to_char(expires_at, 'YYYY-MM-DD') as expires \
+             from service_tokens where repo_id = $1 order by created_at desc",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ServiceTokenSummary {
+                    id: r.try_get("id")?,
+                    label: r.try_get("label").ok().flatten(),
+                    created: r.try_get("created")?,
+                    last_used: r.try_get("last_used").ok().flatten(),
+                    expires: r.try_get("expires").ok().flatten(),
+                })
+            })
+            .collect()
+    }
+
+    /// Revoke (delete) a service token by id, scoped to its repo. Returns whether
+    /// one was removed.
+    pub async fn revoke_service_token(
+        &self,
+        repo_id: Uuid,
+        token_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query("delete from service_tokens where id = $1 and repo_id = $2")
+            .bind(token_id)
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected() > 0)
     }
 
     /// Build an [`Edition`] from a listing row (shared by `list_editions` /
@@ -4923,6 +5176,13 @@ fn generate_secret(prefix: &str) -> String {
 fn token_hash(token: &str) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// Whether a query error is a Postgres unique-constraint violation (SQLSTATE
+/// 23505) — used to turn a lost idempotency race into a graceful replay.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
 }
 
 /// Lowercase hex of bytes (matches Postgres `encode(_, 'hex')`).
@@ -7089,10 +7349,12 @@ mod tests {
         )
         .unwrap();
         let key = cat
-            .issue_from_edition(repo_id, ed, Some("buyer@x"))
+            .issue_from_edition(repo_id, ed, Some("buyer@x"), None)
             .await
             .unwrap()
-            .expect("issued");
+            .expect("issued")
+            .key
+            .expect("newly created → plaintext key");
         let lic = cat.resolve_license(repo_id, &key).await.unwrap().unwrap();
 
         // Entitled by reference to the set's packages, and auto-grows.
@@ -7157,9 +7419,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let key = cat
-            .issue_from_edition(repo_id, ed, None)
+            .issue_from_edition(repo_id, ed, None, None)
             .await
             .unwrap()
+            .unwrap()
+            .key
             .unwrap();
         let lic = cat.resolve_license(repo_id, &key).await.unwrap().unwrap();
 
@@ -7236,6 +7500,99 @@ mod tests {
         assert!(cat.set_edition_active(repo_id, first, false).await.unwrap());
         assert_eq!(cat.count_active_editions(org_id).await.unwrap(), 0);
         mk("Solo2").await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue_is_idempotent_and_renew_extends_bound() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of_repo(&cat, repo_id).await;
+        cat.upsert_package(repo_id, "acme/a", "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        let set = cat.singleton_set(org_id, "acme/a").await.unwrap().unwrap();
+        let ed = cat
+            .create_edition(
+                repo_id,
+                "Annual",
+                None,
+                set,
+                &EditionBound::Time { period_months: 12 },
+                false,
+                &PolicyOverride::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First issue with an idempotency key mints a key.
+        let first = cat
+            .issue_from_edition(repo_id, ed, Some("buyer"), Some("order-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.created && first.key.is_some());
+
+        // A replay with the same key returns the same license, no new secret,
+        // and does NOT create a second row.
+        let replay = cat
+            .issue_from_edition(repo_id, ed, Some("buyer"), Some("order-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!replay.created && replay.key.is_none());
+        assert_eq!(replay.id, first.id);
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from license_keys where repo_id = $1")
+                .bind(repo_id)
+                .fetch_one(&cat.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "replay must not mint a duplicate");
+
+        // Renew extends the (time) bound further out; the detail reflects it.
+        let before = cat.license_detail(repo_id, first.id).await.unwrap().unwrap();
+        let before_until = before.bound.until_unix.unwrap();
+        let renewed = cat.renew_license(repo_id, first.id).await.unwrap();
+        assert!(renewed.is_some(), "a time-bound edition key renews");
+        let after = cat.license_detail(repo_id, first.id).await.unwrap().unwrap();
+        assert!(after.bound.until_unix.unwrap() > before_until);
+        assert_eq!(after.edition.as_deref(), Some("Annual"));
+        assert_eq!(after.packages, vec!["acme/a"]);
+
+        // Revoke flips status; serving's resolve_license then rejects it.
+        assert!(cat.revoke_license(repo_id, first.id).await.unwrap());
+        assert_eq!(
+            cat.license_detail(repo_id, first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_token_resolves_to_its_repo() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let (token, id) = cat
+            .create_service_token(repo_id, Some("magento"), None)
+            .await
+            .unwrap();
+        assert_eq!(cat.resolve_service_token(&token).await.unwrap(), Some(repo_id));
+        assert_eq!(cat.list_service_tokens(repo_id).await.unwrap().len(), 1);
+        // An expired token doesn't resolve.
+        let (expired, _) = cat
+            .create_service_token(repo_id, None, Some(-1))
+            .await
+            .unwrap();
+        assert_eq!(cat.resolve_service_token(&expired).await.unwrap(), None);
+        // Revoked → no longer resolves.
+        assert!(cat.revoke_service_token(repo_id, id).await.unwrap());
+        assert_eq!(cat.resolve_service_token(&token).await.unwrap(), None);
     }
 
     #[tokio::test]
