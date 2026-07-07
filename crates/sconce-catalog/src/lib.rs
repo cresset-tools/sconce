@@ -4068,7 +4068,10 @@ impl Catalog {
     }
 
     /// Whether `token` is valid **for this repository** (and not expired). Bumps
-    /// `last_used_at`.
+    /// `last_used_at`. This is the serving (read) credential path — it queries only
+    /// the read `tokens` table, so a management-API service token is never accepted
+    /// here (the two credential types are intentionally kept in separate tables;
+    /// see the service-token section below).
     pub async fn token_valid(&self, repo_id: Uuid, token: &str) -> Result<bool, sqlx::Error> {
         let updated = sqlx::query(
             "update tokens set last_used_at = now() where repo_id = $1 and token_hash = $2 \
@@ -5030,6 +5033,23 @@ impl Catalog {
     }
 
     // ----- Management-API service tokens -----------------------------------
+    //
+    // These deliberately mirror the read-`tokens` CRUD above but live in their own
+    // `service_tokens` table, and that separation is INTENTIONAL — do not merge the
+    // two into one table to remove the apparent duplication. Read tokens and
+    // service tokens sit at opposite privilege levels: a read token only unlocks
+    // Composer *serving* (download packages), while a service token can *provision*
+    // license keys via `/api/v1` (issue / renew / revoke — money-adjacent writes).
+    // Keeping them in separate tables makes the isolation hold *by construction*:
+    // `resolve_service_token` only ever reads `service_tokens`, so a read token
+    // physically cannot authenticate the management API (and vice versa for
+    // `token_valid` / serving). A single table with a `kind` discriminator would
+    // make that guarantee depend on every query remembering the right filter — one
+    // slip is a privilege escalation. See `read_and_service_tokens_do_not_cross_
+    // authenticate` for the regression guard. They also genuinely diverge: read
+    // tokens are policy-gated at creation, carry serving policy + `origin`, and
+    // resolve scoped to a known repo; service tokens have none of that and resolve
+    // globally to discover their repo.
 
     /// Mint a repo-scoped service token for the management API. Returns the
     /// plaintext (shown once); only its hash is stored. `expires_days`, when set,
@@ -8096,6 +8116,55 @@ mod tests {
         // Revoked → no longer resolves.
         assert!(cat.revoke_service_token(repo_id, id).await.unwrap());
         assert_eq!(cat.resolve_service_token(&token).await.unwrap(), None);
+    }
+
+    /// The privilege boundary between the two credential types: a read token (which
+    /// only unlocks serving) must never authenticate the management API, and a
+    /// service token (which can provision/revoke licenses) must never unlock
+    /// serving. This holds by construction — they live in separate tables — but is
+    /// guarded here so a future refactor (e.g. merging the tables) can't silently
+    /// erase it. See the service-token section in the impl for why they're split.
+    #[tokio::test]
+    async fn read_and_service_tokens_do_not_cross_authenticate() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        // A read token unlocks serving...
+        let read = cat.create_token(repo_id, Some("ci"), None).await.unwrap();
+        assert!(
+            cat.token_valid(repo_id, &read).await.unwrap(),
+            "read token unlocks serving"
+        );
+        // ...but is NOT accepted by the management-API resolve path.
+        assert_eq!(
+            cat.resolve_service_token(&read).await.unwrap(),
+            None,
+            "a read token must not authenticate the management API"
+        );
+
+        // A service token authenticates the management API...
+        let (svc, _) = cat
+            .create_service_token(repo_id, Some("magento"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.resolve_service_token(&svc).await.unwrap(),
+            Some(repo_id),
+            "service token authenticates the management API"
+        );
+        // ...but must NOT unlock serving.
+        assert!(
+            !cat.token_valid(repo_id, &svc).await.unwrap(),
+            "a service token must not unlock serving"
+        );
+        // ...nor carry a serving policy on the read path.
+        assert!(
+            cat.resolve_token_policy(repo_id, &svc)
+                .await
+                .unwrap()
+                .is_none(),
+            "a service token is not a serving credential"
+        );
     }
 
     #[tokio::test]
