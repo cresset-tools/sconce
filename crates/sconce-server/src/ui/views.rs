@@ -574,6 +574,26 @@ pub struct LicSet {
     pub name: String,
 }
 
+/// An edition (SKU) row in the Editions section of the Tokens tab.
+pub struct EditionRow {
+    pub id: String,
+    pub name: String,
+    /// Slug (empty if none), shown in parentheses.
+    pub slug: String,
+    pub set_name: String,
+    /// Bound label ("perpetual", "12 months", "≤ v3").
+    pub bound: String,
+    pub snapshot: bool,
+    pub active: bool,
+}
+
+/// An option in the "issue against edition" `<select>` (active editions only).
+pub struct EditionOpt {
+    pub id: String,
+    /// "Pro — 12 months" (name + bound), for the picker.
+    pub label: String,
+}
+
 /// A license-key row in the Tokens tab.
 pub struct LicenseRow {
     pub buyer: String,
@@ -690,6 +710,10 @@ pub struct RepoPage {
     // Tokens + licenses
     pub licenses: Vec<LicenseRow>,
     pub org_set_opts: Vec<SetOpt>,
+    /// Editions (SKUs) defined on this repo.
+    pub editions: Vec<EditionRow>,
+    /// Active editions, for the "issue against edition" picker.
+    pub edition_opts: Vec<EditionOpt>,
     pub tokens: Vec<TokenRow>,
     // CI
     pub ci: Vec<CiRow>,
@@ -829,6 +853,8 @@ mod tests {
             deps: vec![],
             licenses: vec![],
             org_set_opts: vec![],
+            editions: vec![],
+            edition_opts: vec![],
             tokens: vec![],
             ci: vec![],
         }
