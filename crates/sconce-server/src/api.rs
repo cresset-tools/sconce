@@ -186,8 +186,14 @@ pub(crate) async fn issue_license(
         .catalog
         .find_edition(repo_id, req.edition.trim())
         .await?
-        .ok_or_else(|| ApiError::BadRequest(format!("no edition '{}' in {org}/{repo}", req.edition)))?;
-    let buyer = req.buyer.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("no edition '{}' in {org}/{repo}", req.edition))
+        })?;
+    let buyer = req
+        .buyer
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
     let issued = s
         .catalog
         .issue_from_edition(repo_id, edition_id, buyer, idem)
@@ -263,7 +269,10 @@ pub(crate) async fn revoke_license(
     Path((_org, _repo, id)): Path<(String, String, String)>,
     AuthedRepo(repo_id): AuthedRepo,
 ) -> Result<Response, ApiError> {
-    if s.catalog.revoke_license(repo_id, parse_license_id(&id)?).await? {
+    if s.catalog
+        .revoke_license(repo_id, parse_license_id(&id)?)
+        .await?
+    {
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         Err(ApiError::NotFound("license"))

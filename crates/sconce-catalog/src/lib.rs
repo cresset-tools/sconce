@@ -357,7 +357,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0037_org_entitlements",
         include_str!("../migrations/0037_org_entitlements.sql"),
     ),
-    ("0038_editions", include_str!("../migrations/0038_editions.sql")),
+    (
+        "0038_editions",
+        include_str!("../migrations/0038_editions.sql"),
+    ),
     (
         "0039_service_tokens",
         include_str!("../migrations/0039_service_tokens.sql"),
@@ -856,7 +859,9 @@ impl EditionBound {
         } else if let Some(v) = s.strip_prefix("version:").or_else(|| s.strip_prefix('v')) {
             major(v)
                 .map(|major| EditionBound::Version { major })
-                .ok_or_else(|| format!("invalid version bound '{spec}' (want e.g. version:3 or v3)"))
+                .ok_or_else(|| {
+                    format!("invalid version bound '{spec}' (want e.g. version:3 or v3)")
+                })
         } else {
             Err(format!(
                 "unknown bound '{spec}' (want perpetual, time:<months>, or version:<major>)"
@@ -4648,11 +4653,12 @@ impl Catalog {
         active: bool,
     ) -> Result<bool, EntitlementError> {
         if !active {
-            let n = sqlx::query("update editions set active = false where id = $1 and repo_id = $2")
-                .bind(edition_id)
-                .bind(repo_id)
-                .execute(&self.pool)
-                .await?;
+            let n =
+                sqlx::query("update editions set active = false where id = $1 and repo_id = $2")
+                    .bind(edition_id)
+                    .bind(repo_id)
+                    .execute(&self.pool)
+                    .await?;
             return Ok(n.rows_affected() > 0);
         }
         let org_id = self.org_of_repo(repo_id).await?;
@@ -4751,7 +4757,9 @@ impl Catalog {
             Ok(row) => row,
             Err(e) if is_unique_violation(&e) => {
                 tx.rollback().await?;
-                let Some(idem) = idempotency_key else { return Err(e) };
+                let Some(idem) = idempotency_key else {
+                    return Err(e);
+                };
                 let Some(id) = self
                     .license_id_for_idempotency(repo_id, edition_id, idem)
                     .await?
@@ -4918,7 +4926,8 @@ impl Catalog {
         .await?;
         let bound = if fresh.is_some() {
             // First time for this key: extend the bound.
-            self.extend_time_bound_tx(&mut tx, repo_id, license_id).await?
+            self.extend_time_bound_tx(&mut tx, repo_id, license_id)
+                .await?
         } else {
             // Replay: return the current bound unchanged (only for a renewable key,
             // so the response shape matches a fresh renewal).
@@ -7798,20 +7807,27 @@ mod tests {
             .unwrap();
         assert!(!replay.created && replay.key.is_none());
         assert_eq!(replay.id, first.id);
-        let count: i64 =
-            sqlx::query_scalar("select count(*) from license_keys where repo_id = $1")
-                .bind(repo_id)
-                .fetch_one(&cat.pool)
-                .await
-                .unwrap();
+        let count: i64 = sqlx::query_scalar("select count(*) from license_keys where repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap();
         assert_eq!(count, 1, "replay must not mint a duplicate");
 
         // Renew extends the (time) bound further out; the detail reflects it.
-        let before = cat.license_detail(repo_id, first.id).await.unwrap().unwrap();
+        let before = cat
+            .license_detail(repo_id, first.id)
+            .await
+            .unwrap()
+            .unwrap();
         let before_until = before.bound.until_unix.unwrap();
         let renewed = cat.renew_license(repo_id, first.id, None).await.unwrap();
         assert!(renewed.is_some(), "a time-bound edition key renews");
-        let after = cat.license_detail(repo_id, first.id).await.unwrap().unwrap();
+        let after = cat
+            .license_detail(repo_id, first.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(after.bound.until_unix.unwrap() > before_until);
         assert_eq!(after.edition.as_deref(), Some("Annual"));
         assert_eq!(after.packages, vec!["acme/a"]);
@@ -7875,7 +7891,11 @@ mod tests {
                 .await
                 .unwrap();
         let ct = ct.expect("ciphertext stored");
-        assert_ne!(ct.as_slice(), key.as_bytes(), "key is not plaintext at rest");
+        assert_ne!(
+            ct.as_slice(),
+            key.as_bytes(),
+            "key is not plaintext at rest"
+        );
 
         // Recover it directly, on idempotent replay, and via inspect.
         assert_eq!(
@@ -7891,7 +7911,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!replay.created && replay.id == first.id);
-        assert_eq!(replay.key.as_deref(), Some(key.as_str()), "replay returns the key");
+        assert_eq!(
+            replay.key.as_deref(),
+            Some(key.as_str()),
+            "replay returns the key"
+        );
         assert_eq!(
             cat.license_detail(repo_id, first.id)
                 .await
@@ -7916,6 +7940,7 @@ mod tests {
     /// Regression coverage for the code-review fixes: edition-scoped idempotency,
     /// idempotent + status-guarded renewal, and singleton-set name-collision safety.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn edition_issue_and_renew_edge_cases() {
         let Some((cat, repo_id)) = repo().await else {
             return;
@@ -7959,7 +7984,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(a.created && b.created && a.id != b.id, "one key per edition");
+        assert!(
+            a.created && b.created && a.id != b.id,
+            "one key per edition"
+        );
         // ...but a retry of the same (edition, order) is still a no-op replay.
         let a_replay = cat
             .issue_from_edition(repo_id, ed_a, None, Some("order-7"))
@@ -8016,7 +8044,10 @@ mod tests {
 
         // (#7) A curated multi-package set named exactly like a package is not
         // silently reused as that package's singleton.
-        let curated = cat.create_package_set(org_id, "acme/collide").await.unwrap();
+        let curated = cat
+            .create_package_set(org_id, "acme/collide")
+            .await
+            .unwrap();
         let a_id = cat
             .find_package_in_org(org_id, "acme/a")
             .await
@@ -8051,7 +8082,10 @@ mod tests {
             .create_service_token(repo_id, Some("magento"), None)
             .await
             .unwrap();
-        assert_eq!(cat.resolve_service_token(&token).await.unwrap(), Some(repo_id));
+        assert_eq!(
+            cat.resolve_service_token(&token).await.unwrap(),
+            Some(repo_id)
+        );
         assert_eq!(cat.list_service_tokens(repo_id).await.unwrap().len(), 1);
         // An expired token doesn't resolve.
         let (expired, _) = cat

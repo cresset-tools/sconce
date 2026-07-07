@@ -2452,12 +2452,7 @@ fn license_create(
     })
 }
 
-fn license_issue(
-    repo: &str,
-    edition: &str,
-    buyer: Option<&str>,
-    database_url: &str,
-) -> Result<()> {
+fn license_issue(repo: &str, edition: &str, buyer: Option<&str>, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
         let ed = catalog
@@ -2550,7 +2545,10 @@ fn edition_create(
         {
             Ok(Some(id)) => {
                 println!("{id}");
-                eprintln!("Edition '{name}' created in {repo} (bound: {}).", bound.label());
+                eprintln!(
+                    "Edition '{name}' created in {repo} (bound: {}).",
+                    bound.label()
+                );
                 Ok(())
             }
             Ok(None) => anyhow::bail!("target set does not belong to {org_slug}"),

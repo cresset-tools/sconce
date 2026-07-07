@@ -4029,6 +4029,7 @@ struct EditionForm {
 
 /// Create an edition. The target is a single package (singleton set) if given,
 /// else an existing org set. Gated on `max_skus`.
+#[allow(clippy::too_many_lines)]
 async fn create_edition_action(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
@@ -4045,8 +4046,18 @@ async fn create_edition_action(
 
     // Resolve the target set: a single package (singleton set) takes precedence
     // over a chosen set. Exactly one path must produce a set.
-    let set_id = if let Some(pkg) = f.package.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        match s.catalog.singleton_set(summary.org_id, pkg).await.map_err(e500)? {
+    let set_id = if let Some(pkg) = f
+        .package
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        match s
+            .catalog
+            .singleton_set(summary.org_id, pkg)
+            .await
+            .map_err(e500)?
+        {
             sconce_catalog::SingletonSet::Set(id) => id,
             sconce_catalog::SingletonSet::UnknownPackage => {
                 return Ok(error_card(
@@ -4149,9 +4160,7 @@ async fn deactivate_edition(
     Form(f): Form<IdForm>,
 ) -> Result<Redirect, StatusCode> {
     let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
-    let id =
-        f.id.parse::<Uuid>()
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = f.id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
     s.catalog
         .set_edition_active(repo_id, id, false)
         .await
