@@ -1,11 +1,10 @@
 # Nightly database snapshot → sconce.
 #
-# Copy this into your application repo as `.github/workflows/db-snapshot.yml`
-# (and `upload-snapshot.sh` next to it, e.g. `.github/scripts/`). It produces an
-# anonymized dump from production with jibs and uploads it to sconce as the
-# `<env>/latest` snapshot — no long-lived sconce credential is stored; the job
-# authenticates with a per-run GitHub OIDC token. See README.md for the one-time
-# sconce + secrets setup.
+# Copy this into your application repo as `.github/workflows/db-snapshot.yml`. It
+# produces an anonymized dump from production with jibs and uploads it to sconce
+# as the `<env>/latest` snapshot via the `cresset-tools/sconce-upload` action — no
+# long-lived sconce credential is stored; the job authenticates with a per-run
+# GitHub OIDC token. See README.md for the one-time sconce + secrets setup.
 name: db-snapshot
 
 on:
@@ -51,4 +50,9 @@ jobs:
         run: jibs import shop.jibs --host "$PROD_SSH_HOST" --dump-to nightly.jibsdump
 
       - name: Upload to sconce
-        run: ./.github/scripts/upload-snapshot.sh nightly.jibsdump
+        uses: cresset-tools/sconce-upload@v1
+        with:
+          repo: ${{ env.SCONCE_REPO }}
+          url: ${{ env.SCONCE_URL }}
+          file: nightly.jibsdump
+          environment: ${{ env.SNAPSHOT_ENV }}
