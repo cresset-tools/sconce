@@ -26,6 +26,7 @@ pub mod mail;
 pub mod oidc;
 mod publish;
 pub mod ratelimit;
+mod snapshots;
 pub mod ui;
 
 use axum::Router;
@@ -81,6 +82,21 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .route(
             "/{org}/{repo}/uploads/{upload_id}/complete",
             post(publish::upload_complete),
+        )
+        // Snapshot (dataset) API — single-shot + chunked upload (the chunked flow
+        // reuses the shared `…/uploads/{id}/…` routes above), and a latest-download
+        // that 302s to a presigned URL like `dist`.
+        .route(
+            "/{org}/{repo}/snapshots/{env}",
+            put(snapshots::upload_single).layer(upload_limit),
+        )
+        .route(
+            "/{org}/{repo}/snapshots/{env}/uploads",
+            post(snapshots::upload_init),
+        )
+        .route(
+            "/{org}/{repo}/snapshots/{env}/latest",
+            get(snapshots::download_latest),
         )
         // Management API (service-token auth) — provisioning for commerce
         // front-ends like the Magento module. See `api`.

@@ -495,6 +495,12 @@ enum Command {
         action: ServiceTokenAction,
     },
 
+    /// Inspect and prune database snapshots (datasets) uploaded to a repository.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+
     /// Grant a package from one repository into another (agency curation).
     ///
     /// The target repo then exposes the package without owning it — mirror a
@@ -894,6 +900,37 @@ enum ServiceTokenAction {
         repo: String,
         /// Service-token id (from `service-token list`).
         id: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotAction {
+    /// List a repository+environment's snapshots, newest first (`*` = latest).
+    List {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Environment label (e.g. production, staging).
+        #[arg(long)]
+        env: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+    /// Retention: keep the newest `--keep` snapshots in a repo+environment,
+    /// deleting the rest. Never deletes the current `latest`; freed blobs are
+    /// reclaimed by `sconce gc`.
+    Prune {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Environment label (e.g. production, staging).
+        #[arg(long)]
+        env: String,
+        /// How many of the newest snapshots to keep.
+        #[arg(long)]
+        keep: i64,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -1306,6 +1343,19 @@ fn main() -> Result<()> {
                 id,
                 database_url,
             } => service_token_revoke(&repo, &id, &database_url),
+        },
+        Command::Snapshot { action } => match action {
+            SnapshotAction::List {
+                repo,
+                env,
+                database_url,
+            } => snapshot_list(&repo, &env, &database_url),
+            SnapshotAction::Prune {
+                repo,
+                env,
+                keep,
+                database_url,
+            } => snapshot_prune(&repo, &env, keep, &database_url),
         },
         Command::Grant {
             repo,
@@ -2971,6 +3021,39 @@ fn service_token_list(repo: &str, database_url: &str) -> Result<()> {
                 t.expires.unwrap_or_else(|| "never".to_owned()),
             );
         }
+        Ok(())
+    })
+}
+
+fn snapshot_list(repo: &str, env: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let latest = catalog.resolve_latest(repo_id, env).await?.map(|s| s.id);
+        let snapshots = catalog.list_snapshots(repo_id, env).await?;
+        if snapshots.is_empty() {
+            println!("no snapshots for {repo} [{env}]");
+            return Ok(());
+        }
+        for s in snapshots {
+            let marker = if Some(s.id) == latest { '*' } else { ' ' };
+            println!(
+                "{marker} {}  {}  {} bytes  {}",
+                s.id,
+                sconce_cas::BlobId::from_bytes(s.blob_sha256).to_hex(),
+                s.size_bytes,
+                s.source_ref.unwrap_or_else(|| "-".to_owned()),
+            );
+        }
+        Ok(())
+    })
+}
+
+fn snapshot_prune(repo: &str, env: &str, keep: i64, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let deleted = catalog.prune_snapshots(repo_id, env, keep).await?;
+        println!("pruned {deleted} snapshot(s) from {repo} [{env}] (kept the newest {keep})");
+        eprintln!("run `sconce gc` to reclaim any now-orphaned blobs.");
         Ok(())
     })
 }

@@ -385,6 +385,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0044_upload_sessions",
         include_str!("../migrations/0044_upload_sessions.sql"),
     ),
+    (
+        "0045_snapshots",
+        include_str!("../migrations/0045_snapshots.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -629,14 +633,19 @@ pub enum PublishOutcome {
     Conflict,
 }
 
-/// A chunked-upload session ([`Catalog::create_upload_session`]).
+/// A chunked-upload session ([`Catalog::create_upload_session`] /
+/// [`Catalog::create_snapshot_upload_session`]). `kind` discriminates: a
+/// `"package"` session carries `vendor`/`name`/`version`, a `"snapshot"` session
+/// carries `environment`. Both share the part-staging + assemble routes.
 #[derive(Debug, Clone)]
 pub struct UploadSession {
     pub id: Uuid,
     pub repo_id: Uuid,
-    pub vendor: String,
-    pub name: String,
-    pub version: String,
+    pub kind: String,
+    pub vendor: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub environment: Option<String>,
     pub status: String,
 }
 
@@ -646,6 +655,19 @@ pub struct UploadPart {
     pub part_number: i32,
     pub chunk_sha256: Vec<u8>,
     pub size_bytes: i64,
+}
+
+/// A registered database snapshot ([`Catalog::list_snapshots`] /
+/// [`Catalog::resolve_latest`]). `blob_sha256` is the `.jibsdump`'s CAS key.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub id: Uuid,
+    pub environment: String,
+    pub blob_sha256: [u8; 32],
+    pub size_bytes: i64,
+    pub source_ref: Option<String>,
+    /// Unix seconds of `created_at`.
+    pub created_at: i64,
 }
 
 /// An OIDC connection (identity-provider config). `client_secret` is encrypted.
@@ -2805,18 +2827,27 @@ impl Catalog {
     }
 
     /// Storage metered to one org — the summed size of the **distinct** blobs
-    /// its package versions reference. Full logical size: a blob shared with
-    /// other orgs is counted here in full (no cross-tenant dedup credit). See
-    /// [`StorageUsage`].
+    /// its package versions **and snapshots** reference. Full logical size: a blob
+    /// shared with other orgs is counted here in full (no cross-tenant dedup
+    /// credit); a blob shared between a package and a snapshot in this org is
+    /// counted once. See [`StorageUsage`].
     pub async fn org_storage(&self, org_id: Uuid) -> Result<StorageUsage, sqlx::Error> {
         let (bytes, blob_count): (i64, i64) = sqlx::query_as(
             "select coalesce(sum(size_bytes), 0)::bigint, count(*) from ( \
-                 select distinct pv.dist_blob_sha256, b.size_bytes \
-                 from package_versions pv \
-                 join packages p on p.id = pv.package_id \
-                 join repositories r on r.id = p.repo_id \
-                 join blobs b on b.sha256 = pv.dist_blob_sha256 \
-                 where r.org_id = $1 and pv.dist_blob_sha256 is not null \
+                 select distinct sha, size_bytes from ( \
+                     select pv.dist_blob_sha256 as sha, b.size_bytes \
+                     from package_versions pv \
+                     join packages p on p.id = pv.package_id \
+                     join repositories r on r.id = p.repo_id \
+                     join blobs b on b.sha256 = pv.dist_blob_sha256 \
+                     where r.org_id = $1 and pv.dist_blob_sha256 is not null \
+                     union all \
+                     select s.blob_sha256 as sha, b.size_bytes \
+                     from snapshots s \
+                     join repositories r on r.id = s.repo_id \
+                     join blobs b on b.sha256 = s.blob_sha256 \
+                     where r.org_id = $1 \
+                 ) u \
              ) t",
         )
         .bind(org_id)
@@ -2835,12 +2866,19 @@ impl Catalog {
                     coalesce(sum(t.size_bytes), 0)::bigint, count(t.sha) \
              from organizations o \
              left join ( \
-                 select distinct r.org_id, pv.dist_blob_sha256 as sha, b.size_bytes \
-                 from package_versions pv \
-                 join packages p on p.id = pv.package_id \
-                 join repositories r on r.id = p.repo_id \
-                 join blobs b on b.sha256 = pv.dist_blob_sha256 \
-                 where pv.dist_blob_sha256 is not null \
+                 select distinct org_id, sha, size_bytes from ( \
+                     select r.org_id, pv.dist_blob_sha256 as sha, b.size_bytes \
+                     from package_versions pv \
+                     join packages p on p.id = pv.package_id \
+                     join repositories r on r.id = p.repo_id \
+                     join blobs b on b.sha256 = pv.dist_blob_sha256 \
+                     where pv.dist_blob_sha256 is not null \
+                     union all \
+                     select r.org_id, s.blob_sha256 as sha, b.size_bytes \
+                     from snapshots s \
+                     join repositories r on r.id = s.repo_id \
+                     join blobs b on b.sha256 = s.blob_sha256 \
+                 ) u \
              ) t on t.org_id = o.id \
              group by o.id, o.slug, o.name \
              order by 4 desc, o.slug",
@@ -5264,7 +5302,7 @@ impl Catalog {
     /// Fetch a session by id (any status). `None` if unknown.
     pub async fn upload_session(&self, id: Uuid) -> Result<Option<UploadSession>, sqlx::Error> {
         let row = sqlx::query(
-            "select id, repo_id, vendor, name, version, status \
+            "select id, repo_id, kind, vendor, name, version, environment, status \
              from upload_sessions where id = $1",
         )
         .bind(id)
@@ -5274,13 +5312,37 @@ impl Catalog {
             Ok(UploadSession {
                 id: r.try_get("id")?,
                 repo_id: r.try_get("repo_id")?,
+                kind: r.try_get("kind")?,
                 vendor: r.try_get("vendor")?,
                 name: r.try_get("name")?,
                 version: r.try_get("version")?,
+                environment: r.try_get("environment")?,
                 status: r.try_get("status")?,
             })
         })
         .transpose()
+    }
+
+    /// Open a chunked-upload session for a **snapshot** — a `.jibsdump` for
+    /// `environment` in a repo, expiring `ttl_secs` from now. Shares the part-staging
+    /// and assemble routes with package uploads; `upload_complete` dispatches on the
+    /// session's `kind`. Returns the new session id.
+    pub async fn create_snapshot_upload_session(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+        ttl_secs: i64,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "insert into upload_sessions (repo_id, kind, environment, expires_at) \
+             values ($1, 'snapshot', $2, now() + make_interval(secs => $3::double precision)) \
+             returning id",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .bind(ttl_secs)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Record (or overwrite) a staged part — idempotent on `(session, part_number)`,
@@ -5344,6 +5406,124 @@ impl Catalog {
             "update upload_sessions set status = 'aborted' \
              where status = 'open' and expires_at <= now()",
         )
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected())
+    }
+
+    /// Register an uploaded snapshot for `environment` in a repo, referencing the
+    /// already-stored `.jibsdump` blob. Inserting the row bumps the blob's refcount
+    /// (trigger, migration 0045). Call [`Catalog::upsert_blob`] first so the blob's
+    /// size + `last_seen_at` are recorded before the GC grace window applies.
+    pub async fn create_snapshot(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+        blob_sha256: &[u8; 32],
+        size_bytes: i64,
+        source_ref: Option<&str>,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "insert into snapshots (repo_id, environment, blob_sha256, size_bytes, source_ref) \
+             values ($1, $2, $3, $4, $5) returning id",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .bind(&blob_sha256[..])
+        .bind(size_bytes)
+        .bind(source_ref)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Point `(repo, environment)`'s "latest" at `snapshot_id`. Upsert, so the first
+    /// upload creates the pointer and every later one moves it.
+    pub async fn advance_latest(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+        snapshot_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into snapshot_latest (repo_id, environment, snapshot_id) \
+             values ($1, $2, $3) \
+             on conflict (repo_id, environment) do update set \
+                 snapshot_id = excluded.snapshot_id, updated_at = now()",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .bind(snapshot_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve `(repo, environment)`'s current "latest" snapshot. `None` if the
+    /// environment has never had a snapshot uploaded.
+    pub async fn resolve_latest(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+    ) -> Result<Option<Snapshot>, sqlx::Error> {
+        let row = sqlx::query(
+            "select s.id, s.environment, s.blob_sha256, s.size_bytes, s.source_ref, \
+                    extract(epoch from s.created_at)::bigint as created_at \
+             from snapshot_latest l join snapshots s on s.id = l.snapshot_id \
+             where l.repo_id = $1 and l.environment = $2",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_snapshot).transpose()
+    }
+
+    /// A repo+environment's snapshots, newest first.
+    pub async fn list_snapshots(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+    ) -> Result<Vec<Snapshot>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select id, environment, blob_sha256, size_bytes, source_ref, \
+                    extract(epoch from created_at)::bigint as created_at \
+             from snapshots where repo_id = $1 and environment = $2 \
+             order by created_at desc",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_snapshot).collect()
+    }
+
+    /// Retention: keep the `keep` newest snapshots in `(repo, environment)`, deleting
+    /// the rest. Never deletes the one the "latest" pointer references (so `latest`
+    /// always resolves). Deleting a row decrements its blob's refcount; the existing
+    /// orphan GC (`sconce gc`) then reclaims any blob that hits refcount 0. Returns
+    /// how many snapshots were deleted.
+    pub async fn prune_snapshots(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+        keep: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let n = sqlx::query(
+            "delete from snapshots \
+             where repo_id = $1 and environment = $2 \
+               and id not in ( \
+                   select snapshot_id from snapshot_latest \
+                   where repo_id = $1 and environment = $2 \
+               ) \
+               and id not in ( \
+                   select id from snapshots \
+                   where repo_id = $1 and environment = $2 \
+                   order by created_at desc limit $3 \
+               )",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .bind(keep.max(0))
         .execute(&self.pool)
         .await?;
         Ok(n.rows_affected())
@@ -5827,6 +6007,22 @@ fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<PackageVersion, sqlx::E
         dist_blob_sha256,
         dist_shasum: row.try_get("dist_shasum")?,
         source_reference: row.try_get("source_reference")?,
+    })
+}
+
+fn row_to_snapshot(row: &sqlx::postgres::PgRow) -> Result<Snapshot, sqlx::Error> {
+    let raw: Vec<u8> = row.try_get("blob_sha256")?;
+    let mut blob = [0u8; 32];
+    // A sha256 column is always 32 bytes; truncate/pad defensively rather than panic.
+    let n = raw.len().min(32);
+    blob[..n].copy_from_slice(&raw[..n]);
+    Ok(Snapshot {
+        id: row.try_get("id")?,
+        environment: row.try_get("environment")?,
+        blob_sha256: blob,
+        size_bytes: row.try_get("size_bytes")?,
+        source_ref: row.try_get("source_ref")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -7756,6 +7952,121 @@ mod tests {
         assert!(cat.delete_repo(repo_id).await.unwrap());
         assert_eq!(refcount(&cat, &sha).await, Some(0));
         assert_eq!(refcount(&cat, &sha2).await, Some(0));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn snapshot_latest_advances_and_lists() {
+        let _serial = serial_blobs();
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let sha1 = test_sha(repo_id, 21);
+        let sha2 = test_sha(repo_id, 22);
+
+        // Nothing uploaded yet.
+        assert!(
+            cat.resolve_latest(repo_id, "production")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        cat.upsert_blob(&sha1, 1000).await.unwrap();
+        let s1 = cat
+            .create_snapshot(repo_id, "production", &sha1, 1000, Some("commit-a"))
+            .await
+            .unwrap();
+        cat.advance_latest(repo_id, "production", s1).await.unwrap();
+        let latest = cat
+            .resolve_latest(repo_id, "production")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.blob_sha256, sha1);
+        assert_eq!(latest.size_bytes, 1000);
+        assert_eq!(latest.source_ref.as_deref(), Some("commit-a"));
+
+        // A second upload moves the pointer.
+        cat.upsert_blob(&sha2, 2000).await.unwrap();
+        let s2 = cat
+            .create_snapshot(repo_id, "production", &sha2, 2000, None)
+            .await
+            .unwrap();
+        cat.advance_latest(repo_id, "production", s2).await.unwrap();
+        assert_eq!(
+            cat.resolve_latest(repo_id, "production")
+                .await
+                .unwrap()
+                .unwrap()
+                .blob_sha256,
+            sha2,
+            "latest moved to the newest upload"
+        );
+
+        // Environments are independent.
+        assert!(
+            cat.resolve_latest(repo_id, "staging")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let all = cat.list_snapshots(repo_id, "production").await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].blob_sha256, sha2, "newest first");
+
+        // Each snapshot refcounts its blob (via the 0045 trigger).
+        assert_eq!(refcount(&cat, &sha1).await, Some(1));
+        assert_eq!(refcount(&cat, &sha2).await, Some(1));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn snapshot_prune_keeps_latest_and_reclaims_refcount() {
+        let _serial = serial_blobs();
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let mut shas = Vec::new();
+        for i in 0..3u8 {
+            let sha = test_sha(repo_id, 30 + i);
+            cat.upsert_blob(&sha, 100).await.unwrap();
+            let id = cat
+                .create_snapshot(repo_id, "production", &sha, 100, None)
+                .await
+                .unwrap();
+            cat.advance_latest(repo_id, "production", id).await.unwrap();
+            shas.push(sha);
+        }
+        for sha in &shas {
+            assert_eq!(refcount(&cat, sha).await, Some(1));
+        }
+
+        // Keep only the newest → the two oldest are pruned.
+        let deleted = cat.prune_snapshots(repo_id, "production", 1).await.unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            cat.list_snapshots(repo_id, "production")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The latest survives (pointer still resolves) and keeps its blob…
+        assert_eq!(
+            cat.resolve_latest(repo_id, "production")
+                .await
+                .unwrap()
+                .unwrap()
+                .blob_sha256,
+            shas[2]
+        );
+        assert_eq!(refcount(&cat, &shas[2]).await, Some(1));
+        // …while the pruned snapshots' blobs drop to 0 (now orphan-GC eligible).
+        assert_eq!(refcount(&cat, &shas[0]).await, Some(0));
+        assert_eq!(refcount(&cat, &shas[1]).await, Some(0));
     }
 
     #[tokio::test]
