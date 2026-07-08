@@ -17,6 +17,13 @@ categories = ["command-line-utilities", "development-tools"]
 name = "sconce"
 path = "src/main.rs"
 
+# Opt this crate back into dist (the workspace default in dist-workspace.toml is
+# `dist = false` because the other 7 crates are libraries that ship no binary).
+# Only `sconce` produces the user-facing `sconce` binary, so it's the only
+# package dist needs to build.
+[package.metadata.dist]
+dist = true
+
 [dependencies]
 sconce-archive = { workspace = true }
 sconce-cas = { workspace = true }
