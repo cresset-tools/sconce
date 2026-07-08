@@ -1,0 +1,54 @@
+# Nightly database snapshot → sconce.
+#
+# Copy this into your application repo as `.github/workflows/db-snapshot.yml`
+# (and `upload-snapshot.sh` next to it, e.g. `.github/scripts/`). It produces an
+# anonymized dump from production with jibs and uploads it to sconce as the
+# `<env>/latest` snapshot — no long-lived sconce credential is stored; the job
+# authenticates with a per-run GitHub OIDC token. See README.md for the one-time
+# sconce + secrets setup.
+name: db-snapshot
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC nightly
+  workflow_dispatch: {} # allow manual runs
+
+# Least privilege: only the OIDC token (to auth to sconce) and repo read.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: db-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    env:
+      SCONCE_URL: https://repo.example.com # your sconce base URL
+      SCONCE_REPO: acme/backend # org/repo in sconce
+      SNAPSHOT_ENV: production
+      PROD_SSH_HOST: deploy@prod.example.com # host jibs streams the dump from
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jibs
+        run: |
+          curl -fsSL https://github.com/cresset-tools/jibs/releases/latest/download/jibs-installer.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure SSH to production
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${PROD_SSH_HOST#*@}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Produce an anonymized dump
+        # `shop.jibs` (committed to your repo) declares the tables + anonymization
+        # rules; jibs runs them server-side over SSH and streams a .jibsdump back.
+        run: jibs import shop.jibs --host "$PROD_SSH_HOST" --dump-to nightly.jibsdump
+
+      - name: Upload to sconce
+        run: ./.github/scripts/upload-snapshot.sh nightly.jibsdump

@@ -175,34 +175,67 @@ fn created_response(environment: &str, blob: &BlobId) -> Response {
 // Download
 // ---------------------------------------------------------------------------
 
-/// `GET /{org}/{repo}/snapshots/{env}/latest` — resolve the environment's current
-/// latest snapshot and 302 to a short-lived presigned URL (the dist model), or
-/// proxy the bytes on a filesystem backend. Gated on a repo **read** token, so a
-/// license key or publish token can't pull prod data.
+/// `GET /{org}/{repo}/snapshots/{env}/latest` — download the environment's current
+/// latest snapshot. Gated on a repo **read** token.
 pub(crate) async fn download_latest(
     State(s): State<AppState>,
     Path((org, repo, environment)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let repo_id = s
-        .catalog
-        .resolve_repo(&org, &repo)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let token = crate::extract_token(&headers).ok_or(AppError::Unauthorized)?;
-    if !s.catalog.token_valid(repo_id, &token).await? {
-        return Err(AppError::Unauthorized);
-    }
-
+    let repo_id = authorize_read(&s, &org, &repo, &headers).await?;
     let snapshot = s
         .catalog
         .resolve_latest(repo_id, &environment)
         .await?
         .ok_or(AppError::NotFound)?;
-    let id = BlobId::from_bytes(snapshot.blob_sha256);
+    serve_blob(&s, snapshot.blob_sha256).await
+}
 
-    // Object-store backend: hand the client a short-lived presigned URL and 302 to
-    // it (one HEAD first so a dangling blob 404s as sconce, not store XML).
+/// `GET /{org}/{repo}/snapshots/{env}/{digest}` — download a **pinned** snapshot by
+/// its 64-hex blob digest, for reproducible pulls (a lockfile / CI parity can pin
+/// the exact bytes a dev used). The digest must name a snapshot registered in this
+/// repo+environment — so a read token can't fish arbitrary CAS blobs by sha. Gated
+/// on a repo **read** token.
+pub(crate) async fn download_digest(
+    State(s): State<AppState>,
+    Path((org, repo, environment, digest)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let repo_id = authorize_read(&s, &org, &repo, &headers).await?;
+    let sha = crate::parse_hex32(&digest).ok_or(AppError::NotFound)?;
+    let snapshot = s
+        .catalog
+        .resolve_snapshot_by_digest(repo_id, &environment, &sha)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    serve_blob(&s, snapshot.blob_sha256).await
+}
+
+/// Resolve `(org, repo)` and require a valid repo **read** token (rejects license
+/// keys and publish tokens, so only a serving credential can pull prod data).
+async fn authorize_read(
+    s: &AppState,
+    org: &str,
+    repo: &str,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppError> {
+    let repo_id = s
+        .catalog
+        .resolve_repo(org, repo)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let token = crate::extract_token(headers).ok_or(AppError::Unauthorized)?;
+    if !s.catalog.token_valid(repo_id, &token).await? {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(repo_id)
+}
+
+/// Serve a snapshot blob: 302 to a short-lived presigned URL on an object-store
+/// backend (the dist model — one HEAD first so a dangling blob 404s as sconce, not
+/// store XML), or proxy the bytes on a filesystem backend.
+async fn serve_blob(s: &AppState, blob_sha256: [u8; 32]) -> Result<Response, AppError> {
+    let id = BlobId::from_bytes(blob_sha256);
     if let Some(url) = s.store.presigned_get(&id, PRESIGN_SECS) {
         let store = s.store.clone();
         if !crate::blocking(move || store.exists(&id)).await? {
@@ -210,8 +243,6 @@ pub(crate) async fn download_latest(
         }
         return Ok((StatusCode::FOUND, [(header::LOCATION, url)]).into_response());
     }
-
-    // Filesystem backend: no presign → proxy the bytes.
     let store = s.store.clone();
     match crate::blocking(move || store.get(&id)).await? {
         Some(bytes) => {

@@ -98,6 +98,10 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             "/{org}/{repo}/snapshots/{env}/latest",
             get(snapshots::download_latest),
         )
+        .route(
+            "/{org}/{repo}/snapshots/{env}/{digest}",
+            get(snapshots::download_digest),
+        )
         // Management API (service-token auth) — provisioning for commerce
         // front-ends like the Magento module. See `api`.
         .route(
