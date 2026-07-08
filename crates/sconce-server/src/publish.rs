@@ -232,38 +232,39 @@ pub(crate) async fn upload_complete(
     }
     let expected_sha = parse_hex32(&req.sha256)
         .ok_or_else(|| AppError::BadRequest("sha256 must be 64 hex chars".into()))?;
-    let cap = max_package_bytes();
     let total: u64 = parts
         .iter()
         .map(|p| u64::try_from(p.size_bytes).unwrap_or(0))
         .sum();
-    if total > cap {
-        return Err(AppError::PayloadTooLarge);
-    }
-
     let ids: Vec<BlobId> = parts
         .iter()
         .map(|p| as_blob_id(&p.chunk_sha256))
         .collect::<Option<_>>()
         .ok_or(AppError::NotFound)?;
-    let store = s.store.clone();
-    let expected_name = format!("{}/{}", session.vendor, session.name);
-    let prepared = spawn_prepare(move || {
-        assemble_and_archive(&store, &ids, expected_sha, &expected_name, cap)
-    })
-    .await?;
 
-    let outcome = persist(
-        &s,
-        repo_id,
-        &session.vendor,
-        &session.name,
-        &session.version,
-        prepared,
-    )
-    .await?;
+    // Assemble + ingest, dispatched on what this session is uploading. A snapshot is
+    // stored verbatim (see `snapshots`); a package is re-archived here.
+    let response = if session.kind == "snapshot" {
+        crate::snapshots::finish_upload(&s, &session, &ids, expected_sha, total).await?
+    } else {
+        let cap = max_package_bytes();
+        if total > cap {
+            return Err(AppError::PayloadTooLarge);
+        }
+        let vendor = session.vendor.clone().unwrap_or_default();
+        let name = session.name.clone().unwrap_or_default();
+        let version = session.version.clone().unwrap_or_default();
+        let expected_name = format!("{vendor}/{name}");
+        let store = s.store.clone();
+        let prepared = spawn_prepare(move || {
+            assemble_and_archive(&store, &ids, expected_sha, &expected_name, cap)
+        })
+        .await?;
+        let outcome = persist(&s, repo_id, &vendor, &name, &version, prepared).await?;
+        publish_response(outcome)
+    };
     s.catalog.set_upload_status(upload_id, "completed").await?;
-    Ok(publish_response(outcome))
+    Ok(response)
 }
 
 /// `DELETE /{org}/{repo}/uploads/{upload_id}` — abort. Staged chunks are reclaimed
