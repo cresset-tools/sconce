@@ -35,7 +35,7 @@ jobs:
 
       - name: Install jibs
         run: |
-          curl -fsSL https://github.com/cresset-tools/jibs/releases/latest/download/jibs-installer.sh | sh
+          curl -fsSL https://bougie.tools/jibs.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure SSH to production
