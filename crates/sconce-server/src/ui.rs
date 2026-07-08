@@ -3101,6 +3101,7 @@ async fn repo_page(
                 claims,
                 ttl: p.token_ttl_secs,
                 id: p.id.to_string(),
+                capability: p.capability.clone(),
             }
         })
         .collect();
@@ -3511,6 +3512,9 @@ struct CiForm {
     audience: String,
     claims: Option<String>,
     ttl: Option<String>,
+    /// `read` (mint a serving token, default) or `publish` (mint a publish token
+    /// so a zero-secret CI workflow can upload package versions).
+    capability: Option<String>,
 }
 
 async fn add_ci(
@@ -3523,6 +3527,11 @@ async fn add_ci(
     if !matches!(f.provider.as_str(), "github" | "gitlab") {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let capability = match f.capability.as_deref().unwrap_or("read") {
+        "" | "read" => "read",
+        "publish" => "publish",
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
     let ttl = match f.ttl.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
         Some(t) => t
             .parse::<i64>()
@@ -3539,6 +3548,7 @@ async fn add_ci(
             f.audience.trim(),
             &claims,
             ttl,
+            capability,
         )
         .await
         .map_err(e500)?;

@@ -13,10 +13,14 @@ description = "HTTP server exposing the Composer v2 wire API (packages.json, p2 
 sconce-catalog = { workspace = true }
 sconce-cas = { workspace = true }
 sconce-metadata = { workspace = true }
+# Deterministic re-archiving of an uploaded package tree (the publish path).
+sconce-archive = { workspace = true }
+# Composer version normalization for a published version string.
+composer-semver = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
 base64 = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -32,6 +36,17 @@ askama_web = { workspace = true }
 lettre = { workspace = true }
 # Emit log events; the binary installs the subscriber.
 tracing = { workspace = true }
+# Publish uploads: untar (`tar`), gunzip (`flate2`), Composer dist sha1, and
+# sha256 of the assembled input for integrity checks on chunked completes.
+tar = { workspace = true }
+flate2 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Drive the router in-process (oneshot) for the publish integration test.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

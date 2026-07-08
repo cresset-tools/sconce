@@ -24,14 +24,15 @@ pub mod ci;
 pub mod csrf;
 pub mod mail;
 pub mod oidc;
+mod publish;
 pub mod ratelimit;
 pub mod ui;
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use base64::Engine as _;
 use sconce_cas::{AnyBlobStore, BlobId, BlobStore};
 use sconce_catalog::Catalog;
@@ -50,11 +51,37 @@ struct AppState {
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
 /// gated by a token valid *for that repository*.
 pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router {
+    // Uploads carry package bytes, so they need a much larger body cap than axum's
+    // 2 MiB default — applied per-route so the read/serving routes keep the default.
+    let max_upload = publish::max_upload_bytes();
+    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
     Router::new()
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
         .route("/{org}/{repo}/dist/{*rest}", get(dist))
         .route("/oauth/ci", post(oauth_ci))
+        .route("/oauth/ci-publish", post(oauth_ci_publish))
+        // Publish (push) API — single-shot + chunked/resumable uploads.
+        .route(
+            "/{org}/{repo}/packages/{vendor}/{name}/{version}",
+            put(publish::publish_single).layer(upload_limit),
+        )
+        .route(
+            "/{org}/{repo}/packages/{vendor}/{name}/{version}/uploads",
+            post(publish::upload_init),
+        )
+        .route(
+            "/{org}/{repo}/uploads/{upload_id}/parts/{n}",
+            put(publish::upload_part).layer(upload_limit),
+        )
+        .route(
+            "/{org}/{repo}/uploads/{upload_id}",
+            get(publish::upload_status).delete(publish::upload_abort),
+        )
+        .route(
+            "/{org}/{repo}/uploads/{upload_id}/complete",
+            post(publish::upload_complete),
+        )
         // Management API (service-token auth) — provisioning for commerce
         // front-ends like the Magento module. See `api`.
         .route(
@@ -336,7 +363,7 @@ async fn dist(
 
 /// Run one blocking store operation (disk or S3 round-trip via ureq) off the
 /// async executor.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     op: impl FnOnce() -> std::io::Result<T> + Send + 'static,
 ) -> Result<T, AppError> {
     tokio::task::spawn_blocking(op)
@@ -369,14 +396,14 @@ struct CiExchange {
     jwt: String,
 }
 
-/// Trade a CI OIDC JWT for a short-lived repo token (zero stored secret). The
-/// JWT is validated against each of the repo's CI policies (signature via the
-/// issuer's JWKS, `iss`/`aud`/`exp`, then the claim matchers); the first match
-/// mints a token. 401 if nothing matches.
-async fn oauth_ci(
-    State(s): State<AppState>,
-    Json(req): Json<CiExchange>,
-) -> Result<Json<serde_json::Value>, AppError> {
+/// Validate a CI OIDC JWT against the repo's policies of a given `capability`
+/// (signature via the issuer's JWKS, `iss`/`aud`/`exp`, then the claim matchers).
+/// Returns the first matching `(repo_id, workload label, token ttl)`, or `None`.
+async fn ci_match(
+    s: &AppState,
+    req: &CiExchange,
+    capability: &str,
+) -> Result<Option<(Uuid, String, i64)>, AppError> {
     let (org, repo) = req.repository.split_once('/').ok_or(AppError::NotFound)?;
     let repo_id = s
         .catalog
@@ -385,6 +412,11 @@ async fn oauth_ci(
         .ok_or(AppError::NotFound)?;
 
     for policy in s.catalog.ci_policies(repo_id).await? {
+        // Each exchange only considers policies that grant its capability, so a
+        // serving policy can never mint a publish token and vice versa.
+        if policy.capability != capability {
+            continue;
+        }
         // A JWKS fetch failure for one issuer shouldn't doom other policies.
         let Ok(jwks) = ci::fetch_jwks(&policy.issuer).await else {
             continue;
@@ -395,22 +427,52 @@ async fn oauth_ci(
         if !ci::claims_match(&claims, &policy.claims) {
             continue;
         }
-        // Matched → mint a short-lived CI token labelled with the workload `sub`.
         let label = claims
             .get("sub")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("ci");
-        let token = s
-            .catalog
-            .create_ci_token(repo_id, label, policy.token_ttl_secs)
-            .await?;
-        return Ok(Json(json!({
-            "access_token": token,
-            "token_type": "Bearer",
-            "expires_in": policy.token_ttl_secs,
-        })));
+            .unwrap_or("ci")
+            .to_owned();
+        return Ok(Some((repo_id, label, policy.token_ttl_secs)));
     }
-    Err(AppError::Unauthorized)
+    Ok(None)
+}
+
+/// Trade a CI OIDC JWT for a short-lived **read** token (zero stored secret) — the
+/// serving credential a Composer client uses. 401 if no `read` policy matches.
+async fn oauth_ci(
+    State(s): State<AppState>,
+    Json(req): Json<CiExchange>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match ci_match(&s, &req, "read").await? {
+        Some((repo_id, label, ttl)) => {
+            let token = s.catalog.create_ci_token(repo_id, &label, ttl).await?;
+            Ok(Json(json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": ttl,
+            })))
+        }
+        None => Err(AppError::Unauthorized),
+    }
+}
+
+/// Trade a CI OIDC JWT for a short-lived **publish** token (zero stored secret) —
+/// the credential the publish API requires. 401 if no `publish` policy matches.
+async fn oauth_ci_publish(
+    State(s): State<AppState>,
+    Json(req): Json<CiExchange>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match ci_match(&s, &req, "publish").await? {
+        Some((repo_id, label, ttl)) => {
+            let token = s.catalog.create_publish_token(repo_id, &label, ttl).await?;
+            Ok(Json(json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": ttl,
+            })))
+        }
+        None => Err(AppError::Unauthorized),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -419,6 +481,21 @@ enum AppError {
     NotFound,
     #[error("unauthorized")]
     Unauthorized,
+    /// A valid publish token, but for a different repository than the path.
+    #[error("forbidden")]
+    Forbidden,
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    /// The upload session or version is in a state that rejects the request
+    /// (e.g. a closed session, or a version already published with other bytes).
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// The assembled package exceeds `SCONCE_MAX_PACKAGE_BYTES`.
+    #[error("payload too large")]
+    PayloadTooLarge,
+    /// A staged upload chunk was reclaimed before the upload completed.
+    #[error("gone")]
+    Gone,
     #[error("catalog error")]
     Catalog(#[from] sconce_catalog::SqlxError),
     #[error("storage error")]
@@ -430,6 +507,11 @@ impl IntoResponse for AppError {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND.into_response(),
             AppError::Unauthorized => unauthorized(),
+            AppError::Forbidden => StatusCode::FORBIDDEN.into_response(),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+            AppError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
+            AppError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            AppError::Gone => StatusCode::GONE.into_response(),
             AppError::Catalog(_) | AppError::Storage(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
