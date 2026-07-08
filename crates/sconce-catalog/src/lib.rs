@@ -959,6 +959,22 @@ pub struct IssuedLicense {
     pub created: bool,
 }
 
+/// The outcome of [`Catalog::add_edition_to_license`] — attaching an edition's
+/// content to an existing key so a repeat buyer accumulates onto one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditionAdd {
+    /// The edition's content was attached (or was already present — idempotent).
+    Added,
+    /// The key or the edition can't be safely merged onto a shared key
+    /// (non-perpetual bound, or a snapshot edition). The key is untouched; the
+    /// caller should issue a standalone key instead.
+    Standalone,
+    /// No active key with that id in the repo.
+    NoKey,
+    /// No active edition with that id in the repo.
+    NoEdition,
+}
+
 /// The outcome of resolving a single-package edition's target set via
 /// [`Catalog::singleton_set`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4894,6 +4910,27 @@ impl Catalog {
         let license_id: Uuid = row.try_get("id")?;
         let set_id: Uuid = row.try_get("set_id")?;
         let snapshot: bool = row.try_get("snapshot")?;
+        Self::attach_edition_set(&mut tx, license_id, set_id, snapshot).await?;
+        tx.commit().await?;
+        Ok(Some(IssuedLicense {
+            id: license_id,
+            key: Some(key),
+            created: true,
+        }))
+    }
+
+    /// Attach an edition's target set to a license inside a transaction, exactly
+    /// as issuance does: freeze current membership as explicit per-package
+    /// entitlements when the edition snapshots at issue, else unlock the set by
+    /// reference (auto-growing as the set grows). Idempotent (`on conflict do
+    /// nothing`). Shared by [`Self::issue_from_edition`] and
+    /// [`Self::add_edition_to_license`] so both attach content identically.
+    async fn attach_edition_set(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        license_id: Uuid,
+        set_id: Uuid,
+        snapshot: bool,
+    ) -> Result<(), sqlx::Error> {
         if snapshot {
             // Freeze current set membership as explicit per-package entitlements.
             sqlx::query(
@@ -4909,7 +4946,7 @@ impl Catalog {
             )
             .bind(license_id)
             .bind(set_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         } else {
             // Unlock by reference — auto-grows with the set.
@@ -4919,15 +4956,103 @@ impl Catalog {
             )
             .bind(license_id)
             .bind(set_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
+        Ok(())
+    }
+
+    /// Attach an edition's sellable content to an **existing** license key, so a
+    /// repeat buyer accumulates purchases onto one key (a single Composer auth
+    /// entry then unlocks everything they own). Returns [`EditionAdd`].
+    ///
+    /// Only merges when the key **and** the edition are perpetual and
+    /// by-reference: sconce stores the update bound per *key* (not per
+    /// entitlement), so folding a time/version-bounded edition — or a snapshot
+    /// edition, whose frozen per-package rows can't be cleanly detached on a
+    /// refund — onto a shared key would silently over/under-entitle. Any such
+    /// case yields [`EditionAdd::Standalone`] and leaves the key untouched, so
+    /// the caller issues a separate key instead (matching the subscription
+    /// carve-out). Idempotent: re-adding the same edition is a no-op.
+    pub async fn add_edition_to_license(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+        edition_id: Uuid,
+    ) -> Result<EditionAdd, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Target must be an active key in this repo; capture whether it's perpetual
+        // (no time bound and no version cap).
+        let key_perpetual: Option<bool> = sqlx::query_scalar(
+            "select (update_until is null and version_cap_major is null) \
+             from license_keys where id = $1 and repo_id = $2 and status = 'active'",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(key_perpetual) = key_perpetual else {
+            tx.rollback().await?;
+            return Ok(EditionAdd::NoKey);
+        };
+        // Edition must be active in this repo; capture its set, bound kind, and
+        // snapshot flag.
+        let ed: Option<(Uuid, String, bool)> = sqlx::query_as(
+            "select set_id, bound_kind, snapshot_at_issue \
+             from editions where id = $1 and repo_id = $2 and active",
+        )
+        .bind(edition_id)
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((set_id, bound_kind, snapshot)) = ed else {
+            tx.rollback().await?;
+            return Ok(EditionAdd::NoEdition);
+        };
+        if !key_perpetual || bound_kind != "perpetual" || snapshot {
+            tx.rollback().await?;
+            return Ok(EditionAdd::Standalone);
+        }
+        Self::attach_edition_set(&mut tx, license_id, set_id, snapshot).await?;
         tx.commit().await?;
-        Ok(Some(IssuedLicense {
-            id: license_id,
-            key: Some(key),
-            created: true,
-        }))
+        Ok(EditionAdd::Added)
+    }
+
+    /// Detach an edition's set entitlement from a license — a refund of one line
+    /// item on a shared key. Removes only the by-reference set entitlement, the
+    /// mirror of how [`Self::add_edition_to_license`] attached it. Returns whether
+    /// the key exists in the repo (so a caller distinguishes "removed / nothing to
+    /// remove" from "no such key"). Idempotent, and deliberately does **not**
+    /// revoke the key even when it now entitles nothing: the caller tracks the
+    /// per-item rows and revokes once the last item is gone.
+    pub async fn remove_edition_from_license(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+        edition_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        // Both the key and the edition are repo-scoped (defense in depth): the
+        // subselects yield no id for a foreign key/edition, so the delete matches
+        // nothing.
+        sqlx::query(
+            "delete from license_set_entitlements \
+             where license_key_id = (select id from license_keys \
+                                     where id = $1 and repo_id = $2) \
+               and set_id = (select set_id from editions \
+                             where id = $3 and repo_id = $2)",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .bind(edition_id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query_scalar(
+            "select exists(select 1 from license_keys where id = $1 and repo_id = $2)",
+        )
+        .bind(license_id)
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// The license id previously issued for a `(repo, edition, idempotency_key)`,
@@ -7937,6 +8062,143 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ed_link, Some(ed));
+    }
+
+    #[tokio::test]
+    async fn editions_accumulate_onto_perpetual_key_and_detach_on_refund() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of_repo(&cat, repo_id).await;
+        for n in ["acme/a", "acme/b", "acme/c"] {
+            cat.upsert_package(repo_id, n, "git", None, Visibility::Private)
+                .await
+                .unwrap();
+        }
+        // One by-reference set + edition per package: A and B perpetual, C annual.
+        let mk_ed = async |name: &str, bound: EditionBound| {
+            let set = cat.create_package_set(org_id, name).await.unwrap();
+            cat.add_set_rule(set, &format!("acme/{}", name.to_lowercase()))
+                .await
+                .unwrap();
+            cat.create_edition(
+                repo_id,
+                name,
+                Some(&name.to_lowercase()),
+                set,
+                &bound,
+                false,
+                &PolicyOverride::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let ed_a = mk_ed("A", EditionBound::Perpetual).await;
+        let ed_b = mk_ed("B", EditionBound::Perpetual).await;
+        let ed_c = mk_ed("C", EditionBound::Time { period_months: 12 }).await;
+
+        // First purchase mints the customer's account key: perpetual, A only.
+        let key = cat
+            .issue_from_edition(repo_id, ed_a, Some("buyer@x"), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .unwrap();
+        let lic = cat.resolve_license(repo_id, &key).await.unwrap().unwrap();
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a"]
+        );
+
+        // A second perpetual purchase accumulates onto the same key…
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, lic, ed_b)
+                .await
+                .unwrap(),
+            EditionAdd::Added
+        );
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a", "acme/b"]
+        );
+        // …idempotently (a retried webhook is a no-op).
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, lic, ed_b)
+                .await
+                .unwrap(),
+            EditionAdd::Added
+        );
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a", "acme/b"]
+        );
+
+        // A time-bounded edition can't be merged onto the perpetual key (the bound
+        // lives on the key, not the entitlement) — caller issues a standalone key.
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, lic, ed_c)
+                .await
+                .unwrap(),
+            EditionAdd::Standalone
+        );
+        // Nor can a perpetual edition be merged onto a time-bounded key.
+        let tkey = cat
+            .issue_from_edition(repo_id, ed_c, None, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .unwrap();
+        let tlic = cat.resolve_license(repo_id, &tkey).await.unwrap().unwrap();
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, tlic, ed_a)
+                .await
+                .unwrap(),
+            EditionAdd::Standalone
+        );
+        assert_eq!(
+            cat.entitled_package_names(tlic).await.unwrap(),
+            vec!["acme/c"]
+        );
+
+        // Unknown key / edition are distinct, non-mutating outcomes.
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, Uuid::new_v4(), ed_b)
+                .await
+                .unwrap(),
+            EditionAdd::NoKey
+        );
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, lic, Uuid::new_v4())
+                .await
+                .unwrap(),
+            EditionAdd::NoEdition
+        );
+
+        // Refund of the second item detaches just that edition; the key and its
+        // other entitlement survive. Idempotent, and reports the key still exists.
+        assert!(
+            cat.remove_edition_from_license(repo_id, lic, ed_b)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a"]
+        );
+        assert!(
+            cat.remove_edition_from_license(repo_id, lic, ed_b)
+                .await
+                .unwrap()
+        );
+        // Removing from a key that isn't in the repo reports false (not found).
+        assert!(
+            !cat.remove_edition_from_license(repo_id, Uuid::new_v4(), ed_b)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

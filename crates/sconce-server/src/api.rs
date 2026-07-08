@@ -10,6 +10,10 @@
 //! - `POST license-keys` — issue against an edition (`Idempotency-Key` = order id).
 //! - `GET license-keys/{id}` — inspect: entitlements, bound, install info.
 //! - `POST license-keys/{id}/renew` — extend the update bound.
+//! - `POST license-keys/{id}/editions` — attach an edition to a key (a repeat
+//!   buyer accumulates purchases onto one key).
+//! - `DELETE license-keys/{id}/editions/{edition}` — detach an edition (refund
+//!   of one line item on a shared key).
 //! - `DELETE license-keys/{id}` — revoke.
 
 use axum::extract::{FromRequestParts, Path, State};
@@ -22,7 +26,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::{AppState, extract_token, repo_base};
-use sconce_catalog::LicenseDetail;
+use sconce_catalog::{EditionAdd, LicenseDetail};
 
 /// A management-API failure, rendered as `{"error": "..."}` with a status.
 pub(crate) enum ApiError {
@@ -32,6 +36,9 @@ pub(crate) enum ApiError {
     Forbidden,
     NotFound(&'static str),
     BadRequest(String),
+    /// The request is valid but conflicts with the resource's state (e.g. an
+    /// edition that can't be merged onto a shared key).
+    Conflict(String),
     Db(sconce_catalog::SqlxError),
 }
 
@@ -54,6 +61,7 @@ impl IntoResponse for ApiError {
             ),
             ApiError::NotFound(what) => (StatusCode::NOT_FOUND, format!("{what} not found")),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Db(e) => {
                 tracing::error!(error = %e, "management API database error");
                 (
@@ -261,6 +269,83 @@ pub(crate) async fn renew_license(
         .await?
         .ok_or(ApiError::NotFound("license"))?;
     Ok(Json(license_json(&s, &org, &repo, &detail)))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AddEditionReq {
+    /// Edition name or slug to attach to the key.
+    edition: String,
+}
+
+/// `POST /api/v1/repos/{org}/{repo}/license-keys/{id}/editions` — attach an
+/// edition's content to an existing key, so a repeat buyer accumulates their
+/// purchases onto one key (one Composer auth entry unlocks everything they own).
+/// `200` with the updated license on success (or an idempotent replay). `409`
+/// when the edition can't be merged onto this key (non-perpetual bound, or a
+/// snapshot edition) — the caller should issue a standalone key instead. `404`
+/// if the key isn't in this repo, `400` for an unknown/inactive edition.
+pub(crate) async fn add_license_edition(
+    State(s): State<AppState>,
+    Path((org, repo, id)): Path<(String, String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
+    Json(req): Json<AddEditionReq>,
+) -> Result<Response, ApiError> {
+    let license_id = parse_license_id(&id)?;
+    let edition_id = s
+        .catalog
+        .find_edition(repo_id, req.edition.trim())
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("no edition '{}' in {org}/{repo}", req.edition))
+        })?;
+    match s
+        .catalog
+        .add_edition_to_license(repo_id, license_id, edition_id)
+        .await?
+    {
+        EditionAdd::Added => {
+            let detail = s
+                .catalog
+                .license_detail(repo_id, license_id)
+                .await?
+                .ok_or(ApiError::NotFound("license"))?;
+            Ok((StatusCode::OK, Json(license_json(&s, &org, &repo, &detail))).into_response())
+        }
+        EditionAdd::Standalone => Err(ApiError::Conflict(format!(
+            "edition '{}' can't be merged onto this key (issue a standalone key instead)",
+            req.edition
+        ))),
+        EditionAdd::NoKey => Err(ApiError::NotFound("license")),
+        EditionAdd::NoEdition => Err(ApiError::BadRequest(format!(
+            "edition '{}' is inactive",
+            req.edition
+        ))),
+    }
+}
+
+/// `DELETE /api/v1/repos/{org}/{repo}/license-keys/{id}/editions/{edition}` —
+/// detach an edition's content from a key (a refund of one line item on a shared
+/// key). `204` whether or not the entitlement was present (idempotent); `404` if
+/// the key isn't in this repo. Never revokes the key even if it now entitles
+/// nothing — the caller revokes once its last line item is refunded.
+pub(crate) async fn remove_license_edition(
+    State(s): State<AppState>,
+    Path((_org, _repo, id, edition)): Path<(String, String, String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
+) -> Result<Response, ApiError> {
+    let license_id = parse_license_id(&id)?;
+    // An unknown edition can't have entitled the key, so removing it is a no-op.
+    let Some(edition_id) = s.catalog.find_edition(repo_id, edition.trim()).await? else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    if s.catalog
+        .remove_edition_from_license(repo_id, license_id, edition_id)
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Err(ApiError::NotFound("license"))
+    }
 }
 
 /// `DELETE /api/v1/repos/{org}/{repo}/license-keys/{id}` — revoke a key.

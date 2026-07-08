@@ -32,7 +32,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Redirect, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
 use sconce_cas::{AnyBlobStore, BlobId, BlobStore};
 use sconce_catalog::Catalog;
@@ -99,6 +99,14 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .route(
             "/api/v1/repos/{org}/{repo}/license-keys/{id}/renew",
             post(api::renew_license),
+        )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys/{id}/editions",
+            post(api::add_license_edition),
+        )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys/{id}/editions/{edition}",
+            delete(api::remove_license_edition),
         )
         .route("/healthz", get(healthz))
         .with_state(AppState {
