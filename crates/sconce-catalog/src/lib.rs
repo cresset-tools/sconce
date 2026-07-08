@@ -5603,6 +5603,31 @@ impl Catalog {
         row.as_ref().map(row_to_snapshot).transpose()
     }
 
+    /// Resolve a snapshot pinned by its blob digest within a repo+environment — for
+    /// reproducible downloads. Scoped to the repo+environment so a read token can't
+    /// resolve an arbitrary CAS blob it was never granted. `None` if no snapshot in
+    /// that repo+environment references the digest.
+    pub async fn resolve_snapshot_by_digest(
+        &self,
+        repo_id: Uuid,
+        environment: &str,
+        blob_sha256: &[u8; 32],
+    ) -> Result<Option<Snapshot>, sqlx::Error> {
+        let row = sqlx::query(
+            "select id, environment, blob_sha256, size_bytes, source_ref, \
+                    extract(epoch from created_at)::bigint as created_at \
+             from snapshots \
+             where repo_id = $1 and environment = $2 and blob_sha256 = $3 \
+             order by created_at desc limit 1",
+        )
+        .bind(repo_id)
+        .bind(environment)
+        .bind(&blob_sha256[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_snapshot).transpose()
+    }
+
     /// A repo+environment's snapshots, newest first.
     pub async fn list_snapshots(
         &self,
@@ -8144,6 +8169,47 @@ mod tests {
         // Each snapshot refcounts its blob (via the 0045 trigger).
         assert_eq!(refcount(&cat, &sha1).await, Some(1));
         assert_eq!(refcount(&cat, &sha2).await, Some(1));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn snapshot_resolve_by_digest_is_repo_and_env_scoped() {
+        let _serial = serial_blobs();
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let sha = test_sha(repo_id, 41);
+        cat.upsert_blob(&sha, 500).await.unwrap();
+        cat.create_snapshot(repo_id, "production", &sha, 500, None)
+            .await
+            .unwrap();
+
+        // Pinned resolve of the exact digest in its repo+env.
+        let got = cat
+            .resolve_snapshot_by_digest(repo_id, "production", &sha)
+            .await
+            .unwrap()
+            .expect("digest resolves in its repo+env");
+        assert_eq!(got.blob_sha256, sha);
+        assert_eq!(got.size_bytes, 500);
+
+        // Same digest, wrong environment → not found (env-scoped).
+        assert!(
+            cat.resolve_snapshot_by_digest(repo_id, "staging", &sha)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A digest that is a real CAS blob but not a snapshot here → not found
+        // (a read token can't fish arbitrary blobs by sha).
+        let other = test_sha(repo_id, 42);
+        cat.upsert_blob(&other, 500).await.unwrap();
+        assert!(
+            cat.resolve_snapshot_by_digest(repo_id, "production", &other)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
