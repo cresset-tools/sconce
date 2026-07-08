@@ -125,3 +125,10 @@ lto = "fat"
 opt-level = 3
 panic = "abort"
 strip = "symbols"
+
+# The profile cargo-dist builds release binaries with (see dist-workspace.toml).
+# Thin LTO keeps release-build times reasonable across the target matrix while
+# still inheriting the release profile's size/speed settings.
+[profile.dist]
+inherits = "release"
+lto = "thin"

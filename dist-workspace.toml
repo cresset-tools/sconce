@@ -1,0 +1,104 @@
+# dist configuration, following the shared cresset-tools pattern (see jibs /
+# wick / bougie). Produces per-target `sconce` binary archives plus a shell
+# installer. release-please owns the whole release: it publishes the
+# `sconce-v<version>` GitHub Release (creating the tag), and the
+# `release: published` event triggers dist to build the binaries and upload
+# them onto that release; publish-mirror.yml then fans them out to
+# origin.bougie.tools.
+#
+# Edit this file when adding targets / installers, then regenerate the
+# workflow with:
+#     dist generate
+# which rewrites .github/workflows/sconce-release.yml. NOTE: `dist generate`
+# (run once with `allow-dirty` cleared to emit the file) uses an
+# `on: push: tags` trigger; we hand-edit it to `on: release: published`
+# (release-please creates tags via the API, which doesn't reliably fire
+# `push`). Re-apply that trigger edit after any regenerate. `allow-dirty =
+# ["ci"]` tells dist we own that file so its `generate --check` won't abort.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# Pin the dist version CI runs. Bumps come through PRs so the generated
+# release.yml stays in lockstep. Kept in step with the rest of the family.
+cargo-dist-version = "0.32.0"
+
+# The workspace has 8 crates; only `sconce` ships a binary. `dist = false`
+# opts every package out by default; the `sconce` crate opts itself back in
+# via `[package.metadata.dist] dist = true` in crates/sconce/Cargo.toml.
+dist = false
+
+# CI provider.
+ci = "github"
+
+# `curl ... | sh` installer. No PowerShell installer / Windows binaries: sconce
+# is a server + a CI-side publish client, run on Linux (the action) and macOS
+# (dev) — mirrors jibs. Can be extended later.
+installers = ["shell"]
+
+# Archive format.
+unix-archive = ".tar.gz"
+
+# Target triples we ship prebuilt binaries for. Linux gets both gnu and musl
+# (older distros and Alpine both work — the musl static binary is what CI
+# actions install); macOS is Apple Silicon.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+]
+
+# Keep the tarballs to just the binary the installer drops on PATH.
+auto-includes = false
+
+# release-please publishes the GitHub Release (with the changelog body) and
+# creates the tag; dist only attaches the built binaries. `create-release =
+# false` makes dist upload onto that pre-existing release rather than create
+# its own. See release-please.yml + build-docker.yml (which also fire on the
+# `release: published` event).
+create-release = false
+
+# We hand-edit release.yml's trigger to `on: release: published`, so tell dist
+# we own the CI file and skip its `generate --check`.
+allow-dirty = ["ci"]
+
+# Don't run dist on PRs. CI already covers building.
+pr-run-mode = "skip"
+
+# release-please tags as `sconce-v<version>` rather than the bare `v<version>`
+# dist defaults to. Without this dist's release.yml wouldn't recognize the tag.
+tag-namespace = "sconce"
+
+# Where the shell installer drops the binary. Matches uv's layout so installs
+# land on PATH without extra config.
+install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
+
+# Mirror first, GitHub fallback. The "simple" host MUST be listed in `hosting`
+# for it to reach the generated installer; the order here is the download
+# precedence the shell installer uses (try the mirror, fall back to the GitHub
+# release if it's offline / hasn't ingested the new tag yet). Shared cresset
+# origin mirror (origin.bougie.tools; see publish-mirror.yml + cresset-tools/infra).
+hosting = ["simple", "github"]
+simple-download-url = "https://releases.bougie.tools/github/sconce/releases/download/{tag}"
+
+# Fan the dist artifacts out to the origin mirror after the release is
+# announced. build-docker stays an independent `release: published` workflow
+# (not wired here) since it builds from source, not from these archives.
+post-announce-jobs = ["./publish-mirror"]
+
+# publish-mirror only needs to read the uploaded artifacts.
+github-custom-job-permissions = { "publish-mirror" = { contents = "read" } }
+
+# The musl static build compiles C (the rustls crypto provider / ring build);
+# musl-tools provides the musl-targeting C compiler and cmake covers the C
+# build systems. cmake on macOS too for the aarch64-apple-darwin build.
+[dist.dependencies.apt]
+cmake = '*'
+musl-tools = '*'
+
+[dist.dependencies.homebrew]
+cmake = '*'
+
+[dist.binaries]
+"*" = ["sconce"]
