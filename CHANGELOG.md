@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.3.0...sconce-v0.4.0) (2026-07-08)
+
+
+### Features
+
+* **cli:** add `sconce snapshot push` to upload a snapshot from CI ([28283e8](https://github.com/cresset-tools/sconce/commit/28283e8d017642c7aa802dd7de6ad448a26581fc))
+* **cli:** add `sconce snapshot push` to upload a snapshot from CI ([f135303](https://github.com/cresset-tools/sconce/commit/f135303989a7d66ff99092931b5d7028b528c43d))
+* **licensing:** accumulate editions onto a repeat buyer's key ([68ba78e](https://github.com/cresset-tools/sconce/commit/68ba78e51baccc427d5032fb9e5427acc54b1747))
+* **licensing:** accumulate editions onto a repeat buyer's key ([dab0f42](https://github.com/cresset-tools/sconce/commit/dab0f42bad9caa7a8a842fd83ba4b7beaa80be68))
+* **snapshots:** add database snapshot object with upload + latest download ([435bd65](https://github.com/cresset-tools/sconce/commit/435bd6557f1b618ad895eb14c68a822b4c3516d9))
+* **snapshots:** add database snapshot object with upload + latest download ([7505c3a](https://github.com/cresset-tools/sconce/commit/7505c3a16f760340afa17376248e76721e04b7d9))
+* **snapshots:** download by pinned digest + scheduled-dump example ([ffd9e8e](https://github.com/cresset-tools/sconce/commit/ffd9e8eecd1e2445954080fe45a47cee2fa840c2))
+* **snapshots:** download by pinned digest + scheduled-dump example ([12ff7ef](https://github.com/cresset-tools/sconce/commit/12ff7ef9be8a9c9f08b7d8f0ed249050fcb6fee5))
+
 ## [0.3.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.2.0...sconce-v0.3.0) (2026-07-08)
 
 
