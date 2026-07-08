@@ -8442,6 +8442,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn editions_accumulate_onto_perpetual_key_and_detach_on_refund() {
         let Some((cat, repo_id)) = repo().await else {
             return;
