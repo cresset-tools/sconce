@@ -373,6 +373,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0041_edition_integrity",
         include_str!("../migrations/0041_edition_integrity.sql"),
     ),
+    (
+        "0042_ci_policy_capability",
+        include_str!("../migrations/0042_ci_policy_capability.sql"),
+    ),
+    (
+        "0043_publish_tokens",
+        include_str!("../migrations/0043_publish_tokens.sql"),
+    ),
+    (
+        "0044_upload_sessions",
+        include_str!("../migrations/0044_upload_sessions.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -599,6 +611,41 @@ pub struct CiPolicy {
     /// Claim matchers (every key must equal the JWT's claim).
     pub claims: Value,
     pub token_ttl_secs: i64,
+    /// What the minted token can do: `"read"` (Composer serving) or `"publish"`
+    /// (upload package versions). Selected by the matching exchange endpoint.
+    pub capability: String,
+}
+
+/// The result of an immutable publish insert ([`Catalog::insert_pushed_version`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// A new `(package, version)` row was created.
+    Created,
+    /// The version already exists with **identical** dist bytes — a safe,
+    /// idempotent re-publish (e.g. a retried CI job).
+    AlreadyPublished,
+    /// The version already exists with **different** dist bytes — rejected, so
+    /// published versions stay immutable.
+    Conflict,
+}
+
+/// A chunked-upload session ([`Catalog::create_upload_session`]).
+#[derive(Debug, Clone)]
+pub struct UploadSession {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub vendor: String,
+    pub name: String,
+    pub version: String,
+    pub status: String,
+}
+
+/// One staged part of a chunked upload; `chunk_sha256` is its CAS key.
+#[derive(Debug, Clone)]
+pub struct UploadPart {
+    pub part_number: i32,
+    pub chunk_sha256: Vec<u8>,
+    pub size_bytes: i64,
 }
 
 /// An OIDC connection (identity-provider config). `client_secret` is encrypted.
@@ -2564,6 +2611,7 @@ impl Catalog {
     // ----- CI OIDC token exchange -----
 
     /// Add a CI OIDC policy to a repo. Returns the new policy id.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_ci_policy(
         &self,
         repo_id: Uuid,
@@ -2572,10 +2620,12 @@ impl Catalog {
         audience: &str,
         claims: &Value,
         token_ttl_secs: i64,
+        capability: &str,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
-            "insert into ci_oidc_policies (repo_id, provider, issuer, audience, claims, token_ttl_secs) \
-             values ($1, $2, $3, $4, $5, $6) returning id",
+            "insert into ci_oidc_policies \
+                 (repo_id, provider, issuer, audience, claims, token_ttl_secs, capability) \
+             values ($1, $2, $3, $4, $5, $6, $7) returning id",
         )
         .bind(repo_id)
         .bind(provider)
@@ -2583,6 +2633,7 @@ impl Catalog {
         .bind(audience)
         .bind(claims)
         .bind(token_ttl_secs)
+        .bind(capability)
         .fetch_one(&self.pool)
         .await
     }
@@ -2590,7 +2641,7 @@ impl Catalog {
     /// A repo's CI OIDC policies.
     pub async fn ci_policies(&self, repo_id: Uuid) -> Result<Vec<CiPolicy>, sqlx::Error> {
         let rows = sqlx::query(
-            "select id, repo_id, provider, issuer, audience, claims, token_ttl_secs \
+            "select id, repo_id, provider, issuer, audience, claims, token_ttl_secs, capability \
              from ci_oidc_policies where repo_id = $1 order by created_at",
         )
         .bind(repo_id)
@@ -2606,6 +2657,7 @@ impl Catalog {
                     audience: r.try_get("audience")?,
                     claims: r.try_get("claims")?,
                     token_ttl_secs: r.try_get("token_ttl_secs")?,
+                    capability: r.try_get("capability")?,
                 })
             })
             .collect()
@@ -3315,6 +3367,64 @@ impl Catalog {
         .bind(released_at_unix)
         .fetch_one(&self.pool)
         .await
+    }
+
+    /// Insert a **published** (pushed) version *immutably*. Unlike
+    /// [`Self::upsert_package_version`] — which overwrites on conflict, correct for
+    /// re-mirroring where the upstream is the source of truth — a published version
+    /// cannot be silently replaced: re-publishing identical dist bytes is an
+    /// idempotent no-op, and publishing *different* bytes for an existing version is
+    /// rejected. Returns which of the three happened; the caller maps it to
+    /// 201 / 200 / 409.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_pushed_version(
+        &self,
+        package_id: Uuid,
+        version: &str,
+        normalized_version: &str,
+        stability: &str,
+        composer_json: &Value,
+        dist_blob_sha256: &[u8; 32],
+        dist_shasum: &str,
+        released_at_unix: i64,
+    ) -> Result<PublishOutcome, sqlx::Error> {
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            "insert into package_versions \
+                 (package_id, version, normalized_version, stability, composer_json, \
+                  dist_blob_sha256, dist_shasum, released_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::double precision)) \
+             on conflict (package_id, normalized_version) do nothing \
+             returning id",
+        )
+        .bind(package_id)
+        .bind(version)
+        .bind(normalized_version)
+        .bind(stability)
+        .bind(composer_json)
+        .bind(&dist_blob_sha256[..])
+        .bind(dist_shasum)
+        .bind(released_at_unix)
+        .fetch_optional(&self.pool)
+        .await?;
+        if inserted.is_some() {
+            return Ok(PublishOutcome::Created);
+        }
+        // The row already existed (conflict) — compare dist bytes to tell an
+        // idempotent retry from an immutability-violating republish.
+        let existing: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+            "select dist_blob_sha256 from package_versions \
+             where package_id = $1 and normalized_version = $2",
+        )
+        .bind(package_id)
+        .bind(normalized_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        match existing.flatten() {
+            Some(bytes) if bytes.as_slice() == &dist_blob_sha256[..] => {
+                Ok(PublishOutcome::AlreadyPublished)
+            }
+            _ => Ok(PublishOutcome::Conflict),
+        }
     }
 
     /// Create a new read token for a repository: generate a high-entropy secret,
@@ -5088,6 +5198,155 @@ impl Catalog {
         .bind(token_hash(token))
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// Mint a short-lived **publish** token (`scpt_` prefix) for a repo. Minted only
+    /// by the OIDC publish exchange; authorizes uploading package versions and
+    /// nothing else. Returns the plaintext (shown once, stored only as sha256).
+    pub async fn create_publish_token(
+        &self,
+        repo_id: Uuid,
+        label: &str,
+        ttl_secs: i64,
+    ) -> Result<String, sqlx::Error> {
+        let token = generate_secret("scpt_");
+        sqlx::query(
+            "insert into publish_tokens (repo_id, token_hash, label, expires_at) values \
+             ($1, $2, $3, now() + make_interval(secs => $4::double precision))",
+        )
+        .bind(repo_id)
+        .bind(token_hash(&token))
+        .bind(label)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(token)
+    }
+
+    /// Validate a publish token and return the repo it authorizes, stamping
+    /// `last_used_at`. `None` if unknown, revoked, or expired. A read or service
+    /// token can never resolve here — publish tokens live in their own table.
+    pub async fn resolve_publish_token(&self, token: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "update publish_tokens set last_used_at = now() \
+             where token_hash = $1 and (expires_at is null or expires_at > now()) \
+             returning repo_id",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Open a chunked-upload session for `(vendor/name, version)` in a repo,
+    /// expiring `ttl_secs` from now. Returns the new session id.
+    pub async fn create_upload_session(
+        &self,
+        repo_id: Uuid,
+        vendor: &str,
+        name: &str,
+        version: &str,
+        ttl_secs: i64,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "insert into upload_sessions (repo_id, vendor, name, version, expires_at) \
+             values ($1, $2, $3, $4, now() + make_interval(secs => $5::double precision)) \
+             returning id",
+        )
+        .bind(repo_id)
+        .bind(vendor)
+        .bind(name)
+        .bind(version)
+        .bind(ttl_secs)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Fetch a session by id (any status). `None` if unknown.
+    pub async fn upload_session(&self, id: Uuid) -> Result<Option<UploadSession>, sqlx::Error> {
+        let row = sqlx::query(
+            "select id, repo_id, vendor, name, version, status \
+             from upload_sessions where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            Ok(UploadSession {
+                id: r.try_get("id")?,
+                repo_id: r.try_get("repo_id")?,
+                vendor: r.try_get("vendor")?,
+                name: r.try_get("name")?,
+                version: r.try_get("version")?,
+                status: r.try_get("status")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Record (or overwrite) a staged part — idempotent on `(session, part_number)`,
+    /// so a retried or resumed part upload is safe.
+    pub async fn record_upload_part(
+        &self,
+        session_id: Uuid,
+        part_number: i32,
+        chunk_sha256: &[u8; 32],
+        size_bytes: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into upload_parts (session_id, part_number, chunk_sha256, size_bytes) \
+             values ($1, $2, $3, $4) \
+             on conflict (session_id, part_number) do update set \
+                 chunk_sha256 = excluded.chunk_sha256, size_bytes = excluded.size_bytes",
+        )
+        .bind(session_id)
+        .bind(part_number)
+        .bind(&chunk_sha256[..])
+        .bind(size_bytes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// All staged parts for a session, ordered by part number (assembly order).
+    pub async fn upload_parts(&self, session_id: Uuid) -> Result<Vec<UploadPart>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select part_number, chunk_sha256, size_bytes from upload_parts \
+             where session_id = $1 order by part_number",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(UploadPart {
+                    part_number: r.try_get("part_number")?,
+                    chunk_sha256: r.try_get("chunk_sha256")?,
+                    size_bytes: r.try_get("size_bytes")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set a session's status (`completed` / `aborted`).
+    pub async fn set_upload_status(&self, id: Uuid, status: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("update upload_sessions set status = $2 where id = $1")
+            .bind(id)
+            .bind(status)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Abort every `open` session past its deadline (worker sweep). Parts cascade;
+    /// staged chunk blobs are reclaimed by the orphan GC. Returns how many aborted.
+    pub async fn expire_upload_sessions(&self) -> Result<u64, sqlx::Error> {
+        let n = sqlx::query(
+            "update upload_sessions set status = 'aborted' \
+             where status = 'open' and expires_at <= now()",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected())
     }
 
     /// A repo's service tokens (never the tokens themselves), newest first.
@@ -8165,6 +8424,79 @@ mod tests {
                 .is_none(),
             "a service token is not a serving credential"
         );
+
+        // A publish token authorizes uploads on its own path...
+        let pub_tok = cat.create_publish_token(repo_id, "ci", 900).await.unwrap();
+        assert_eq!(
+            cat.resolve_publish_token(&pub_tok).await.unwrap(),
+            Some(repo_id),
+            "publish token authorizes uploads"
+        );
+        // ...but must NOT unlock serving or the management API.
+        assert!(
+            !cat.token_valid(repo_id, &pub_tok).await.unwrap(),
+            "a publish token must not unlock serving"
+        );
+        assert_eq!(
+            cat.resolve_service_token(&pub_tok).await.unwrap(),
+            None,
+            "a publish token must not authenticate the management API"
+        );
+        // ...and neither a read nor a service token can resolve as a publish token.
+        assert_eq!(
+            cat.resolve_publish_token(&read).await.unwrap(),
+            None,
+            "a read token must not authorize uploads"
+        );
+        assert_eq!(
+            cat.resolve_publish_token(&svc).await.unwrap(),
+            None,
+            "a service token must not authorize uploads"
+        );
+    }
+
+    /// A published version is immutable: identical re-push is an idempotent no-op,
+    /// but pushing different dist bytes for an existing version is rejected.
+    #[tokio::test]
+    async fn pushed_versions_are_immutable() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let sha_a = [11u8; 32];
+        let sha_b = [22u8; 32];
+        cat.upsert_blob(&sha_a, 100).await.unwrap();
+        cat.upsert_blob(&sha_b, 200).await.unwrap();
+        let pkg = cat
+            .upsert_package(repo_id, "acme/tool", "upload", None, Visibility::Private)
+            .await
+            .unwrap();
+        let cj = serde_json::json!({"name": "acme/tool"});
+
+        // First publish creates the version.
+        assert_eq!(
+            cat.insert_pushed_version(pkg, "1.0.0", "1.0.0.0", "stable", &cj, &sha_a, "aa", 0)
+                .await
+                .unwrap(),
+            PublishOutcome::Created,
+        );
+        // Re-publishing the exact same bytes is an idempotent no-op.
+        assert_eq!(
+            cat.insert_pushed_version(pkg, "1.0.0", "1.0.0.0", "stable", &cj, &sha_a, "aa", 0)
+                .await
+                .unwrap(),
+            PublishOutcome::AlreadyPublished,
+        );
+        // Publishing *different* bytes for the same version is rejected.
+        assert_eq!(
+            cat.insert_pushed_version(pkg, "1.0.0", "1.0.0.0", "stable", &cj, &sha_b, "bb", 0)
+                .await
+                .unwrap(),
+            PublishOutcome::Conflict,
+        );
+        // The stored version still points at the original bytes (unchanged).
+        let versions = cat.package_versions(repo_id, "acme/tool").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].dist_blob_sha256, Some(sha_a));
     }
 
     #[tokio::test]

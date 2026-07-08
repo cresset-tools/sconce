@@ -3533,6 +3533,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "flate2",
  "sconce-archive",
  "sconce-cas",
  "sconce-catalog",
@@ -3540,10 +3541,13 @@ dependencies = [
  "sconce-mirror",
  "sconce-server",
  "serde_json",
+ "sha2",
  "sqlx",
+ "tar",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "uuid",
 ]
 
@@ -3626,17 +3630,25 @@ dependencies = [
  "askama_web",
  "axum",
  "base64 0.22.1",
+ "composer-semver",
+ "flate2",
+ "http-body-util",
  "jsonwebtoken",
  "lettre",
  "openidconnect",
  "reqwest",
+ "sconce-archive",
  "sconce-cas",
  "sconce-catalog",
  "sconce-metadata",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
+ "tar",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -4185,6 +4197,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4581,6 +4604,7 @@ checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
@@ -5152,6 +5176,16 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.4",
+]
 
 [[package]]
 name = "yoke"

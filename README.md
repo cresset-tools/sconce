@@ -82,6 +82,62 @@ shared across orgs (the same public package mirrored by two tenants) is counted
 in full for each — the physical dedup saving is the operator's margin, reflected
 only in a lower overall list price, not a per-tenant discount.
 
+## Publishing packages (push)
+
+Besides *mirroring* upstreams, sconce can accept packages **pushed** to it — so a
+generated package (build artifacts, transpiled code, a private library) can be
+published straight from CI without ever committing the generated files to git. A
+push re-archives the uploaded tree through the same deterministic archiver as a
+mirror, so pushed and mirrored packages dedupe identically and get a stable
+`dist.shasum`; the new version lands in the normal approval queue and is
+**immutable** (re-publishing the same version with different bytes is rejected).
+
+Auth is **zero-secret via GitHub OIDC** — no upload password is stored anywhere.
+
+1. **Add a publish CI policy** (admin UI → repo → *CI access* tab, or CLI). Pick
+   capability **publish**, issuer `https://token.actions.githubusercontent.com`,
+   an audience, and claim matchers (e.g. `repository=acme/app`, `ref=refs/tags/*`):
+
+   ```bash
+   sconce ci-policy add --repo acme/tools --provider github \
+     --capability publish \
+     --issuer https://token.actions.githubusercontent.com \
+     --audience sconce \
+     --claim repository=acme/tools --claim ref=refs/tags/*
+   ```
+
+2. **Publish from a GitHub Action** with the
+   [`cresset-tools/sconce-publish`](https://github.com/cresset-tools/sconce-publish)
+   action (needs `permissions: id-token: write`):
+
+   ```yaml
+   permissions:
+     id-token: write   # lets the job mint an OIDC token
+   jobs:
+     publish:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - run: ./build.sh            # generate the package into ./dist
+         - uses: cresset-tools/sconce-publish@v1
+           with:
+             repo: acme/tools
+             url: https://repo.example.com
+             dir: ./dist
+             # version defaults to the pushed tag; audience defaults to "sconce"
+   ```
+
+   Under the hood the action runs `sconce publish` from the container image; it
+   fetches a GitHub OIDC JWT, exchanges it at `POST /oauth/ci-publish` for a
+   short-lived publish token, then uploads. `sconce publish <dir> --repo <org/repo>
+   --url <base>` is also usable directly (pass a token via `--token` /
+   `SCONCE_PUBLISH_TOKEN` outside GitHub Actions).
+
+Large packages upload in **resumable chunks**, so a single request body limit
+(a proxy's 100 MB cap, say) isn't the ceiling — the client splits automatically.
+Per-request and whole-package caps are `SCONCE_MAX_UPLOAD_BYTES` (default 100 MiB)
+and `SCONCE_MAX_PACKAGE_BYTES` (default 1 GiB).
+
 ## Workspace
 
 | Crate | Role |

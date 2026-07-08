@@ -375,6 +375,38 @@ enum Command {
         action: CiPolicyAction,
     },
 
+    /// Publish (push) a package directory to a sconce server.
+    ///
+    /// Tars `dir`, obtains a short-lived **publish token** (via GitHub Actions
+    /// OIDC, or `--token`), and uploads it to `<url>/<org>/<repo>` — one request for
+    /// small packages, resumable chunks for large ones. The package **name** is read
+    /// from `dir/composer.json`; the **version** is `--version` or `$GITHUB_REF_NAME`.
+    /// Unlike the other commands, this talks to the running server over HTTP, not the
+    /// database.
+    Publish {
+        /// Package directory (must contain `composer.json` at its root).
+        dir: PathBuf,
+        /// Target repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Base URL of the sconce wire server, e.g. `https://repo.example.com`.
+        #[arg(long, env = "SCONCE_URL")]
+        url: String,
+        /// Version to publish (e.g. `1.2.0`). Defaults to `$GITHUB_REF_NAME`.
+        #[arg(long)]
+        version: Option<String>,
+        /// OIDC audience the repo's publish policy expects.
+        #[arg(long, default_value = "sconce")]
+        audience: String,
+        /// A publish token to use directly (otherwise obtained via GitHub OIDC).
+        #[arg(long, env = "SCONCE_PUBLISH_TOKEN")]
+        token: Option<String>,
+        /// Upload as chunks of at most this many bytes (also the single-shot
+        /// threshold). Defaults to 32 MiB.
+        #[arg(long)]
+        part_size: Option<u64>,
+    },
+
     /// Create (or replace) an org's SCIM bearer token for identity-provider
     /// provisioning / deprovisioning. Printed once — set it in the provider's
     /// SCIM settings.
@@ -687,6 +719,10 @@ enum CiPolicyAction {
         /// Minted token lifetime in seconds.
         #[arg(long, default_value_t = 900)]
         ttl_secs: i64,
+        /// What the minted token may do: `read` (Composer serving, default) or
+        /// `publish` (upload package versions via the publish API).
+        #[arg(long, default_value = "read")]
+        capability: String,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -1159,6 +1195,7 @@ fn main() -> Result<()> {
                 audience,
                 claims,
                 ttl_secs,
+                capability,
                 database_url,
             } => ci_policy_add(
                 &repo,
@@ -1167,10 +1204,28 @@ fn main() -> Result<()> {
                 &audience,
                 &claims,
                 ttl_secs,
+                &capability,
                 &database_url,
             ),
             CiPolicyAction::List { repo, database_url } => ci_policy_list(&repo, &database_url),
         },
+        Command::Publish {
+            dir,
+            repo,
+            url,
+            version,
+            audience,
+            token,
+            part_size,
+        } => publish(
+            &dir,
+            &repo,
+            &url,
+            version.as_deref(),
+            &audience,
+            token.as_deref(),
+            part_size,
+        ),
         Command::ScimToken { org, database_url } => scim_token(&org, &database_url),
         Command::OidcConfig {
             org,
@@ -2297,6 +2352,274 @@ fn user_create(email: &str, password: &str, superadmin: bool, database_url: &str
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Default chunk size (and single-shot threshold) for `sconce publish`.
+const DEFAULT_PART_SIZE: u64 = 32 * 1024 * 1024;
+
+fn publish(
+    dir: &Path,
+    repo_path: &str,
+    url: &str,
+    version: Option<&str>,
+    audience: &str,
+    token: Option<&str>,
+    part_size: Option<u64>,
+) -> Result<()> {
+    let base = url.trim_end_matches('/');
+    let (org, repo) = repo_path
+        .split_once('/')
+        .context("--repo must be <org>/<repo>")?;
+
+    // Package name from composer.json (must sit at the directory root).
+    let cj_path = dir.join("composer.json");
+    let cj_bytes =
+        std::fs::read(&cj_path).with_context(|| format!("reading {}", cj_path.display()))?;
+    let cj: serde_json::Value =
+        serde_json::from_slice(&cj_bytes).context("composer.json is not valid JSON")?;
+    let name = cj
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .context("composer.json has no \"name\" field")?;
+    let (vendor, pkg) = name
+        .split_once('/')
+        .context("composer.json \"name\" must be vendor/name")?;
+
+    // Version from --version or the pushed git tag.
+    let version = match version {
+        Some(v) => v.to_owned(),
+        None => std::env::var("GITHUB_REF_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("no --version given and $GITHUB_REF_NAME is unset")?,
+    };
+
+    // A publish token: an explicit one, else exchange a GitHub Actions OIDC token.
+    let token = match token {
+        Some(t) => t.to_owned(),
+        None => obtain_publish_token(base, repo_path, audience)?,
+    };
+
+    let tarball = build_targz(dir)?;
+    let part_size = part_size.unwrap_or(DEFAULT_PART_SIZE).max(1);
+    println!(
+        "Publishing {name} {version} ({} bytes gzip) → {base}/{org}/{repo}",
+        tarball.len()
+    );
+
+    if u64::try_from(tarball.len()).unwrap_or(u64::MAX) <= part_size {
+        publish_single(base, org, repo, vendor, pkg, &version, &token, &tarball)
+    } else {
+        publish_chunked(
+            base, org, repo, vendor, pkg, &version, &token, &tarball, part_size,
+        )
+    }
+}
+
+/// Obtain a short-lived publish token by exchanging a GitHub Actions OIDC JWT.
+fn obtain_publish_token(base: &str, repo_path: &str, audience: &str) -> Result<String> {
+    let req_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").unwrap_or_default();
+    let req_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").unwrap_or_default();
+    if req_url.is_empty() || req_token.is_empty() {
+        anyhow::bail!(
+            "no --token / $SCONCE_PUBLISH_TOKEN, and no GitHub Actions OIDC available \
+             (the workflow needs `permissions: id-token: write`). Publishing needs a token."
+        );
+    }
+    // 1. Ask GitHub Actions for an OIDC JWT with the audience the policy expects.
+    let jwt_body = ureq::get(&req_url)
+        .query("audience", audience)
+        .set("Authorization", &format!("Bearer {req_token}"))
+        .call()
+        .map_err(publish_http_err)
+        .context("requesting a GitHub OIDC token")?
+        .into_string()
+        .context("reading the OIDC token response")?;
+    let jwt_json: serde_json::Value =
+        serde_json::from_str(&jwt_body).context("parsing the OIDC token response")?;
+    let jwt = jwt_json
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .context("OIDC token response has no \"value\"")?;
+
+    // 2. Exchange it for a publish token.
+    let exch_url = format!("{base}/oauth/ci-publish");
+    let body = serde_json::to_vec(&serde_json::json!({ "repository": repo_path, "jwt": jwt }))?;
+    let text = ureq::post(&exch_url)
+        .set("Content-Type", "application/json")
+        .send_bytes(&body)
+        .map_err(publish_http_err)
+        .context("exchanging the OIDC token for a publish token")?
+        .into_string()
+        .context("reading the exchange response")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).context("parsing the exchange response")?;
+    json.get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .context("exchange response has no \"access_token\"")
+}
+
+/// Tar + gzip a package directory (contents at the archive root, symlinks preserved).
+fn build_targz(dir: &Path) -> Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut enc);
+        builder.follow_symlinks(false);
+        builder
+            .append_dir_all(".", dir)
+            .with_context(|| format!("archiving {}", dir.display()))?;
+        builder.finish().context("finalizing tar")?;
+    }
+    enc.finish().context("finalizing gzip")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_single(
+    base: &str,
+    org: &str,
+    repo: &str,
+    vendor: &str,
+    pkg: &str,
+    version: &str,
+    token: &str,
+    body: &[u8],
+) -> Result<()> {
+    let url = format!("{base}/{org}/{repo}/packages/{vendor}/{pkg}/{version}");
+    let resp = ureq::put(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/tar+gzip")
+        .send_bytes(body);
+    report_publish(resp)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_chunked(
+    base: &str,
+    org: &str,
+    repo: &str,
+    vendor: &str,
+    pkg: &str,
+    version: &str,
+    token: &str,
+    body: &[u8],
+    part_size: u64,
+) -> Result<()> {
+    let auth = format!("Bearer {token}");
+
+    // 1. Open a session and learn the server's per-request cap.
+    let init_url = format!("{base}/{org}/{repo}/packages/{vendor}/{pkg}/{version}/uploads");
+    let init_text = ureq::post(&init_url)
+        .set("Authorization", &auth)
+        .call()
+        .map_err(publish_http_err)
+        .context("opening an upload session")?
+        .into_string()?;
+    let init: serde_json::Value = serde_json::from_str(&init_text)?;
+    let upload_id = init
+        .get("upload_id")
+        .and_then(serde_json::Value::as_str)
+        .context("session response has no upload_id")?
+        .to_owned();
+    let server_limit = init
+        .get("part_size_limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(part_size);
+    let chunk = usize::try_from(part_size.min(server_limit).max(1)).unwrap_or(usize::MAX);
+
+    // 2. Which parts are already staged (so a resumed run skips them)?
+    let status_url = format!("{base}/{org}/{repo}/uploads/{upload_id}");
+    let status_text = ureq::get(&status_url)
+        .set("Authorization", &auth)
+        .call()
+        .map_err(publish_http_err)
+        .context("reading session status")?
+        .into_string()?;
+    let status: serde_json::Value = serde_json::from_str(&status_text)?;
+    let existing: std::collections::HashSet<i64> = status
+        .get("parts")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("part_number").and_then(serde_json::Value::as_i64))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 3. Upload each part (1-based), skipping any already staged.
+    let mut part_number: i64 = 0;
+    for slice in body.chunks(chunk) {
+        part_number += 1;
+        if existing.contains(&part_number) {
+            println!("  part {part_number}: already uploaded, skipping");
+            continue;
+        }
+        let part_url = format!("{base}/{org}/{repo}/uploads/{upload_id}/parts/{part_number}");
+        ureq::put(&part_url)
+            .set("Authorization", &auth)
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(slice)
+            .map_err(publish_http_err)
+            .with_context(|| format!("uploading part {part_number}"))?;
+        println!("  part {part_number}: {} bytes", slice.len());
+    }
+
+    // 4. Complete: the server assembles and verifies against this sha256.
+    let complete_url = format!("{base}/{org}/{repo}/uploads/{upload_id}/complete");
+    let cbody = serde_json::to_vec(
+        &serde_json::json!({ "parts": part_number, "sha256": sha256_hex(body) }),
+    )?;
+    let resp = ureq::post(&complete_url)
+        .set("Authorization", &auth)
+        .set("Content-Type", "application/json")
+        .send_bytes(&cbody);
+    report_publish(resp)
+}
+
+/// Turn a publish/complete response into a success line or a friendly error.
+fn report_publish(result: Result<ureq::Response, ureq::Error>) -> Result<()> {
+    match result {
+        Ok(r) => {
+            let code = r.status();
+            let body = r.into_string().unwrap_or_default();
+            println!("✓ {code} {}", body.trim());
+            Ok(())
+        }
+        Err(ureq::Error::Status(409, r)) => anyhow::bail!(
+            "version already published with different contents (409): {}",
+            r.into_string().unwrap_or_default().trim()
+        ),
+        Err(ureq::Error::Status(code, r)) => anyhow::bail!(
+            "publish failed ({code}): {}",
+            r.into_string().unwrap_or_default().trim()
+        ),
+        Err(e) => Err(anyhow::Error::new(e).context("publish request failed")),
+    }
+}
+
+/// Collapse a ureq error into an anyhow error carrying the server's status + body.
+fn publish_http_err(e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(code, r) => anyhow::anyhow!(
+            "server returned {code}: {}",
+            r.into_string().unwrap_or_default().trim()
+        ),
+        err @ ureq::Error::Transport(_) => anyhow::Error::new(err),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ci_policy_add(
     repo: &str,
     provider: &str,
@@ -2304,8 +2627,12 @@ fn ci_policy_add(
     audience: &str,
     claims: &[(String, String)],
     ttl_secs: i64,
+    capability: &str,
     database_url: &str,
 ) -> Result<()> {
+    if !matches!(capability, "read" | "publish") {
+        anyhow::bail!("--capability must be 'read' or 'publish'");
+    }
     let claims_json = serde_json::Value::Object(
         claims
             .iter()
@@ -2315,7 +2642,15 @@ fn ci_policy_add(
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
         let id = catalog
-            .add_ci_policy(repo_id, provider, issuer, audience, &claims_json, ttl_secs)
+            .add_ci_policy(
+                repo_id,
+                provider,
+                issuer,
+                audience,
+                &claims_json,
+                ttl_secs,
+                capability,
+            )
             .await
             .context("adding CI policy")?;
         println!("CI policy added: {id}");

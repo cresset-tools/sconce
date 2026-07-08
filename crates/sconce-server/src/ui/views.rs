@@ -630,6 +630,8 @@ pub struct CiRow {
     pub claims: String,
     pub ttl: i64,
     pub id: String,
+    /// `read` (mint a serving token) or `publish` (mint a publish token).
+    pub capability: String,
 }
 
 /// "Showing X–Y of N" pager for the Packages tab.

@@ -31,6 +31,12 @@ tokio = { workspace = true, features = ["macros", "time"] }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 dotenvy = { workspace = true }
+# `sconce publish`: tar+gzip a package dir, sha256 the payload, and upload it over
+# HTTP (obtaining a short-lived publish token via GitHub Actions OIDC).
+tar = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+ureq = { workspace = true }
 # Direct use of PgListener for the worker's LISTEN/NOTIFY wait.
 sqlx = { workspace = true }
 # Server/worker logs go through tracing (stderr, RUST_LOG-filtered); CLI
