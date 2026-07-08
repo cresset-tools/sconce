@@ -386,6 +386,35 @@ pub struct TokenCreated {
     pub repo: String,
 }
 
+/// One org option in the device-login org picker.
+pub struct DeviceOrg {
+    pub slug: String,
+    pub name: String,
+}
+
+/// `/device` — approve a `bougie login` device flow: confirm the code and pick
+/// which org the CLI's read token should cover.
+#[derive(Template)]
+#[template(path = "device_approve.html")]
+pub struct DeviceApprove {
+    /// The user code (normalized upper-case); empty if none was supplied.
+    pub code: String,
+    /// Whether `code` names a pending, unexpired flow (gates the approve form).
+    pub pending: bool,
+    /// Orgs the approver may scope the token to (member or above).
+    pub orgs: Vec<DeviceOrg>,
+}
+
+/// `/device` POST result — the "return to your terminal" confirmation.
+#[derive(Template)]
+#[template(path = "device_approved.html")]
+pub struct DeviceApproved {
+    /// "approved" or "denied".
+    pub outcome: &'static str,
+    /// The org the token was scoped to (empty when denied).
+    pub org: String,
+}
+
 /// One version row in the package detail table.
 pub struct VersionRow {
     pub version: String,

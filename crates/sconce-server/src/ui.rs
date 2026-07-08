@@ -126,6 +126,9 @@ pub fn router(
         .route("/auth/start", get(auth_start))
         .route("/auth/route", post(auth_route))
         .route("/auth/callback", get(auth_callback))
+        // Human side of `bougie login` (RFC 8628): a signed-in member confirms
+        // the code the CLI printed and picks the org to scope its token to.
+        .route("/device", get(device_page).post(device_approve))
         .route(
             "/scim/v2/Users",
             get(scim_list_users).post(scim_create_user),
@@ -2433,6 +2436,121 @@ struct NewRepoQuery {
 }
 
 /// The "New repository" screen: pick an org you administer + a name.
+#[derive(Deserialize)]
+struct DeviceQuery {
+    code: Option<String>,
+}
+
+/// `/device` — the human side of `bougie login`. The CLI prints a link here with
+/// `?code=…`; a signed-in member confirms the code and picks which org the CLI's
+/// read token should cover (the token authenticates every repo in that org).
+async fn device_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Query(q): Query<DeviceQuery>,
+) -> Result<Html<String>, StatusCode> {
+    let code = q.code.unwrap_or_default().trim().to_uppercase();
+    let pending = if code.is_empty() {
+        false
+    } else {
+        s.catalog.device_flow_pending(&code).await.map_err(e500)?
+    };
+    let orgs = s.catalog.list_organizations().await.map_err(e500)?;
+    let member_orgs: Vec<views::DeviceOrg> = orgs
+        .iter()
+        .filter(|o| user.can(o.id))
+        .map(|o| views::DeviceOrg {
+            slug: o.slug.clone(),
+            name: o.name.clone().unwrap_or_else(|| o.slug.clone()),
+        })
+        .collect();
+    let view = views::DeviceApprove {
+        code,
+        pending,
+        orgs: member_orgs,
+    };
+    Ok(shell(
+        &s,
+        &user,
+        "Device login",
+        &view.render().map_err(e500)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct DeviceForm {
+    code: String,
+    /// Slug of the org to scope the token to (approve only).
+    #[serde(default)]
+    org: String,
+    /// "approve" or "deny".
+    action: String,
+}
+
+/// `/device` POST — approve or deny the flow. Approve binds the chosen org (which
+/// the approver must belong to) so the next CLI poll mints an org-scoped token.
+async fn device_approve(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(f): Form<DeviceForm>,
+) -> Result<Response, StatusCode> {
+    let code = f.code.trim().to_uppercase();
+    if f.action == "deny" {
+        s.catalog.deny_device_flow(&code).await.map_err(e500)?;
+        return Ok(shell(
+            &s,
+            &user,
+            "Device login",
+            &views::DeviceApproved {
+                outcome: "denied",
+                org: String::new(),
+            }
+            .render()
+            .map_err(e500)?,
+        )
+        .into_response());
+    }
+    // Approve: the chosen org must be one the approver can access.
+    let org_id = s
+        .catalog
+        .org_id_by_slug(f.org.trim())
+        .await
+        .map_err(e500)?;
+    let Some(org_id) = org_id else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if !user.can(org_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let approved = s
+        .catalog
+        .approve_device_flow(&code, org_id, user.id)
+        .await
+        .map_err(e500)?;
+    if !approved {
+        return Ok(error_card(
+            &s,
+            &user,
+            "Couldn't approve",
+            "That code is no longer valid — it may have expired or already been \
+             used. Start the login again from your terminal.",
+            "/device",
+        ));
+    }
+    Ok(shell(
+        &s,
+        &user,
+        "Device login",
+        &views::DeviceApproved {
+            outcome: "approved",
+            org: f.org.trim().to_owned(),
+        }
+        .render()
+        .map_err(e500)?,
+    )
+    .into_response())
+}
+
 async fn new_repo_page(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,

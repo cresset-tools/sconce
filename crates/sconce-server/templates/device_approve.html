@@ -1,0 +1,36 @@
+<h1>Device login</h1>
+{% if code.is_empty() %}
+  <p class=muted>Enter the code shown in your terminal to continue.</p>
+  <form class=row method=get action=/device>
+    <p>Code <input name=code placeholder="XXXX-XXXX" autofocus required></p>
+    <button class=primary>Continue</button>
+  </form>
+{% else if !pending %}
+  <p>The code <code>{{ code }}</code> isn't valid — it may have expired or already
+    been used. Start the login again from your terminal.</p>
+  <form class=row method=get action=/device>
+    <p>Code <input name=code placeholder="XXXX-XXXX" required></p>
+    <button class=primary>Try another code</button>
+  </form>
+{% else if orgs.is_empty() %}
+  <p class=muted>You're not a member of any organization yet, so there's nothing to
+    grant. Ask an org admin to add you.</p>
+  <p><a href=/>← back</a></p>
+{% else %}
+  <p>A device is requesting a <strong>read token</strong> for your Composer
+    packages. Check that this code matches your terminal, choose which
+    organization to grant, then approve.</p>
+  <p>Code <code>{{ code }}</code></p>
+  <form class=row method=post action=/device>
+    <input type=hidden name=code value="{{ code }}">
+    <p>Organization <select name=org required>
+      {% for o in orgs %}<option value="{{ o.slug }}">{{ o.name }}</option>{% endfor %}
+    </select></p>
+    <p>
+      <button class=primary name=action value=approve>Approve</button>
+      <button name=action value=deny>Deny</button>
+    </p>
+  </form>
+  <p class=muted>The token authenticates every repository in the chosen
+    organization and expires in 90 days.</p>
+{% endif %}
