@@ -934,6 +934,34 @@ enum SnapshotAction {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+    /// Upload a database snapshot file as the environment's new `latest`, from CI.
+    /// Unlike `list`/`prune`, this talks to the running server over HTTP (like
+    /// `publish`), authenticated by a publish token or a GitHub OIDC exchange —
+    /// no database access. The file is stored verbatim (small ones in a single
+    /// request, larger ones in resumable chunks).
+    Push {
+        /// Snapshot file to upload (e.g. a `.jibsdump`).
+        file: PathBuf,
+        /// Target repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Base URL of the sconce wire server, e.g. `https://repo.example.com`.
+        #[arg(long, env = "SCONCE_URL")]
+        url: String,
+        /// Environment label the snapshot belongs to (e.g. production, staging).
+        #[arg(long)]
+        env: String,
+        /// OIDC audience the repo's publish policy expects.
+        #[arg(long, default_value = "sconce")]
+        audience: String,
+        /// A publish token to use directly (otherwise obtained via GitHub OIDC).
+        #[arg(long, env = "SCONCE_PUBLISH_TOKEN")]
+        token: Option<String>,
+        /// Upload as chunks of at most this many bytes (also the single-shot
+        /// threshold). Defaults to 32 MiB.
+        #[arg(long)]
+        part_size: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1356,6 +1384,23 @@ fn main() -> Result<()> {
                 keep,
                 database_url,
             } => snapshot_prune(&repo, &env, keep, &database_url),
+            SnapshotAction::Push {
+                file,
+                repo,
+                url,
+                env,
+                audience,
+                token,
+                part_size,
+            } => snapshot_push(
+                &file,
+                &repo,
+                &url,
+                &env,
+                &audience,
+                token.as_deref(),
+                part_size,
+            ),
         },
         Command::Grant {
             repo,
@@ -2455,12 +2500,54 @@ fn publish(
         tarball.len()
     );
 
+    let pkg_path = format!("packages/{vendor}/{pkg}/{version}");
     if u64::try_from(tarball.len()).unwrap_or(u64::MAX) <= part_size {
-        publish_single(base, org, repo, vendor, pkg, &version, &token, &tarball)
+        let single_url = format!("{base}/{org}/{repo}/{pkg_path}");
+        upload_single(&single_url, "application/tar+gzip", &token, &tarball)
     } else {
-        publish_chunked(
-            base, org, repo, vendor, pkg, &version, &token, &tarball, part_size,
-        )
+        let init_url = format!("{base}/{org}/{repo}/{pkg_path}/uploads");
+        upload_chunked(base, org, repo, &init_url, &token, &tarball, part_size)
+    }
+}
+
+/// `sconce snapshot push` — upload a database snapshot file as a repo+environment's
+/// new `latest`, from CI. Mirrors `publish` (HTTP + OIDC), but the file is stored
+/// verbatim (no tar/gzip) and it targets the `snapshots/{env}` routes.
+fn snapshot_push(
+    file: &Path,
+    repo_path: &str,
+    url: &str,
+    environment: &str,
+    audience: &str,
+    token: Option<&str>,
+    part_size: Option<u64>,
+) -> Result<()> {
+    let base = url.trim_end_matches('/');
+    let (org, repo) = repo_path
+        .split_once('/')
+        .context("--repo must be <org>/<repo>")?;
+
+    let body = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+
+    // A publish token: an explicit one, else exchange a GitHub Actions OIDC token.
+    let token = match token {
+        Some(t) => t.to_owned(),
+        None => obtain_publish_token(base, repo_path, audience)?,
+    };
+
+    let part_size = part_size.unwrap_or(DEFAULT_PART_SIZE).max(1);
+    println!(
+        "Uploading snapshot {} ({} bytes) → {base}/{org}/{repo} [{environment}]",
+        file.display(),
+        body.len()
+    );
+
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) <= part_size {
+        let single_url = format!("{base}/{org}/{repo}/snapshots/{environment}");
+        upload_single(&single_url, "application/octet-stream", &token, &body)
+    } else {
+        let init_url = format!("{base}/{org}/{repo}/snapshots/{environment}/uploads");
+        upload_chunked(base, org, repo, &init_url, &token, &body, part_size)
     }
 }
 
@@ -2524,33 +2611,25 @@ fn build_targz(dir: &Path) -> Result<Vec<u8>> {
     enc.finish().context("finalizing gzip")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_single(
-    base: &str,
-    org: &str,
-    repo: &str,
-    vendor: &str,
-    pkg: &str,
-    version: &str,
-    token: &str,
-    body: &[u8],
-) -> Result<()> {
-    let url = format!("{base}/{org}/{repo}/packages/{vendor}/{pkg}/{version}");
-    let resp = ureq::put(&url)
+/// Single-shot upload: PUT the whole `body` to `single_url` with `content_type`
+/// (`application/tar+gzip` for a package, `application/octet-stream` for a snapshot).
+fn upload_single(single_url: &str, content_type: &str, token: &str, body: &[u8]) -> Result<()> {
+    let resp = ureq::put(single_url)
         .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/tar+gzip")
+        .set("Content-Type", content_type)
         .send_bytes(body);
     report_publish(resp)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_chunked(
+/// Resumable chunked upload: open a session at `init_url`, PUT each part to the
+/// shared `…/uploads/{id}/parts/{n}` routes, and complete with the whole-file
+/// sha256. `init_url` is the only endpoint-specific piece (package vs snapshot);
+/// the part / status / complete routes are shared.
+fn upload_chunked(
     base: &str,
     org: &str,
     repo: &str,
-    vendor: &str,
-    pkg: &str,
-    version: &str,
+    init_url: &str,
     token: &str,
     body: &[u8],
     part_size: u64,
@@ -2558,8 +2637,7 @@ fn publish_chunked(
     let auth = format!("Bearer {token}");
 
     // 1. Open a session and learn the server's per-request cap.
-    let init_url = format!("{base}/{org}/{repo}/packages/{vendor}/{pkg}/{version}/uploads");
-    let init_text = ureq::post(&init_url)
+    let init_text = ureq::post(init_url)
         .set("Authorization", &auth)
         .call()
         .map_err(publish_http_err)
