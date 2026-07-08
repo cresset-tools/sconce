@@ -2781,10 +2781,7 @@ impl Catalog {
     /// `device_code` (returned to the CLI, stored only as its sha256) and the
     /// short human `user_code` the user types into the approval page. Returns
     /// `(device_code, user_code)`. TTL in seconds.
-    pub async fn start_device_flow(
-        &self,
-        ttl_secs: i64,
-    ) -> Result<(String, String), sqlx::Error> {
+    pub async fn start_device_flow(&self, ttl_secs: i64) -> Result<(String, String), sqlx::Error> {
         let device_code = generate_secret("scdv_");
         let user_code = generate_user_code();
         sqlx::query(
@@ -2849,10 +2846,7 @@ impl Catalog {
     /// Poll a device flow by its `device_code`. On approval this **consumes** the
     /// flow (deletes the row) and returns the org to mint a token for — a
     /// `device_code` is thus single-use. Pending flows are left in place.
-    pub async fn poll_device_flow(
-        &self,
-        device_code: &str,
-    ) -> Result<DeviceFlowPoll, sqlx::Error> {
+    pub async fn poll_device_flow(&self, device_code: &str) -> Result<DeviceFlowPoll, sqlx::Error> {
         let hash = token_hash(device_code);
         // Consume an approved + fresh flow atomically.
         if let Some(org_id) = sqlx::query_scalar::<_, Uuid>(

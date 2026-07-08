@@ -2511,11 +2511,7 @@ async fn device_approve(
         .into_response());
     }
     // Approve: the chosen org must be one the approver can access.
-    let org_id = s
-        .catalog
-        .org_id_by_slug(f.org.trim())
-        .await
-        .map_err(e500)?;
+    let org_id = s.catalog.org_id_by_slug(f.org.trim()).await.map_err(e500)?;
     let Some(org_id) = org_id else {
         return Err(StatusCode::NOT_FOUND);
     };

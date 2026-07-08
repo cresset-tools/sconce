@@ -549,9 +549,8 @@ async fn oauth_device_token(
     State(s): State<AppState>,
     Json(req): Json<DeviceTokenRequest>,
 ) -> Response {
-    let device_error = |status: StatusCode, code: &str| {
-        (status, Json(json!({ "error": code }))).into_response()
-    };
+    let device_error =
+        |status: StatusCode, code: &str| (status, Json(json!({ "error": code }))).into_response();
     match s.catalog.poll_device_flow(&req.device_code).await {
         Ok(sconce_catalog::DeviceFlowPoll::Approved { org_id }) => {
             match s
