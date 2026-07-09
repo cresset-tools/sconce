@@ -132,6 +132,10 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             "/api/v1/repos/{org}/{repo}/license-keys/{id}/editions/{edition}",
             delete(api::remove_license_edition),
         )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys/{id}/editions/{edition}/renew",
+            post(api::renew_license_edition),
+        )
         .route("/healthz", get(healthz))
         .with_state(AppState {
             catalog,
@@ -154,10 +158,12 @@ async fn healthz(State(s): State<AppState>) -> Response {
 
 /// What a credential is allowed to see in a repository.
 enum Access {
-    /// A repo read token: every package in the repo.
+    /// A repo read token: every package in the repo, unbounded.
     Full,
-    /// A seller license key: only the entitled (purchased) package names.
-    Licensed(std::collections::HashSet<String>),
+    /// A seller license key: only the entitled (purchased) package names, each
+    /// under its own perpetual-fallback bound (per-entitlement bounds, 0047 —
+    /// one accumulated key can carry a perpetual tool beside an annual one).
+    Licensed(std::collections::HashMap<String, sconce_catalog::LicenseBound>),
 }
 
 impl Access {
@@ -165,7 +171,17 @@ impl Access {
     fn allows(&self, package: &str) -> bool {
         match self {
             Access::Full => true,
-            Access::Licensed(entitled) => entitled.contains(package),
+            Access::Licensed(entitled) => entitled.contains_key(package),
+        }
+    }
+
+    /// The update bound `package` is served under (unbounded for a repo token
+    /// or an unknown package — the latter never reaches version serving, since
+    /// [`Self::allows`] gates it first).
+    fn bound_for(&self, package: &str) -> sconce_catalog::LicenseBound {
+        match self {
+            Access::Full => sconce_catalog::LicenseBound::default(),
+            Access::Licensed(entitled) => entitled.get(package).cloned().unwrap_or_default(),
         }
     }
 }
@@ -194,39 +210,27 @@ async fn locate(
 
 /// The access a credential grants to an already-resolved repo. 401 if the
 /// credential is missing/invalid. A repo **token** grants [`Access::Full`]; a
-/// seller **license key** grants [`Access::Licensed`] to its entitled packages.
+/// seller **license key** grants [`Access::Licensed`] to its entitled packages,
+/// each under its own effective update bound (per-entitlement bounds, 0047).
 async fn authorize(
     s: &AppState,
     repo_id: Uuid,
     headers: &HeaderMap,
-) -> Result<
-    (
-        Access,
-        sconce_catalog::PolicyOverride,
-        sconce_catalog::LicenseBound,
-    ),
-    AppError,
-> {
+) -> Result<(Access, sconce_catalog::PolicyOverride), AppError> {
     let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
 
     if let Some(policy) = s.catalog.resolve_token_policy(repo_id, &cred).await? {
-        // A repo token has no perpetual-fallback bound (unbounded).
-        return Ok((
-            Access::Full,
-            policy,
-            sconce_catalog::LicenseBound::default(),
-        ));
+        return Ok((Access::Full, policy));
     }
     if let Some(license_id) = s.catalog.resolve_license(repo_id, &cred).await? {
         let entitled = s
             .catalog
-            .entitled_package_names(license_id)
+            .entitled_package_bounds(license_id)
             .await?
             .into_iter()
             .collect();
         let policy = s.catalog.license_policy(license_id).await?;
-        let bound = s.catalog.license_bound(license_id).await?;
-        return Ok((Access::Licensed(entitled), policy, bound));
+        return Ok((Access::Licensed(entitled), policy));
     }
     Err(AppError::Unauthorized)
 }
@@ -283,11 +287,11 @@ async fn packages_json(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, _policy, _bound) = authorize(&s, loc.repo_id, &headers).await?;
+    let (access, _policy) = authorize(&s, loc.repo_id, &headers).await?;
     let names = match access {
         Access::Full => s.catalog.all_package_names(loc.repo_id).await?,
         Access::Licensed(entitled) => {
-            let mut v: Vec<String> = entitled.into_iter().collect();
+            let mut v: Vec<String> = entitled.into_keys().collect();
             v.sort();
             v
         }
@@ -308,7 +312,7 @@ async fn p2(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, policy, bound) = authorize(&s, loc.repo_id, &headers).await?;
+    let (access, policy) = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -326,7 +330,10 @@ async fn p2(
     // Apply the supply-chain gate (cooldown / manual approval / holds) so clients
     // only ever see versions that have cleared it. The presenting credential's
     // policy override can tighten — never loosen — the repo default. A license's
-    // perpetual-fallback bound additionally caps which versions it may install.
+    // perpetual-fallback bound additionally caps which versions it may install —
+    // resolved **per package** (0047), so an accumulated key serves each
+    // purchase under its own ceiling.
+    let bound = access.bound_for(package);
     let (repo_mode, repo_cooldown) = s.catalog.update_policy(loc.repo_id).await?;
     let (mode, cooldown_days) = policy.effective(&repo_mode, repo_cooldown);
     // A granted package can carry its own (tighter) policy — fold it in after the

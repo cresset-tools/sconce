@@ -393,6 +393,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0046_device_flows",
         include_str!("../migrations/0046_device_flows.sql"),
     ),
+    (
+        "0047_entitlement_bounds",
+        include_str!("../migrations/0047_entitlement_bounds.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -4717,6 +4721,71 @@ impl Catalog {
         rows.iter().map(|r| r.try_get("name")).collect()
     }
 
+    /// The packages a license unlocks **with each package's effective update
+    /// bound** — the serve-time view. Every entitlement edge (direct package or
+    /// by-reference set, 0047) resolves per axis to its own value or, when NULL,
+    /// the key's (0029); a package covered by several edges gets the most
+    /// permissive result (any unbounded edge wins, else the latest/highest
+    /// ceiling). Keys with no edge bounds — every key issued before 0047 —
+    /// resolve to exactly the key bound, so behavior is unchanged for them.
+    pub async fn entitled_package_bounds(
+        &self,
+        license_id: Uuid,
+    ) -> Result<Vec<(String, LicenseBound)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "with edges as ( \
+                 select p.name, \
+                        coalesce(e.update_until, l.update_until) as eff_until, \
+                        coalesce(e.version_cap_major, l.version_cap_major) as eff_major \
+                 from entitlements e \
+                 join license_keys l on l.id = e.license_key_id \
+                 join packages p on p.id = e.package_id \
+                 where e.license_key_id = $1 \
+                 union all \
+                 select p.name, \
+                        coalesce(lse.update_until, l.update_until), \
+                        coalesce(lse.version_cap_major, l.version_cap_major) \
+                 from license_set_entitlements lse \
+                 join license_keys l on l.id = lse.license_key_id \
+                 join package_sets ps on ps.id = lse.set_id \
+                 join packages p on ( \
+                     p.id in (select package_id from package_set_members where set_id = lse.set_id) \
+                     or ( p.repo_id in (select id from repositories where org_id = ps.org_id) \
+                          and exists (select 1 from package_set_rules sr \
+                                      where sr.set_id = lse.set_id \
+                                        and p.name like replace(sr.glob, '*', '%')) ) ) \
+                 where lse.license_key_id = $1 \
+             ), unioned as ( \
+                 select name, \
+                        case when bool_or(eff_until is null) then null \
+                             else max(eff_until) end as bound_until, \
+                        case when bool_or(eff_major is null) then null \
+                             else max(eff_major) end as bound_major \
+                 from edges group by name \
+             ) \
+             select name, \
+                    to_char(bound_until, 'YYYY-MM-DD') as until, \
+                    extract(epoch from bound_until)::bigint as until_unix, \
+                    bound_major as major \
+             from unioned order by name",
+        )
+        .bind(license_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("name")?,
+                    LicenseBound {
+                        until: r.try_get("until").ok().flatten(),
+                        until_unix: r.try_get("until_unix").ok().flatten(),
+                        major: r.try_get("major").ok().flatten(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// Entitle a license to an entire **package set** (a SKU/edition). The license
     /// unlocks every package the set resolves to, by reference — auto-growing as
     /// the set grows. Idempotent.
@@ -5119,12 +5188,14 @@ impl Catalog {
         }))
     }
 
-    /// Attach an edition's target set to a license inside a transaction, exactly
-    /// as issuance does: freeze current membership as explicit per-package
+    /// Attach an edition's target set to a **freshly issued** license inside a
+    /// transaction: freeze current membership as explicit per-package
     /// entitlements when the edition snapshots at issue, else unlock the set by
-    /// reference (auto-growing as the set grows). Idempotent (`on conflict do
-    /// nothing`). Shared by [`Self::issue_from_edition`] and
-    /// [`Self::add_edition_to_license`] so both attach content identically.
+    /// reference (auto-growing as the set grows). Edges are written unbounded
+    /// (NULL, 0047) — the freshly minted key itself carries the edition's bound.
+    /// Idempotent (`on conflict do nothing`). [`Self::add_edition_to_license`]
+    /// deliberately does NOT share this: when merging onto an existing (account)
+    /// key the bound must land on the edge instead.
     async fn attach_edition_set(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         license_id: Uuid,
@@ -5164,16 +5235,25 @@ impl Catalog {
 
     /// Attach an edition's sellable content to an **existing** license key, so a
     /// repeat buyer accumulates purchases onto one key (a single Composer auth
-    /// entry then unlocks everything they own). Returns [`EditionAdd`].
+    /// entry then unlocks everything they own — Composer's http-basic auth is
+    /// keyed by hostname, so a customer can only present one key per repo).
+    /// Returns [`EditionAdd`].
     ///
-    /// Only merges when the key **and** the edition are perpetual and
-    /// by-reference: sconce stores the update bound per *key* (not per
-    /// entitlement), so folding a time/version-bounded edition — or a snapshot
-    /// edition, whose frozen per-package rows can't be cleanly detached on a
-    /// refund — onto a shared key would silently over/under-entitle. Any such
-    /// case yields [`EditionAdd::Standalone`] and leaves the key untouched, so
-    /// the caller issues a separate key instead (matching the subscription
-    /// carve-out). Idempotent: re-adding the same edition is a no-op.
+    /// The edition's update bound lands on the **entitlement edge** (0047),
+    /// resolved from its template exactly as issuance resolves the key bound
+    /// (time -> now()+period, version -> cap, perpetual -> none) — so a time or
+    /// version-bounded edition merges cleanly beside perpetual ones, each package
+    /// served under its own ceiling. Two cases still yield
+    /// [`EditionAdd::Standalone`] (caller issues a separate key):
+    ///
+    /// - a **bounded key**: a NULL edge inherits the key bound (the 0047
+    ///   back-compat rule), so an explicitly-perpetual edge on a bounded key is
+    ///   not expressible — merge targets must be unbounded (account) keys;
+    /// - a **snapshot edition**: its frozen per-package rows can't be cleanly
+    ///   detached on a refund.
+    ///
+    /// Idempotent: re-adding the same edition is a no-op (a renewal — not a
+    /// re-add — is what extends a time edge, see [`Self::renew_license_edition`]).
     pub async fn add_edition_to_license(
         &self,
         repo_id: Uuid,
@@ -5195,25 +5275,40 @@ impl Catalog {
             tx.rollback().await?;
             return Ok(EditionAdd::NoKey);
         };
-        // Edition must be active in this repo; capture its set, bound kind, and
-        // snapshot flag.
-        let ed: Option<(Uuid, String, bool)> = sqlx::query_as(
-            "select set_id, bound_kind, snapshot_at_issue \
+        // Edition must be active in this repo; capture its snapshot flag (the
+        // bound template is resolved inside the insert below).
+        let ed: Option<(Uuid, bool)> = sqlx::query_as(
+            "select set_id, snapshot_at_issue \
              from editions where id = $1 and repo_id = $2 and active",
         )
         .bind(edition_id)
         .bind(repo_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((set_id, bound_kind, snapshot)) = ed else {
+        let Some((_set_id, snapshot)) = ed else {
             tx.rollback().await?;
             return Ok(EditionAdd::NoEdition);
         };
-        if !key_perpetual || bound_kind != "perpetual" || snapshot {
+        if !key_perpetual || snapshot {
             tx.rollback().await?;
             return Ok(EditionAdd::Standalone);
         }
-        Self::attach_edition_set(&mut tx, license_id, set_id, snapshot).await?;
+        // Unlock the set by reference with the edition's bound resolved onto the
+        // edge, mirroring how issue_from_edition resolves it onto the key.
+        sqlx::query(
+            "insert into license_set_entitlements \
+                 (license_key_id, set_id, update_until, version_cap_major) \
+             select $1, ed.set_id, \
+                    case when ed.bound_kind = 'time' \
+                         then now() + make_interval(months => ed.bound_period_months) end, \
+                    case when ed.bound_kind = 'version' then ed.bound_major end \
+             from editions ed where ed.id = $2 \
+             on conflict do nothing",
+        )
+        .bind(license_id)
+        .bind(edition_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(EditionAdd::Added)
     }
@@ -5377,6 +5472,88 @@ impl Catalog {
             )
             .bind(repo_id)
             .bind(license_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        };
+        tx.commit().await?;
+        Ok(bound)
+    }
+
+    /// The edge-renewal `UPDATE`: extend an explicitly time-bounded set
+    /// entitlement (0047) on an active key by its edition's period. `$1` = repo,
+    /// `$2` = license, `$3` = edition. Mirrors [`Self::RENEW_SQL`] semantics:
+    /// renewing before expiry stacks, after expiry restarts from today. The
+    /// `lse.update_until is not null` guard keeps legacy standalone keys (bound
+    /// on the key, NULL edge) on the key-level renew path.
+    const RENEW_EDGE_SQL: &'static str = "update license_set_entitlements lse \
+        set update_until = greatest(lse.update_until, now()) \
+                           + make_interval(months => e.bound_period_months) \
+     from editions e, license_keys l \
+     where lse.license_key_id = $2 and lse.set_id = e.set_id \
+       and l.id = $2 and l.repo_id = $1 and l.status = 'active' \
+       and e.id = $3 and e.repo_id = $1 and e.bound_kind = 'time' \
+       and lse.update_until is not null \
+     returning to_char(lse.update_until, 'YYYY-MM-DD')";
+
+    /// Extend one **edition's** time-bounded entitlement edge on an active key
+    /// (the renewal for accumulated keys, where the bound lives per entitlement —
+    /// 0047 — not on the key). Returns the new `YYYY-MM-DD` edge bound, or
+    /// `Ok(None)` if the key is missing/revoked, the edition isn't time-bounded,
+    /// or the key has no explicitly-bounded edge for it (a legacy standalone key
+    /// renews via [`Self::renew_license`] instead).
+    ///
+    /// Idempotent like key-level renewal: with an `idempotency_key`, a replayed
+    /// "subscription renewed" webhook returns the current edge bound instead of
+    /// stacking a second period (dedup shares the `license_renewals` ledger).
+    pub async fn renew_license_edition(
+        &self,
+        repo_id: Uuid,
+        license_id: Uuid,
+        edition_id: Uuid,
+        idempotency_key: Option<&str>,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let Some(idem) = idempotency_key else {
+            return sqlx::query_scalar(Self::RENEW_EDGE_SQL)
+                .bind(repo_id)
+                .bind(license_id)
+                .bind(edition_id)
+                .fetch_optional(&self.pool)
+                .await;
+        };
+        let mut tx = self.pool.begin().await?;
+        let fresh: Option<Uuid> = sqlx::query_scalar(
+            "insert into license_renewals (license_key_id, idempotency_key) \
+             select l.id, $3 from license_keys l where l.id = $2 and l.repo_id = $1 \
+             on conflict (license_key_id, idempotency_key) do nothing \
+             returning license_key_id",
+        )
+        .bind(repo_id)
+        .bind(license_id)
+        .bind(idem)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let bound = if fresh.is_some() {
+            sqlx::query_scalar(Self::RENEW_EDGE_SQL)
+                .bind(repo_id)
+                .bind(license_id)
+                .bind(edition_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            // Replay: report the current edge bound unchanged (only for a
+            // renewable edge, matching a fresh renewal's response shape).
+            sqlx::query_scalar(
+                "select to_char(lse.update_until, 'YYYY-MM-DD') \
+                 from license_set_entitlements lse \
+                 join license_keys l on l.id = lse.license_key_id \
+                 join editions e on e.set_id = lse.set_id and e.repo_id = l.repo_id \
+                 where l.id = $2 and l.repo_id = $1 and l.status = 'active' \
+                   and e.id = $3 and e.bound_kind = 'time' \
+                   and lse.update_until is not null",
+            )
+            .bind(repo_id)
+            .bind(license_id)
+            .bind(edition_id)
             .fetch_optional(&mut *tx)
             .await?
         };
@@ -8796,15 +8973,74 @@ mod tests {
             vec!["acme/a", "acme/b"]
         );
 
-        // A time-bounded edition can't be merged onto the perpetual key (the bound
-        // lives on the key, not the entitlement) — caller issues a standalone key.
+        // A time-bounded edition merges too (0047): its bound lands on the
+        // entitlement edge while the key itself stays perpetual, so each package
+        // serves under its own ceiling.
         assert_eq!(
             cat.add_edition_to_license(repo_id, lic, ed_c)
                 .await
                 .unwrap(),
-            EditionAdd::Standalone
+            EditionAdd::Added
         );
-        // Nor can a perpetual edition be merged onto a time-bounded key.
+        let bounds: std::collections::HashMap<String, LicenseBound> = cat
+            .entitled_package_bounds(lic)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        assert_eq!(bounds["acme/a"].until_unix, None);
+        assert_eq!(bounds["acme/b"].until_unix, None);
+        let c_until = bounds["acme/c"].until_unix.unwrap();
+        assert!(
+            (now + 300 * 86_400..now + 400 * 86_400).contains(&c_until),
+            "annual edge bound should sit ~12 months out"
+        );
+
+        // Renewing that edition extends only its edge (idempotently), leaving the
+        // key and the perpetual packages untouched.
+        let renewed = cat
+            .renew_license_edition(repo_id, lic, ed_c, Some("ren-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let replay = cat
+            .renew_license_edition(repo_id, lic, ed_c, Some("ren-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed, replay, "idempotent replay must not stack");
+        let bounds: std::collections::HashMap<String, LicenseBound> = cat
+            .entitled_package_bounds(lic)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let c_renewed = bounds["acme/c"].until_unix.unwrap();
+        assert!(
+            (now + 660 * 86_400..now + 760 * 86_400).contains(&c_renewed),
+            "renewal should extend the edge ~12 more months"
+        );
+        assert_eq!(bounds["acme/a"].until_unix, None);
+        // A perpetual edition has no time edge to renew…
+        assert_eq!(
+            cat.renew_license_edition(repo_id, lic, ed_b, Some("ren-2"))
+                .await
+                .unwrap(),
+            None
+        );
+        // …and the account key itself has no key-level time bound to renew.
+        assert_eq!(cat.renew_license(repo_id, lic, None).await.unwrap(), None);
+
+        // A perpetual edition still can't merge onto a **bounded** key (a NULL
+        // edge would inherit the key's bound and silently expire the purchase) —
+        // caller issues/uses an unbounded account key instead.
         let tkey = cat
             .issue_from_edition(repo_id, ed_c, None, None)
             .await
@@ -8823,6 +9059,15 @@ mod tests {
             cat.entitled_package_names(tlic).await.unwrap(),
             vec!["acme/c"]
         );
+        // The standalone key's bound still comes from the key itself (NULL edge
+        // inherits it — the 0047 back-compat rule).
+        let tbounds: std::collections::HashMap<String, LicenseBound> = cat
+            .entitled_package_bounds(tlic)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(tbounds["acme/c"].until_unix.is_some());
 
         // Unknown key / edition are distinct, non-mutating outcomes.
         assert_eq!(
@@ -8838,8 +9083,19 @@ mod tests {
             EditionAdd::NoEdition
         );
 
-        // Refund of the second item detaches just that edition; the key and its
-        // other entitlement survive. Idempotent, and reports the key still exists.
+        // Refund of the time-bounded item detaches just that edition — its edge
+        // (and bound) go with the row; the other entitlements survive.
+        assert!(
+            cat.remove_edition_from_license(repo_id, lic, ed_c)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cat.entitled_package_names(lic).await.unwrap(),
+            vec!["acme/a", "acme/b"]
+        );
+        // Refund of a perpetual item likewise. Idempotent, and reports the key
+        // still exists.
         assert!(
             cat.remove_edition_from_license(repo_id, lic, ed_b)
                 .await
