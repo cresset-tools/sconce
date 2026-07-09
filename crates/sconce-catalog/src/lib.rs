@@ -1678,6 +1678,34 @@ impl Catalog {
             .collect()
     }
 
+    /// Repositories in one org, newest-slug-ordered. Backs the `/api/v1/repos`
+    /// discovery endpoint an org-scoped read token hits so `bougie login` can
+    /// auto-provision a project's Composer `repositories`.
+    pub async fn repos_for_org(&self, org_id: Uuid) -> Result<Vec<RepoSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select o.slug as org, o.id as org_id, r.slug as repo, r.id as id, \
+                    r.update_mode as update_mode, r.cooldown_days as cooldown_days \
+             from repositories r join organizations o on o.id = r.org_id \
+             where r.org_id = $1 \
+             order by r.slug",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RepoSummary {
+                    org: row.try_get("org")?,
+                    org_id: row.try_get("org_id")?,
+                    repo: row.try_get("repo")?,
+                    id: row.try_get("id")?,
+                    update_mode: row.try_get("update_mode")?,
+                    cooldown_days: row.try_get("cooldown_days")?,
+                })
+            })
+            .collect()
+    }
+
     /// Repos in an org with per-repo counts + last sync — the C1 org overview.
     pub async fn org_repo_overview(&self, org_id: Uuid) -> Result<Vec<RepoOverview>, sqlx::Error> {
         let rows = sqlx::query(
@@ -7232,6 +7260,40 @@ mod tests {
             .find(|r| r.id == repo_id)
             .unwrap()
             .org_id
+    }
+
+    #[tokio::test]
+    async fn repos_for_org_lists_only_that_orgs_repos() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of(&cat, repo_id).await;
+        // The fresh org already has repo "r"; add two more.
+        let slug = cat
+            .list_repositories()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == repo_id)
+            .unwrap()
+            .org;
+        cat.create_repo(&slug, "web").await.unwrap();
+        cat.create_repo(&slug, "api").await.unwrap();
+        // A second org with its own repo must not leak in.
+        repo().await.unwrap();
+
+        let mut got: Vec<String> = cat
+            .repos_for_org(org_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.org, slug, "every row is this org");
+                r.repo
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, ["api", "r", "web"]);
     }
 
     #[tokio::test]

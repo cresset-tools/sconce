@@ -119,6 +119,11 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             "/{org}/{repo}/snapshots/{env}/{digest}",
             get(snapshots::download_digest),
         )
+        // Repo discovery for `bougie login`: list the repositories an org-scoped
+        // read token can access, so the CLI auto-provisions a project's Composer
+        // `repositories` without pasted URLs. Org-session-bearer auth (distinct
+        // from the repo-scoped, service-token `/api/v1/repos/{org}/{repo}/…` below).
+        .route("/api/v1/repos", get(list_org_repos))
         // Management API (service-token auth) — provisioning for commerce
         // front-ends like the Magento module. See `api`.
         .route(
@@ -650,6 +655,34 @@ async fn oauth_introspect(
         Ok(None) => Json(json!({ "active": false })).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// `GET /api/v1/repos` — the repositories an org-scoped read token can access,
+/// each with its full Composer URL. `bougie login` calls this with the token it
+/// just minted to auto-provision a project's `repositories`. Repo-scoped tokens
+/// (no `org_id`) authenticate nothing here → 401.
+async fn list_org_repos(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cred = extract_token(&headers).ok_or(AppError::Unauthorized)?;
+    let tok = s
+        .catalog
+        .resolve_org_session_token(&cred)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let repos = s.catalog.repos_for_org(tok.org_id).await?;
+    let list: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|r| {
+            json!({
+                "org": r.org,
+                "repo": r.repo,
+                "url": repo_base(&s.base_url, &r.org, &r.repo),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "repositories": list })))
 }
 
 #[derive(Debug, thiserror::Error)]
