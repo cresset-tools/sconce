@@ -164,6 +164,16 @@ for (const form of document.querySelectorAll('form[data-confirm]')) {
   }
 }
 
+// Packages tab: expand/collapse a package group (one card per package, so a
+// package with many versions is a single line until you open it).
+for (const head of document.querySelectorAll('.pkglist .pkghead')) {
+  head.addEventListener('click', (e) => {
+    // Let the package-name link navigate instead of toggling.
+    if (e.target.closest('a')) return;
+    head.closest('.pkggroup').classList.toggle('open');
+  });
+}
+
 // Editions add-form: show only the input relevant to the chosen bound kind
 // (months for a time bound, major for a version bound; perpetual needs neither).
 {

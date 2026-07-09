@@ -2134,6 +2134,130 @@ button.approveall:hover {
   color: #4f44e6;
 }
 
+/* Packages tab: one collapsed card per package (declutters the long version
+   list) that expands to its versions on click — mirrors the Approvals tab's
+   grouping. */
+.pkglist {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+.pkggroup {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.pkghead {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 16px;
+  background: #fbfbfe;
+  cursor: pointer;
+}
+.pkggroup.open .pkghead {
+  border-bottom: 1px solid var(--soft);
+}
+.pkgchev {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: 0;
+  background: none;
+  color: #8a93a0;
+  transition: transform 0.15s;
+}
+.pkgchev:hover {
+  background: none;
+  color: var(--text2);
+}
+.pkggroup.open .pkgchev {
+  transform: rotate(90deg);
+}
+.pkgname {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2a2f39;
+}
+.pkgname a {
+  color: inherit;
+}
+.pkglatest {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #9aa1ad;
+}
+.pkglatest code {
+  background: none;
+  padding: 0;
+  color: var(--text2);
+}
+.pkgrows {
+  display: none;
+}
+.pkggroup.open .pkgrows {
+  display: block;
+}
+.pkgrowhead,
+.pkgrow {
+  display: grid;
+  grid-template-columns: 2fr 90px 1.5fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+}
+.pkgrowhead {
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #9aa1ad;
+  background: #fcfcfe;
+  border-bottom: 1px solid #f0f1f5;
+}
+.pkgrow {
+  border-bottom: 1px solid #f5f6f8;
+}
+.pkgrow:last-child {
+  border-bottom: 0;
+}
+.pkgrow .ver {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #2a2f39;
+}
+.pkgrow .stab {
+  font-size: 12px;
+  color: var(--text2);
+}
+.pkgrow .acts {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.pkgmore {
+  padding: 9px 16px;
+  font-size: 12px;
+  color: var(--muted);
+  border-top: 1px solid #f5f6f8;
+}
+.pkgempty {
+  padding: 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 /* cooldown card: countdown + progress bar */
 .apcool {
   background: var(--surface);

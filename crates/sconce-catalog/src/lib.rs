@@ -1141,6 +1141,16 @@ pub struct AdminVersion {
     pub source_reference: Option<String>,
 }
 
+/// A package with its versions collapsed into one group — the Packages tab's
+/// per-package card. `version_count` is the full matching count; `rows` is a
+/// capped, newest-first slice (the rest live on the package detail page).
+#[derive(Debug, Clone)]
+pub struct AdminPackageGroup {
+    pub package: String,
+    pub version_count: i64,
+    pub rows: Vec<AdminVersion>,
+}
+
 /// A credential's optional supply-chain policy override (`None` = inherit the
 /// repo). It can only **tighten** the repo default at serve time.
 #[derive(Debug, Clone, Default)]
@@ -1865,6 +1875,112 @@ impl Catalog {
                 })
             })
             .collect()
+    }
+
+    /// Number of distinct packages in a repository that have at least one
+    /// version matching the same name/state filter as the Packages tab. Drives
+    /// the (package-based) pager total.
+    pub async fn count_packages(
+        &self,
+        repo_id: Uuid,
+        name: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(&format!(
+            "select count(distinct p.id) from package_versions pv \
+             join packages p on p.id = pv.package_id \
+             join repositories r on r.id = $1 \
+             where p.repo_id = $1 {VERSION_FILTER}"
+        ))
+        .bind(repo_id)
+        .bind(name)
+        .bind(state)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// A page of packages (ordered by name) with their versions collapsed into
+    /// groups — the Packages tab's per-package cards. Pagination is by
+    /// **package** (`limit`/`offset` count packages, not versions), so a
+    /// package's versions never straddle a page boundary. Each group carries
+    /// its full matching `version_count`; `row_cap` bounds how many version
+    /// rows are materialized per package (newest first) for inline expansion.
+    pub async fn admin_package_groups(
+        &self,
+        repo_id: Uuid,
+        limit: i64,
+        offset: i64,
+        name: Option<&str>,
+        state: Option<&str>,
+        row_cap: i64,
+    ) -> Result<Vec<AdminPackageGroup>, sqlx::Error> {
+        // One windowed pass over the matching versions: `pkg_rank` numbers the
+        // packages (so limit/offset select a page of packages), `version_count`
+        // is the per-package total, and `rn` orders versions newest-first so
+        // `row_cap` keeps the most recent ones. The window functions are
+        // computed before the outer WHERE, so paginating on their output needs
+        // the subquery wrapper.
+        let rows = sqlx::query(&format!(
+            "select package, version, normalized_version, stability, held, approved, yanked, \
+                    released_at, cooldown_days_left, dist_shasum, source_reference, version_count \
+             from ( \
+               select p.name as package, pv.version, pv.normalized_version, pv.stability, \
+                      (pv.held_at is not null) as held, (pv.approved_at is not null) as approved, \
+                      (pv.yanked_at is not null) as yanked, \
+                      pv.released_at::text as released_at, \
+                      case when pv.released_at is null then null else \
+                          greatest(0, ceil(extract(epoch from \
+                              (pv.released_at + make_interval(days => r.cooldown_days) - now())) / 86400))::bigint \
+                      end as cooldown_days_left, \
+                      pv.dist_shasum as dist_shasum, pv.source_reference as source_reference, \
+                      dense_rank() over (order by p.name) as pkg_rank, \
+                      count(*) over (partition by p.name)::bigint as version_count, \
+                      row_number() over (partition by p.name order by pv.normalized_version desc) as rn \
+               from package_versions pv \
+               join packages p on p.id = pv.package_id \
+               join repositories r on r.id = $1 \
+               where p.repo_id = $1 {VERSION_FILTER} \
+             ) t \
+             where pkg_rank > $5 and pkg_rank <= $5 + $4 and rn <= $6 \
+             order by package, rn"
+        ))
+        .bind(repo_id)
+        .bind(name)
+        .bind(state)
+        .bind(limit)
+        .bind(offset)
+        .bind(row_cap)
+        .fetch_all(&self.pool)
+        .await?;
+        // Rows arrive ordered by package then rn (newest first), so a simple
+        // fold into contiguous groups preserves that order.
+        let mut groups: Vec<AdminPackageGroup> = Vec::new();
+        for row in &rows {
+            let package: String = row.try_get("package")?;
+            let version_count: i64 = row.try_get("version_count")?;
+            let version = AdminVersion {
+                package: package.clone(),
+                version: row.try_get("version")?,
+                normalized_version: row.try_get("normalized_version")?,
+                stability: row.try_get("stability")?,
+                held: row.try_get("held")?,
+                approved: row.try_get("approved")?,
+                yanked: row.try_get("yanked")?,
+                released_at: row.try_get("released_at")?,
+                cooldown_days_left: row.try_get("cooldown_days_left")?,
+                dist_shasum: row.try_get("dist_shasum")?,
+                source_reference: row.try_get("source_reference")?,
+            };
+            match groups.last_mut() {
+                Some(g) if g.package == package => g.rows.push(version),
+                _ => groups.push(AdminPackageGroup {
+                    package,
+                    version_count,
+                    rows: vec![version],
+                }),
+            }
+        }
+        Ok(groups)
     }
 
     /// Number of read tokens for a repository.

@@ -466,6 +466,25 @@ pub struct RepoVerRow {
     pub yanked: bool,
 }
 
+/// A collapsed package group in the Packages tab — one card per package that
+/// expands to its version rows (mirrors the Approvals tab's grouping, so a
+/// package with dozens of versions is a single line by default).
+pub struct RepoPkgGroup {
+    pub package: String,
+    /// Total versions in the package (matching the current filter).
+    pub count: i64,
+    /// Newest version string, shown in the collapsed header.
+    pub latest_version: String,
+    pub latest_tone: &'static str,
+    pub latest_label: String,
+    /// Versions beyond the rendered `rows` (viewable on the detail page).
+    pub more: i64,
+    /// Render the group expanded on load (used when a filter is active, so the
+    /// matching versions are visible without a click).
+    pub expanded: bool,
+    pub rows: Vec<RepoVerRow>,
+}
+
 /// A recent-version line in the Overview card.
 pub struct RecentVer {
     pub package: String,
@@ -706,7 +725,9 @@ pub struct RepoPage {
     pub q_enc: String,
     pub state: String,
     pub filtered: bool,
-    pub versions: Vec<RepoVerRow>,
+    /// Packages (with their versions collapsed into groups) for the current
+    /// page. Pagination is by package — see `pager`.
+    pub pkg_groups: Vec<RepoPkgGroup>,
     pub pager: Option<Pager>,
     // Approvals
     /// Versions awaiting a decision (pending + cooldown + held).
@@ -859,7 +880,7 @@ mod tests {
             q_enc: String::new(),
             state: String::new(),
             filtered: false,
-            versions: vec![],
+            pkg_groups: vec![],
             pager: None,
             ap_total: ap_pending + ap_cooldown + ap_held,
             ap_pending,
