@@ -5357,6 +5357,36 @@ impl Catalog {
         Ok(EditionAdd::Added)
     }
 
+    /// The update bound on one edition's set-entitlement **edge** of a license
+    /// (empty = the edge is unbounded or inherits the key). Lets an API response
+    /// report the concrete expiry a just-attached or just-renewed edition carries
+    /// on an accumulated key.
+    pub async fn edition_edge_bound(
+        &self,
+        license_id: Uuid,
+        edition_id: Uuid,
+    ) -> Result<LicenseBound, sqlx::Error> {
+        let row = sqlx::query(
+            "select to_char(lse.update_until, 'YYYY-MM-DD') as until, \
+                    extract(epoch from lse.update_until)::bigint as until_unix, \
+                    lse.version_cap_major as major \
+             from license_set_entitlements lse \
+             join editions e on e.set_id = lse.set_id \
+             where lse.license_key_id = $1 and e.id = $2",
+        )
+        .bind(license_id)
+        .bind(edition_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| LicenseBound {
+                until: r.try_get("until").ok().flatten(),
+                until_unix: r.try_get("until_unix").ok().flatten(),
+                major: r.try_get("major").ok().flatten(),
+            })
+            .unwrap_or_default())
+    }
+
     /// Detach an edition's set entitlement from a license — a refund of one line
     /// item on a shared key. Removes only the by-reference set entitlement, the
     /// mirror of how [`Self::add_edition_to_license`] attached it. Returns whether

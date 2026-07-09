@@ -234,6 +234,17 @@ pub(crate) async fn issue_license(
     if let Some(key) = issued.key {
         body["key"] = json!(key);
     }
+    if req.account {
+        // On an account key the key-level "bound" is null by design — report the
+        // edge bound this edition landed with, so callers know the purchase's
+        // own expiry.
+        let edge = s.catalog.edition_edge_bound(issued.id, edition_id).await?;
+        body["edition_bound"] = json!({
+            "edition": req.edition.trim(),
+            "until": edge.until,
+            "major": edge.major,
+        });
+    }
     let status = if issued.created {
         StatusCode::CREATED
     } else {
@@ -369,7 +380,17 @@ pub(crate) async fn add_license_edition(
                 .license_detail(repo_id, license_id)
                 .await?
                 .ok_or(ApiError::NotFound("license"))?;
-            Ok((StatusCode::OK, Json(license_json(&s, &org, &repo, &detail))).into_response())
+            let mut body = license_json(&s, &org, &repo, &detail);
+            // The concrete bound this edition carries on its edge (null fields =
+            // perpetual) — the key-level "bound" stays null on account keys, so
+            // callers need this to know the purchase's own expiry.
+            let edge = s.catalog.edition_edge_bound(license_id, edition_id).await?;
+            body["edition_bound"] = json!({
+                "edition": req.edition.trim(),
+                "until": edge.until,
+                "major": edge.major,
+            });
+            Ok((StatusCode::OK, Json(body)).into_response())
         }
         EditionAdd::Standalone => Err(ApiError::Conflict(format!(
             "edition '{}' can't be merged onto this key (issue a standalone key instead)",
