@@ -3141,9 +3141,15 @@ async fn repo_page(
             sets: l
                 .sets
                 .iter()
-                .map(|(sid, sname)| views::LicSet {
+                .map(|(sid, sname, edge)| views::LicSet {
                     set_id: sid.to_string(),
                     name: sname.clone(),
+                    bound: match (&edge.until, edge.major) {
+                        (Some(u), Some(m)) => format!("until {u} · ≤ v{m}"),
+                        (Some(u), None) => format!("until {u}"),
+                        (None, Some(m)) => format!("≤ v{m}"),
+                        (None, None) => String::new(),
+                    },
                 })
                 .collect(),
             mode: l.policy.update_mode.clone().unwrap_or_default(),

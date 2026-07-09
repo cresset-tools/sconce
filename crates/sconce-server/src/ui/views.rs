@@ -601,6 +601,9 @@ pub struct DepRow {
 pub struct LicSet {
     pub set_id: String,
     pub name: String,
+    /// The edge's own update bound, pre-rendered ("until 2027-07-09", "≤ v2",
+    /// or empty when the edge inherits the key bound / is perpetual).
+    pub bound: String,
 }
 
 /// An edition (SKU) row in the Editions section of the Tokens tab.

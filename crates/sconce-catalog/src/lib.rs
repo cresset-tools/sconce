@@ -1189,11 +1189,14 @@ pub struct LicenseSummary {
     pub buyer: Option<String>,
     pub status: String,
     pub packages: Vec<String>,
-    /// Entitled package sets as `(set_id, name)` — unlock by reference, auto-grow.
-    pub sets: Vec<(Uuid, String)>,
+    /// Entitled package sets as `(set_id, name, edge_bound)` — unlock by
+    /// reference, auto-grow. The bound is the EDGE's own ceiling (0047): empty
+    /// means the edge inherits the key bound (legacy) / is perpetual.
+    pub sets: Vec<(Uuid, String, LicenseBound)>,
     /// Per-credential supply-chain policy override (empty = inherits the repo).
     pub policy: PolicyOverride,
-    /// Perpetual-fallback update bound (empty = unbounded).
+    /// Perpetual-fallback update bound **on the key** (empty = unbounded).
+    /// Accumulated keys keep this empty and carry bounds per set edge instead.
     pub bound: LicenseBound,
 }
 
@@ -1853,7 +1856,10 @@ impl Catalog {
                     extract(epoch from l.update_until)::bigint as bound_until_unix, \
                     l.version_cap_major as bound_major, \
                     coalesce(array_agg(distinct p.name) filter (where p.name is not null), '{}') as packages, \
-                    coalesce(array_agg(distinct ps.id::text || '|' || ps.name) filter (where ps.id is not null), '{}') as sets \
+                    coalesce(array_agg(distinct ps.id::text || '|' || ps.name || '|' \
+                                       || coalesce(to_char(lse.update_until, 'YYYY-MM-DD'), '') || '|' \
+                                       || coalesce(lse.version_cap_major::text, '')) \
+                             filter (where ps.id is not null), '{}') as sets \
              from license_keys l \
              left join entitlements e on e.license_key_id = l.id \
              left join packages p on p.id = e.package_id \
@@ -1878,8 +1884,21 @@ impl Catalog {
                         let raw: Vec<String> = row.try_get("sets")?;
                         raw.iter()
                             .filter_map(|s| {
-                                let (id, name) = s.split_once('|')?;
-                                Some((id.parse().ok()?, name.to_owned()))
+                                // "id|name|edge_until|edge_major" (empty = none).
+                                let mut parts = s.splitn(4, '|');
+                                let id = parts.next()?.parse().ok()?;
+                                let name = parts.next()?.to_owned();
+                                let until = parts.next().filter(|u| !u.is_empty());
+                                let major = parts.next().and_then(|m| m.parse::<i32>().ok());
+                                Some((
+                                    id,
+                                    name,
+                                    LicenseBound {
+                                        until: until.map(str::to_owned),
+                                        until_unix: None,
+                                        major,
+                                    },
+                                ))
                             })
                             .collect()
                     },
