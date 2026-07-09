@@ -851,6 +851,16 @@ pub enum DeviceFlowPoll {
     Expired,
 }
 
+/// An org-scoped session token resolved for relay introspection: the org it
+/// authenticates and its expiry as unix seconds (`None` = never expires). The
+/// expiry is read as an epoch bigint SQL-side — `sqlx` here has no `time`/
+/// `chrono` feature, so timestamps never cross the boundary as native types.
+#[derive(Debug, Clone)]
+pub struct OrgToken {
+    pub org_id: Uuid,
+    pub expires_at_unix: Option<i64>,
+}
+
 /// An authenticated admin user (from a session or login).
 #[derive(Debug, Clone)]
 pub struct AuthUser {
@@ -4597,6 +4607,35 @@ impl Catalog {
         }))
     }
 
+    /// Resolve an **org-scoped session token** (the credential `bougie login`
+    /// mints via the device flow, `org_id` set / `repo_id` null) to the org it
+    /// authenticates plus its expiry, for the relay introspection endpoint.
+    /// Returns `None` for an unknown, expired, or repo-scoped token. Stamps
+    /// `last_used_at` like the other verifiers ([`Catalog::token_valid`]). The
+    /// expiry comes back as an epoch bigint so no timestamp type is needed on
+    /// the sqlx boundary.
+    pub async fn resolve_org_session_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<OrgToken>, sqlx::Error> {
+        let row = sqlx::query(
+            "update tokens set last_used_at = now() \
+             where token_hash = $1 and org_id is not null \
+               and (expires_at is null or expires_at > now()) \
+             returning org_id, extract(epoch from expires_at)::bigint as expires_at_unix",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(OrgToken {
+                org_id: r.try_get("org_id")?,
+                expires_at_unix: r.try_get("expires_at_unix").ok().flatten(),
+            })),
+            None => Ok(None),
+        }
+    }
+
     /// A license key's policy override (empty if none set).
     pub async fn license_policy(&self, license_id: Uuid) -> Result<PolicyOverride, sqlx::Error> {
         let row = sqlx::query("select update_mode, cooldown_days from license_keys where id = $1")
@@ -6878,6 +6917,62 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "org-scoped token does not resolve for another org on the wire path"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_org_session_token_matches_only_org_credentials() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of(&cat, repo_id).await;
+
+        // A freshly minted org session token resolves to its org, with the
+        // bounded TTL surfaced as a unix-seconds expiry.
+        let token = cat
+            .create_session_token(org_id, "bougie login", 3600)
+            .await
+            .unwrap();
+        let resolved = cat
+            .resolve_org_session_token(&token)
+            .await
+            .unwrap()
+            .expect("org session token resolves");
+        assert_eq!(resolved.org_id, org_id);
+        assert!(
+            resolved.expires_at_unix.is_some(),
+            "a bounded TTL surfaces an expiry"
+        );
+
+        // An unknown token is inactive.
+        assert!(
+            cat.resolve_org_session_token("sconce_not_a_real_token")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A repo-scoped token (org_id null) is NOT an org session token.
+        let repo_token = cat.create_token(repo_id, Some("r"), None).await.unwrap();
+        assert!(
+            cat.resolve_org_session_token(&repo_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "a repo-scoped token does not resolve on the org introspection path"
+        );
+
+        // An already-expired org token is inactive.
+        let expired = cat
+            .create_session_token(org_id, "expired", -1)
+            .await
+            .unwrap();
+        assert!(
+            cat.resolve_org_session_token(&expired)
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired org token does not resolve"
         );
     }
 
