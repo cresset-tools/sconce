@@ -17,6 +17,8 @@
 //!   entitlement-edge time bound (renewal on an accumulated key).
 //! - `DELETE license-keys/{id}/editions/{edition}` — detach an edition (refund
 //!   of one line item on a shared key).
+//! - `POST license-keys/{id}/merge` — fold this key into another (consolidate a
+//!   legacy standalone key onto the customer's account key) and revoke it.
 //! - `DELETE license-keys/{id}` — revoke.
 
 use axum::extract::{FromRequestParts, Path, State};
@@ -426,6 +428,58 @@ pub(crate) async fn remove_license_edition(
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         Err(ApiError::NotFound("license"))
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MergeReq {
+    /// Target license id: the (unbounded) account key that absorbs this one.
+    into: String,
+}
+
+/// `POST /api/v1/repos/{org}/{repo}/license-keys/{id}/merge` — fold this key's
+/// entitlements into another key and revoke this one, so a commerce front-end
+/// can consolidate a customer's legacy standalone keys onto their account key
+/// **and update its own records in the same operation** (the admin-UI merge is
+/// the same catalog primitive, operator-driven). Bounds are materialized per
+/// axis (a NULL edge inherits this key's bound) and collisions keep the more
+/// permissive value. `200` with the updated target license. `404` when either
+/// key is missing/inactive in this repo, `409` when the target is bounded
+/// (merge targets must be unbounded account keys), `400` for a self-merge.
+pub(crate) async fn merge_license(
+    State(s): State<AppState>,
+    Path((org, repo, id)): Path<(String, String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
+    Json(req): Json<MergeReq>,
+) -> Result<Response, ApiError> {
+    let source = parse_license_id(&id)?;
+    let target = req
+        .into
+        .parse::<Uuid>()
+        .map_err(|_| ApiError::BadRequest("invalid target license id".to_owned()))?;
+    match s
+        .catalog
+        .merge_license_keys(repo_id, source, target)
+        .await?
+    {
+        sconce_catalog::LicenseMerge::Merged => {
+            let detail = s
+                .catalog
+                .license_detail(repo_id, target)
+                .await?
+                .ok_or(ApiError::NotFound("license"))?;
+            Ok((StatusCode::OK, Json(license_json(&s, &org, &repo, &detail))).into_response())
+        }
+        sconce_catalog::LicenseMerge::NoSource => Err(ApiError::NotFound("source license")),
+        sconce_catalog::LicenseMerge::NoTarget => Err(ApiError::NotFound("target license")),
+        sconce_catalog::LicenseMerge::TargetBounded => Err(ApiError::Conflict(
+            "target key carries its own update bound — merge targets must be \
+             unbounded (account) keys"
+                .to_owned(),
+        )),
+        sconce_catalog::LicenseMerge::SameKey => Err(ApiError::BadRequest(
+            "source and target are the same key".to_owned(),
+        )),
     }
 }
 
