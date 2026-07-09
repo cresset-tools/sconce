@@ -89,30 +89,42 @@
     <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}&state=yanked" class="{% if state == "yanked" %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>yanked</a>
     <a href="/r/{{ org }}/{{ repo }}?{% if !q_enc.is_empty() %}q={{ q_enc }}{% endif %}&state=approved" class="{% if state == "approved" %}badge violet{% else %}badge{% endif %}" style=text-decoration:none>approved</a>
   </span>
-  <table>
-    <tr><th>Package</th><th>Version</th><th>Stability</th><th>State</th><th>Actions</th></tr>
-    {% for v in versions %}
-      <tr>
-        <td><a href="/r/{{ org }}/{{ repo }}/p/{{ v.package }}">{{ v.package }}</a></td>
-        <td>{{ v.version }} <span class=muted>{{ v.normalized }}</span></td>
-        <td>{{ v.stability }}</td>
-        <td><span class="badge {{ v.badge_tone }}">{{ v.badge_label }}</span> <span class=muted>{{ v.released }}</span></td>
-        <td>
-          <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version">
-            <input type=hidden name=package value="{{ v.package }}"><input type=hidden name=normalized value="{{ v.normalized }}">
-            <button name=action value={% if v.held %}unhold{% else %}hold{% endif %}>{% if v.held %}Unhold{% else %}Hold{% endif %}</button>
-            <button name=action value=approve>Approve</button>
-            <button name=action value={% if v.yanked %}unyank{% else %}yank{% endif %}>{% if v.yanked %}Unyank{% else %}Yank{% endif %}</button>
-          </form>
-        </td>
-      </tr>
+  <div class=pkglist>
+    {% for g in pkg_groups %}
+      <div class="pkggroup{% if g.expanded %} open{% endif %}" data-pkg="{{ g.package }}">
+        <div class=pkghead>
+          <button type=button class=pkgchev aria-label="Expand"><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M9 6l6 6-6 6"></path></svg></button>
+          <code class=pkgname><a href="/r/{{ org }}/{{ repo }}/p/{{ g.package }}">{{ g.package }}</a></code>
+          <span class="badge slate">{{ g.count }} version(s)</span>
+          <span class=pkglatest>latest <code>{{ g.latest_version }}</code> <span class="badge {{ g.latest_tone }}">{{ g.latest_label }}</span></span>
+        </div>
+        <div class=pkgrows>
+          <div class=pkgrowhead><span>Version</span><span>Stability</span><span>State</span><span></span></div>
+          {% for v in g.rows %}
+            <div class=pkgrow>
+              <code class=ver>{{ v.version }} <span class=muted>{{ v.normalized }}</span></code>
+              <span class=stab>{{ v.stability }}</span>
+              <span class=st><span class="badge {{ v.badge_tone }}">{{ v.badge_label }}</span> <span class=muted>{{ v.released }}</span></span>
+              <span class=acts>
+                <form class=inline method=post action="/r/{{ org }}/{{ repo }}/version">
+                  <input type=hidden name=package value="{{ v.package }}"><input type=hidden name=normalized value="{{ v.normalized }}">
+                  <button name=action value={% if v.held %}unhold{% else %}hold{% endif %}>{% if v.held %}Unhold{% else %}Hold{% endif %}</button>
+                  <button name=action value=approve>Approve</button>
+                  <button name=action value={% if v.yanked %}unyank{% else %}yank{% endif %}>{% if v.yanked %}Unyank{% else %}Yank{% endif %}</button>
+                </form>
+              </span>
+            </div>
+          {% endfor %}
+          {% if g.more > 0 %}<div class=pkgmore>+ {{ g.more }} older version(s) — <a href="/r/{{ org }}/{{ repo }}/p/{{ g.package }}">view all on the package page</a></div>{% endif %}
+        </div>
+      </div>
     {% else %}
-      <tr><td colspan=5 class=muted>{% if filtered %}No versions match the filter.{% else %}No packages yet. Mirror one with <code>sconce mirror</code>.{% endif %}</td></tr>
+      <div class=pkgempty>{% if filtered %}No packages match the filter.{% else %}No packages yet. Mirror one with <code>sconce mirror</code>.{% endif %}</div>
     {% endfor %}
-  </table>
+  </div>
   {% if let Some(p) = pager %}
     <div class=pager>
-      <span class=muted>Showing {{ p.from }}&ndash;{{ p.to }} of {{ p.total }} versions</span>
+      <span class=muted>Showing {{ p.from }}&ndash;{{ p.to }} of {{ p.total }} package(s)</span>
       {% if p.last_page > 1 %}
         {% if p.page > 1 %}<a href="{{ p.base }}?{% if !p.extra.is_empty() %}{{ p.extra }}&{% endif %}page={{ p.page - 1 }}">&lsaquo; Prev</a>{% endif %}
         <span class=muted>Page {{ p.page }} of {{ p.last_page }}</span>

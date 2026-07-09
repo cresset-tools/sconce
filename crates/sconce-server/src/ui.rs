@@ -2700,9 +2700,12 @@ async fn repo_page(
     Path((org, repo)): Path<(String, String)>,
     Query(q): Query<PageQuery>,
 ) -> Result<Html<String>, StatusCode> {
-    // Paginate the (potentially long) packages & versions list, with optional
-    // name search + state filter.
-    const PER_PAGE: i64 = 50;
+    // Paginate the packages & versions list by **package** — a package's
+    // versions collapse into one group on the Packages tab, so paginating by
+    // version could split a package across pages. Optional name search + state
+    // filter narrow the set.
+    const PER_PAGE_PKG: i64 = 25; // packages (groups) per page
+    const GROUP_ROW_CAP: i64 = 12; // version rows materialized per group
     // Approval-queue display caps (Approvals tab).
     const AP_CAP: i64 = 300; // versions fetched per state for the queue
     const AP_ROWS: usize = 4; // pending rows shown per package group
@@ -2715,16 +2718,37 @@ async fn repo_page(
         .filter(|x| matches!(*x, "held" | "yanked" | "approved" | "pending"));
     // When the user is searching/filtering packages, open on the Packages tab.
     let filtering = name_q.is_some() || state_q.is_some() || q.page.is_some();
+    // `total_versions` still drives the repo header's "· N version(s)"; the
+    // pager counts packages.
     let total_versions = s
         .catalog
         .count_package_versions(summary.id, name_q, state_q)
         .await
         .map_err(e500)?;
-    let last_page = ((total_versions + PER_PAGE - 1) / PER_PAGE).max(1);
-    let page = q.page.unwrap_or(1).clamp(1, last_page);
-    let versions = s
+    let total_packages = s
         .catalog
-        .admin_package_versions(summary.id, PER_PAGE, (page - 1) * PER_PAGE, name_q, state_q)
+        .count_packages(summary.id, name_q, state_q)
+        .await
+        .map_err(e500)?;
+    let last_page = ((total_packages + PER_PAGE_PKG - 1) / PER_PAGE_PKG).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, last_page);
+    let groups = s
+        .catalog
+        .admin_package_groups(
+            summary.id,
+            PER_PAGE_PKG,
+            (page - 1) * PER_PAGE_PKG,
+            name_q,
+            state_q,
+            GROUP_ROW_CAP,
+        )
+        .await
+        .map_err(e500)?;
+    // Overview's "recent versions" card wants only the newest few, independent
+    // of the Packages pager.
+    let recent_src = s
+        .catalog
+        .admin_package_versions(summary.id, 4, 0, name_q, state_q)
         .await
         .map_err(e500)?;
     let tokens = s.catalog.list_tokens(summary.id).await.map_err(e500)?;
@@ -2747,45 +2771,74 @@ async fn repo_page(
         .map_err(e500)?;
     let title = format!("{org}/{repo}");
 
-    // ---- Packages tab: version rows ----
-    let version_rows: Vec<views::RepoVerRow> = versions
+    // ---- Packages tab: per-package groups (versions collapsed) ----
+    // Badge tone/label for one version, matching the flat list's wording.
+    let version_badge = |v: &sconce_catalog::AdminVersion| -> (&'static str, String) {
+        if v.yanked {
+            ("held", "yanked".to_owned())
+        } else if v.held {
+            ("held", "held".to_owned())
+        } else if v.approved {
+            ("ok", "approved".to_owned())
+        } else {
+            match summary.update_mode.as_str() {
+                "manual" => ("amber", "pending approval".to_owned()),
+                "delayed" => match v.cooldown_days_left {
+                    None => ("amber", "pending".to_owned()),
+                    Some(0) => ("ok", "live".to_owned()),
+                    Some(n) => ("blue", format!("cooldown · {n}d left")),
+                },
+                _ => ("ok", "live".to_owned()),
+            }
+        }
+    };
+    let pkg_groups: Vec<views::RepoPkgGroup> = groups
         .iter()
-        .map(|v| {
-            let (tone, label) = if v.yanked {
-                ("held", "yanked".to_owned())
-            } else if v.held {
-                ("held", "held".to_owned())
-            } else if v.approved {
-                ("ok", "approved".to_owned())
-            } else {
-                match summary.update_mode.as_str() {
-                    "manual" => ("amber", "pending approval".to_owned()),
-                    "delayed" => match v.cooldown_days_left {
-                        None => ("amber", "pending".to_owned()),
-                        Some(0) => ("ok", "live".to_owned()),
-                        Some(n) => ("blue", format!("cooldown · {n}d left")),
-                    },
-                    _ => ("ok", "live".to_owned()),
-                }
-            };
-            views::RepoVerRow {
-                package: v.package.clone(),
-                version: v.version.clone(),
-                normalized: v.normalized_version.clone(),
-                stability: v.stability.clone(),
-                badge_tone: tone,
-                badge_label: label,
-                released: v.released_at.clone().unwrap_or_default(),
-                held: v.held,
-                yanked: v.yanked,
+        .map(|g| {
+            let rows: Vec<views::RepoVerRow> = g
+                .rows
+                .iter()
+                .map(|v| {
+                    let (tone, label) = version_badge(v);
+                    views::RepoVerRow {
+                        package: v.package.clone(),
+                        version: v.version.clone(),
+                        normalized: v.normalized_version.clone(),
+                        stability: v.stability.clone(),
+                        badge_tone: tone,
+                        badge_label: label,
+                        released: v.released_at.clone().unwrap_or_default(),
+                        held: v.held,
+                        yanked: v.yanked,
+                    }
+                })
+                .collect();
+            // Rows are newest-first, so the first heads the collapsed card.
+            let (latest_version, latest_tone, latest_label) = g.rows.first().map_or_else(
+                || (String::new(), "slate", String::new()),
+                |v| {
+                    let (tone, label) = version_badge(v);
+                    (v.version.clone(), tone, label)
+                },
+            );
+            views::RepoPkgGroup {
+                package: g.package.clone(),
+                count: g.version_count,
+                latest_version,
+                latest_tone,
+                latest_label,
+                more: (g.version_count - i64::try_from(rows.len()).unwrap_or(i64::MAX)).max(0),
+                // Expand on load when a filter is active, so matching versions
+                // are visible without a click.
+                expanded: name_q.is_some() || state_q.is_some(),
+                rows,
             }
         })
         .collect();
 
     // ---- Overview: recent versions (top 4) ----
-    let recent: Vec<views::RecentVer> = versions
+    let recent: Vec<views::RecentVer> = recent_src
         .iter()
-        .take(4)
         .map(|v| {
             let (tone, label) = if v.yanked {
                 ("held", "yanked".to_owned())
@@ -3267,7 +3320,7 @@ async fn repo_page(
         .first()
         .map_or_else(|| "<package>".to_owned(), |p| p.name.clone());
     let q_enc = name_q.map_or(String::new(), urlencode);
-    let pager = if total_versions == 0 {
+    let pager = if total_packages == 0 {
         None
     } else {
         let mut extra = String::new();
@@ -3281,9 +3334,9 @@ async fn repo_page(
             let _ = write!(extra, "state={st}");
         }
         Some(views::Pager {
-            from: (page - 1) * PER_PAGE + 1,
-            to: (page * PER_PAGE).min(total_versions),
-            total: total_versions,
+            from: (page - 1) * PER_PAGE_PKG + 1,
+            to: (page * PER_PAGE_PKG).min(total_packages),
+            total: total_packages,
             page,
             last_page,
             base: format!("/r/{org}/{repo}"),
@@ -3314,7 +3367,7 @@ async fn repo_page(
         q_enc,
         state: state_q.unwrap_or("").to_owned(),
         filtered: name_q.is_some() || state_q.is_some(),
-        versions: version_rows,
+        pkg_groups,
         pager,
         ap_total,
         ap_pending,
