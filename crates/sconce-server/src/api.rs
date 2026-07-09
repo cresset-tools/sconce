@@ -9,9 +9,12 @@
 //! - `GET editions` — list editions (for mapping a product to a SKU).
 //! - `POST license-keys` — issue against an edition (`Idempotency-Key` = order id).
 //! - `GET license-keys/{id}` — inspect: entitlements, bound, install info.
-//! - `POST license-keys/{id}/renew` — extend the update bound.
+//! - `POST license-keys/{id}/renew` — extend the update bound (standalone keys).
 //! - `POST license-keys/{id}/editions` — attach an edition to a key (a repeat
-//!   buyer accumulates purchases onto one key).
+//!   buyer accumulates purchases onto one key; the edition's bound lands on the
+//!   entitlement edge, 0047).
+//! - `POST license-keys/{id}/editions/{edition}/renew` — extend one edition's
+//!   entitlement-edge time bound (renewal on an accumulated key).
 //! - `DELETE license-keys/{id}/editions/{edition}` — detach an edition (refund
 //!   of one line item on a shared key).
 //! - `DELETE license-keys/{id}` — revoke.
@@ -176,12 +179,20 @@ pub(crate) struct IssueReq {
     edition: String,
     /// Buyer reference (email / order id / company).
     buyer: Option<String>,
+    /// Issue an **account key**: the key itself is unbounded and the edition's
+    /// bound lands on the entitlement edge (0047), so later purchases of any
+    /// edition can merge onto it. Front-ends that accumulate purchases onto one
+    /// key per customer should always set this. Default `false` = legacy
+    /// standalone shape (bound on the key).
+    #[serde(default)]
+    account: bool,
 }
 
 /// `POST /api/v1/repos/{org}/{repo}/license-keys` — issue a key against an
 /// edition. Idempotent on the `Idempotency-Key` header: a repeat returns the
 /// existing license (200, no `key`) instead of a duplicate; a fresh issue is
-/// `201` and includes the one-time `key`.
+/// `201` and includes the one-time `key`. With `"account": true` the key is
+/// minted unbounded and the edition's bound lands on its entitlement edge.
 pub(crate) async fn issue_license(
     State(s): State<AppState>,
     Path((org, repo)): Path<(String, String)>,
@@ -202,11 +213,16 @@ pub(crate) async fn issue_license(
         .as_deref()
         .map(str::trim)
         .filter(|b| !b.is_empty());
-    let issued = s
-        .catalog
-        .issue_from_edition(repo_id, edition_id, buyer, idem)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest(format!("edition '{}' is inactive", req.edition)))?;
+    let issued = if req.account {
+        s.catalog
+            .issue_account_key_from_edition(repo_id, edition_id, buyer, idem)
+            .await?
+    } else {
+        s.catalog
+            .issue_from_edition(repo_id, edition_id, buyer, idem)
+            .await?
+    }
+    .ok_or_else(|| ApiError::BadRequest(format!("edition '{}' is inactive", req.edition)))?;
     let detail = s
         .catalog
         .license_detail(repo_id, issued.id)
@@ -217,6 +233,17 @@ pub(crate) async fn issue_license(
     // The plaintext key exists only on first creation (never re-derivable).
     if let Some(key) = issued.key {
         body["key"] = json!(key);
+    }
+    if req.account {
+        // On an account key the key-level "bound" is null by design — report the
+        // edge bound this edition landed with, so callers know the purchase's
+        // own expiry.
+        let edge = s.catalog.edition_edge_bound(issued.id, edition_id).await?;
+        body["edition_bound"] = json!({
+            "edition": req.edition.trim(),
+            "until": edge.until,
+            "major": edge.major,
+        });
     }
     let status = if issued.created {
         StatusCode::CREATED
@@ -271,6 +298,47 @@ pub(crate) async fn renew_license(
     Ok(Json(license_json(&s, &org, &repo, &detail)))
 }
 
+/// `POST /api/v1/repos/{org}/{repo}/license-keys/{id}/editions/{edition}/renew`
+/// — extend one edition's **entitlement-edge** time bound by its period: the
+/// renewal path for accumulated keys, where each purchase carries its own bound
+/// (0047) and the key itself stays unbounded. `400` if the key is
+/// missing/revoked, the edition isn't time-bounded, or the key has no
+/// explicitly-bounded edge for it (a standalone key renews via `…/renew`).
+/// Idempotent on the `Idempotency-Key` header like key-level renewal.
+pub(crate) async fn renew_license_edition(
+    State(s): State<AppState>,
+    Path((org, repo, id, edition)): Path<(String, String, String, String)>,
+    AuthedRepo(repo_id): AuthedRepo,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let idem = idempotency_key(&headers);
+    let lic = parse_license_id(&id)?;
+    let edition_id = s
+        .catalog
+        .find_edition(repo_id, edition.trim())
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(format!("no edition '{edition}' in {org}/{repo}")))?;
+    let new_until = s
+        .catalog
+        .renew_license_edition(repo_id, lic, edition_id, idem)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "license not found or revoked, edition not time-bounded, or no bounded \
+                 entitlement for it on this key (a standalone key renews via /renew)"
+                    .to_owned(),
+            )
+        })?;
+    let detail = s
+        .catalog
+        .license_detail(repo_id, lic)
+        .await?
+        .ok_or(ApiError::NotFound("license"))?;
+    let mut body = license_json(&s, &org, &repo, &detail);
+    body["edition_bound"] = json!({ "edition": edition, "until": new_until });
+    Ok(Json(body))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct AddEditionReq {
     /// Edition name or slug to attach to the key.
@@ -280,10 +348,13 @@ pub(crate) struct AddEditionReq {
 /// `POST /api/v1/repos/{org}/{repo}/license-keys/{id}/editions` — attach an
 /// edition's content to an existing key, so a repeat buyer accumulates their
 /// purchases onto one key (one Composer auth entry unlocks everything they own).
-/// `200` with the updated license on success (or an idempotent replay). `409`
-/// when the edition can't be merged onto this key (non-perpetual bound, or a
-/// snapshot edition) — the caller should issue a standalone key instead. `404`
-/// if the key isn't in this repo, `400` for an unknown/inactive edition.
+/// A time/version-bounded edition merges too: its bound lands on the entitlement
+/// edge (0047), serving each package under its own ceiling. `200` with the
+/// updated license on success (or an idempotent replay). `409` when the edition
+/// can't be merged onto this key (the key itself is bounded — merge targets are
+/// unbounded account keys — or a snapshot edition) — the caller should issue a
+/// standalone key instead. `404` if the key isn't in this repo, `400` for an
+/// unknown/inactive edition.
 pub(crate) async fn add_license_edition(
     State(s): State<AppState>,
     Path((org, repo, id)): Path<(String, String, String)>,
@@ -309,7 +380,17 @@ pub(crate) async fn add_license_edition(
                 .license_detail(repo_id, license_id)
                 .await?
                 .ok_or(ApiError::NotFound("license"))?;
-            Ok((StatusCode::OK, Json(license_json(&s, &org, &repo, &detail))).into_response())
+            let mut body = license_json(&s, &org, &repo, &detail);
+            // The concrete bound this edition carries on its edge (null fields =
+            // perpetual) — the key-level "bound" stays null on account keys, so
+            // callers need this to know the purchase's own expiry.
+            let edge = s.catalog.edition_edge_bound(license_id, edition_id).await?;
+            body["edition_bound"] = json!({
+                "edition": req.edition.trim(),
+                "until": edge.until,
+                "major": edge.major,
+            });
+            Ok((StatusCode::OK, Json(body)).into_response())
         }
         EditionAdd::Standalone => Err(ApiError::Conflict(format!(
             "edition '{}' can't be merged onto this key (issue a standalone key instead)",

@@ -191,6 +191,7 @@ pub fn router(
             "/r/{org}/{repo}/license/set/remove",
             post(remove_license_set),
         )
+        .route("/r/{org}/{repo}/license/merge", post(merge_license_action))
         .route("/r/{org}/{repo}/license/issue", post(issue_license_edition))
         .route("/r/{org}/{repo}/editions", post(create_edition_action))
         .route(
@@ -4533,6 +4534,45 @@ async fn remove_license_set(
         .await
         .map_err(e500)?;
     Ok(Redirect::to(&format!("/r/{org}/{repo}")))
+}
+
+#[derive(Deserialize)]
+struct LicenseMergeForm {
+    /// The source key: its entitlements move and it gets revoked.
+    id: String,
+    /// The target (account) key that absorbs them.
+    into: String,
+}
+
+/// Fold one key's entitlements into another and revoke the source — the manual
+/// consolidation for buyers who accumulated standalone keys before
+/// per-entitlement bounds (0047). The catalog materializes inherited bounds and
+/// unions collisions; the target must be an unbounded active key.
+async fn merge_license_action(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<LicenseMergeForm>,
+) -> Result<Redirect, StatusCode> {
+    let repo_id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let source =
+        f.id.parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let target = f
+        .into
+        .parse::<uuid::Uuid>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    match s
+        .catalog
+        .merge_license_keys(repo_id, source, target)
+        .await
+        .map_err(e500)?
+    {
+        sconce_catalog::LicenseMerge::Merged => Ok(Redirect::to(&format!("/r/{org}/{repo}"))),
+        // Invalid pick (bounded target, same key, or a key vanished) — nothing
+        // was changed; bounce back with a 4xx the operator can act on.
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 #[cfg(test)]
