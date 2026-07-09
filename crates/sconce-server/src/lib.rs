@@ -47,6 +47,10 @@ struct AppState {
     store: AnyBlobStore,
     /// Public base URL; each repository is served under `<base>/<org>/<repo>`.
     base_url: String,
+    /// Shared secret a first-party relay presents (as `Authorization: Bearer`)
+    /// to the token-introspection endpoint. Loaded once from
+    /// `SCONCE_INTROSPECT_SECRET`; `None` (unset/blank) fails every call closed.
+    introspect_secret: Option<String>,
 }
 
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
@@ -56,6 +60,11 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
     // 2 MiB default — applied per-route so the read/serving routes keep the default.
     let max_upload = publish::max_upload_bytes();
     let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
+    // Relay-introspection secret, loaded once at startup. Blank/unset → the
+    // endpoint fails closed (see `oauth_introspect`).
+    let introspect_secret = std::env::var("SCONCE_INTROSPECT_SECRET")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     Router::new()
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
@@ -66,6 +75,10 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         // a flow + polls here; the human approves on the dashboard (see ui.rs).
         .route("/oauth/device", post(oauth_device))
         .route("/oauth/device/token", post(oauth_device_token))
+        // Token introspection (RFC 7662 style) for a first-party relay: verify a
+        // `bougie login` org-session token. Caller-authenticated by a shared
+        // secret; never exposed to end users.
+        .route("/oauth/introspect", post(oauth_introspect))
         // Publish (push) API — single-shot + chunked/resumable uploads.
         .route(
             "/{org}/{repo}/packages/{vendor}/{name}/{version}",
@@ -141,6 +154,7 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             catalog,
             store,
             base_url,
+            introspect_secret,
         })
 }
 
@@ -584,6 +598,57 @@ async fn oauth_device_token(
             device_error(StatusCode::BAD_REQUEST, "expired_token")
         }
         Err(_) => device_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct IntrospectRequest {
+    token: String,
+}
+
+/// RFC 7662-style token introspection for a **first-party relay** (e.g. the
+/// tunnel relay fronting `bougie server` tunnels): verify a `bougie login`
+/// org-scoped session token and report the org it authenticates.
+///
+/// Caller auth is a shared secret presented as `Authorization: Bearer
+/// <SCONCE_INTROSPECT_SECRET>`. The secret is loaded once at startup; if it's
+/// unset the endpoint fails **closed** — every call is `401`, never allow-all.
+/// Not an end-user endpoint. On success (HTTP 200):
+/// `{ "active": true, "org_id": "<uuid>", "expires_at": <unix-secs?> }`, and
+/// `{ "active": false }` for an unknown / expired / repo-scoped token.
+async fn oauth_introspect(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<IntrospectRequest>,
+) -> Response {
+    // Fail closed when no relay secret is configured.
+    let Some(expected) = s.introspect_secret.as_deref() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // Strictly require the secret as a bearer token (not basic-auth).
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    // Plain compare (the codebase carries no constant-time helper; the admin
+    // auth in `ui.rs` compares the same way).
+    if presented != Some(expected) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match s.catalog.resolve_org_session_token(&req.token).await {
+        Ok(Some(tok)) => {
+            let mut body = json!({
+                "active": true,
+                "org_id": tok.org_id.to_string(),
+            });
+            if let Some(exp) = tok.expires_at_unix {
+                body["expires_at"] = json!(exp);
+            }
+            Json(body).into_response()
+        }
+        Ok(None) => Json(json!({ "active": false })).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

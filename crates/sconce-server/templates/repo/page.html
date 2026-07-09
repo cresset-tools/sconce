@@ -527,7 +527,7 @@
   <h2>License keys</h2>
   <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs (a date = “updates until”, or ≤ a major version) — it keeps everything in-window forever. Entitling a key to a <strong>set</strong> unlocks every package it resolves to, by reference (auto-grows).</p>
   <table>
-    <tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Sets</th><th>Policy</th><th>Update bound</th></tr>
+    <tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Sets</th><th>Policy</th><th>Update bound</th><th>Merge</th></tr>
     {% for l in licenses %}
       <tr>
         <td>{{ l.buyer }}</td>
@@ -560,9 +560,26 @@
             until <input name=until type=date value="{{ l.until }}" style="width:9em"> or ≤ major <input name=major type=number min=0 placeholder=any style="width:4em" value="{{ l.major }}"> <button>Set</button>
           </form>
         </td>
+        <td>
+          {# Fold this key into an unbounded (account) key: entitlements move
+             with their effective bounds and THIS key is revoked — the manual
+             consolidation for buyers holding pre-0047 standalone keys. #}
+          {% if l.status == "active" %}
+            <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/merge"
+                  onsubmit="return confirm('Merge this key into the selected one? This key will be REVOKED; its entitlements (with their bounds) move to the target.')">
+              <input type=hidden name=id value="{{ l.id }}">
+              <select name=into>
+                {%- for t in licenses %}{% if t.id != l.id && t.status == "active" && t.until.is_empty() && t.major.is_empty() -%}
+                  <option value="{{ t.id }}">{{ t.buyer }} · {{ t.id|truncate(8) }}</option>
+                {%- endif %}{% endfor -%}
+              </select>
+              <button>Merge into ▸</button>
+            </form>
+          {% else %}<span class=muted>—</span>{% endif %}
+        </td>
       </tr>
     {% else %}
-      <tr><td colspan=6 class=muted>none</td></tr>
+      <tr><td colspan=7 class=muted>none</td></tr>
     {% endfor %}
   </table>
   {% if edition_opts.is_empty() %}
