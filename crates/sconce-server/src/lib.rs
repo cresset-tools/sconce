@@ -47,10 +47,13 @@ struct AppState {
     store: AnyBlobStore,
     /// Public base URL; each repository is served under `<base>/<org>/<repo>`.
     base_url: String,
-    /// Shared secret a first-party relay presents (as `Authorization: Bearer`)
-    /// to the token-introspection endpoint. Loaded once from
-    /// `SCONCE_INTROSPECT_SECRET`; `None` (unset/blank) fails every call closed.
-    introspect_secret: Option<String>,
+    /// sha256 of each shared secret a first-party relay may present (as
+    /// `Authorization: Bearer`) to the token-introspection endpoint. A *set*
+    /// (not one value) so a secret can be rotated with an overlap window — see
+    /// `parse_introspect_secrets`. Loaded once from `SCONCE_INTROSPECT_SECRET`;
+    /// empty (unset/blank) fails every call closed. Stored as digests so the
+    /// plaintext secrets don't linger in memory.
+    introspect_secrets: Vec<[u8; 32]>,
 }
 
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
@@ -60,11 +63,15 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
     // 2 MiB default — applied per-route so the read/serving routes keep the default.
     let max_upload = publish::max_upload_bytes();
     let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
-    // Relay-introspection secret, loaded once at startup. Blank/unset → the
-    // endpoint fails closed (see `oauth_introspect`).
-    let introspect_secret = std::env::var("SCONCE_INTROSPECT_SECRET")
+    // Relay-introspection secrets, loaded once at startup. Accept a *set*
+    // (comma- or whitespace-separated) so a secret can be rotated with zero
+    // downtime: add the new one here and restart, roll the relay onto it, then
+    // drop the old one and restart — at no point is the relay's live secret
+    // rejected. Blank/unset → the endpoint fails closed (see `oauth_introspect`).
+    let introspect_secrets = std::env::var("SCONCE_INTROSPECT_SECRET")
         .ok()
-        .filter(|v| !v.trim().is_empty());
+        .map(|raw| parse_introspect_secrets(&raw))
+        .unwrap_or_default();
     Router::new()
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
@@ -163,7 +170,7 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             catalog,
             store,
             base_url,
-            introspect_secret,
+            introspect_secrets,
         })
 }
 
@@ -615,14 +622,46 @@ struct IntrospectRequest {
     token: String,
 }
 
+/// sha256 of a relay secret. Hashing before comparison means unequal secret
+/// *lengths* never leak through the compare (the digests are always 32 bytes).
+fn secret_digest(secret: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(secret.as_bytes()));
+    out
+}
+
+/// Constant-time equality for two fixed-size digests: fold every byte, no
+/// data-dependent branch or early exit, so timing reveals nothing about how
+/// many bytes matched.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Parse `SCONCE_INTROSPECT_SECRET` into the sha256 digest of each accepted
+/// secret. Splitting on commas *and* whitespace lets an operator list more than
+/// one during a rotation overlap window; blanks are dropped, and an empty result
+/// leaves the endpoint fail-closed.
+fn parse_introspect_secrets(raw: &str) -> Vec<[u8; 32]> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(secret_digest)
+        .collect()
+}
+
 /// RFC 7662-style token introspection for a **first-party relay** (e.g. the
 /// tunnel relay fronting `bougie server` tunnels): verify a `bougie login`
 /// org-scoped session token and report the org it authenticates.
 ///
 /// Caller auth is a shared secret presented as `Authorization: Bearer
-/// <SCONCE_INTROSPECT_SECRET>`. The secret is loaded once at startup; if it's
-/// unset the endpoint fails **closed** — every call is `401`, never allow-all.
-/// Not an end-user endpoint. On success (HTTP 200):
+/// <SCONCE_INTROSPECT_SECRET>`, checked in constant time against the accepted
+/// set (more than one during a rotation overlap). The set is loaded once at
+/// startup; if it's empty the endpoint fails **closed** — every call is `401`,
+/// never allow-all. Not an end-user endpoint. On success (HTTP 200):
 /// `{ "active": true, "org_id": "<uuid>", "expires_at": <unix-secs?> }`, and
 /// `{ "active": false }` for an unknown / expired / repo-scoped token.
 async fn oauth_introspect(
@@ -631,18 +670,28 @@ async fn oauth_introspect(
     Json(req): Json<IntrospectRequest>,
 ) -> Response {
     // Fail closed when no relay secret is configured.
-    let Some(expected) = s.introspect_secret.as_deref() else {
+    if s.introspect_secrets.is_empty() {
         return StatusCode::UNAUTHORIZED.into_response();
-    };
+    }
     // Strictly require the secret as a bearer token (not basic-auth).
-    let presented = headers
+    let Some(presented) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    // Plain compare (the codebase carries no constant-time helper; the admin
-    // auth in `ui.rs` compares the same way).
-    if presented != Some(expected) {
+        .map(str::trim)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // Constant-time membership test against the accepted set. Hash first so
+    // unequal lengths don't leak, then fold over every entry (`|=`, never
+    // short-circuiting) so the time taken depends only on how many secrets are
+    // configured — not on which one matched or what was presented.
+    let got = secret_digest(presented);
+    let mut matched = false;
+    for expected in &s.introspect_secrets {
+        matched |= ct_eq(&got, expected);
+    }
+    if !matched {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match s.catalog.resolve_org_session_token(&req.token).await {
@@ -766,5 +815,41 @@ mod tests {
         );
         assert_eq!(extract_token(&HeaderMap::new()), None);
         assert_eq!(extract_token(&headers_with("Weird foo")), None);
+    }
+
+    #[test]
+    fn parses_introspect_secret_set() {
+        // Unset/blank → empty → endpoint stays fail-closed.
+        assert!(parse_introspect_secrets("").is_empty());
+        assert!(parse_introspect_secrets("   ").is_empty());
+        assert!(parse_introspect_secrets(" , ,\n").is_empty());
+
+        // A single secret hashes to its own digest.
+        let one = parse_introspect_secrets("s3cr3t");
+        assert_eq!(one, vec![secret_digest("s3cr3t")]);
+
+        // Comma- and whitespace-separated (rotation overlap) both split; blanks drop.
+        let many = parse_introspect_secrets(" old ,new\tthird ");
+        assert_eq!(
+            many,
+            vec![
+                secret_digest("old"),
+                secret_digest("new"),
+                secret_digest("third"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical_digests() {
+        let a = secret_digest("relay-secret");
+        assert!(ct_eq(&a, &secret_digest("relay-secret")));
+        assert!(!ct_eq(&a, &secret_digest("relay-secre")));
+        assert!(!ct_eq(&a, &secret_digest("wrong")));
+        // A presented secret matches iff it's in the accepted set.
+        let set = parse_introspect_secrets("old,new");
+        let hit = secret_digest("new");
+        assert!(set.iter().any(|e| ct_eq(&hit, e)));
+        assert!(!set.iter().any(|e| ct_eq(&secret_digest("other"), e)));
     }
 }
