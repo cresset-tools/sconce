@@ -62,6 +62,10 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .route("/{org}/{repo}/dist/{*rest}", get(dist))
         .route("/oauth/ci", post(oauth_ci))
         .route("/oauth/ci-publish", post(oauth_ci_publish))
+        // Device authorization grant (RFC 8628) for `bougie login`: the CLI starts
+        // a flow + polls here; the human approves on the dashboard (see ui.rs).
+        .route("/oauth/device", post(oauth_device))
+        .route("/oauth/device/token", post(oauth_device_token))
         // Publish (push) API — single-shot + chunked/resumable uploads.
         .route(
             "/{org}/{repo}/packages/{vendor}/{name}/{version}",
@@ -500,6 +504,79 @@ async fn oauth_ci_publish(
             })))
         }
         None => Err(AppError::Unauthorized),
+    }
+}
+
+/// Device authorization TTLs (RFC 8628): the approval window, how often the CLI
+/// polls, and how long the minted read token lives (dev machines re-login rarely,
+/// so a longer, bounded TTL than a CI token).
+const DEVICE_FLOW_TTL_SECS: i64 = 600;
+const DEVICE_POLL_INTERVAL_SECS: i64 = 5;
+const DEVICE_TOKEN_TTL_SECS: i64 = 90 * 24 * 60 * 60;
+
+#[derive(serde::Deserialize)]
+struct DeviceTokenRequest {
+    device_code: String,
+}
+
+/// Start a device-authorization flow — `bougie login` POSTs here to begin. Returns
+/// the device/user codes and where the human goes to approve (the dashboard). No
+/// auth: the flow is inert until a signed-in org member approves it in the browser.
+async fn oauth_device(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let (device_code, user_code) = s.catalog.start_device_flow(DEVICE_FLOW_TTL_SECS).await?;
+    // The approval page lives on the dashboard (UI router), which may be a
+    // different origin than this wire endpoint; prefer its configured URL, fall
+    // back to this server's base_url for a single-binary deploy.
+    let dashboard = std::env::var("SCONCE_UI_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| s.base_url.clone());
+    let dashboard = dashboard.trim_end_matches('/');
+    Ok(Json(json!({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": format!("{dashboard}/device"),
+        "verification_uri_complete": format!("{dashboard}/device?code={user_code}"),
+        "expires_in": DEVICE_FLOW_TTL_SECS,
+        "interval": DEVICE_POLL_INTERVAL_SECS,
+    })))
+}
+
+/// Poll a device-authorization flow (the RFC 8628 token endpoint) — `bougie login`
+/// POSTs `{device_code}` here on an interval. Pending → 400 `authorization_pending`;
+/// approved → an org-scoped read token; expired/denied → the matching RFC error.
+async fn oauth_device_token(
+    State(s): State<AppState>,
+    Json(req): Json<DeviceTokenRequest>,
+) -> Response {
+    let device_error =
+        |status: StatusCode, code: &str| (status, Json(json!({ "error": code }))).into_response();
+    match s.catalog.poll_device_flow(&req.device_code).await {
+        Ok(sconce_catalog::DeviceFlowPoll::Approved { org_id }) => {
+            match s
+                .catalog
+                .create_session_token(org_id, "bougie login", DEVICE_TOKEN_TTL_SECS)
+                .await
+            {
+                Ok(token) => Json(json!({
+                    "access_token": token,
+                    "token_type": "Bearer",
+                    "expires_in": DEVICE_TOKEN_TTL_SECS,
+                }))
+                .into_response(),
+                Err(_) => device_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            }
+        }
+        Ok(sconce_catalog::DeviceFlowPoll::Pending) => {
+            device_error(StatusCode::BAD_REQUEST, "authorization_pending")
+        }
+        Ok(sconce_catalog::DeviceFlowPoll::Denied) => {
+            device_error(StatusCode::BAD_REQUEST, "access_denied")
+        }
+        Ok(sconce_catalog::DeviceFlowPoll::Expired) => {
+            device_error(StatusCode::BAD_REQUEST, "expired_token")
+        }
+        Err(_) => device_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     }
 }
 

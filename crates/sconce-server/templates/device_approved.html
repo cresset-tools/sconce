@@ -1,0 +1,8 @@
+<h1>{% if outcome == "approved" %}Login approved{% else %}Login denied{% endif %}</h1>
+{% if outcome == "approved" %}
+  <p>A read token scoped to <code>{{ org }}</code> has been granted. Return to your
+    terminal — <code>bougie login</code> will finish on its own.</p>
+{% else %}
+  <p>The login request was denied. Nothing was granted; you can close this page.</p>
+{% endif %}
+<p><a href=/>← back to dashboard</a></p>

@@ -389,6 +389,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0045_snapshots",
         include_str!("../migrations/0045_snapshots.sql"),
     ),
+    (
+        "0046_device_flows",
+        include_str!("../migrations/0046_device_flows.sql"),
+    ),
 ];
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
@@ -832,6 +836,19 @@ pub struct RepoSummary {
     pub id: Uuid,
     pub update_mode: String,
     pub cooldown_days: i32,
+}
+
+/// Result of polling a device-authorization flow (the RFC 8628 token endpoint).
+#[derive(Debug)]
+pub enum DeviceFlowPoll {
+    /// Still waiting for the user to approve in the browser.
+    Pending,
+    /// Approved — mint an org-scoped read token for this org.
+    Approved { org_id: Uuid },
+    /// The request was denied.
+    Denied,
+    /// Unknown `device_code`, or the flow expired.
+    Expired,
 }
 
 /// An authenticated admin user (from a session or login).
@@ -2735,6 +2752,138 @@ impl Catalog {
         Ok(token)
     }
 
+    /// Mint an **org-scoped** read token (origin `session`) — the credential a
+    /// device login issues. Like [`Catalog::create_ci_token`] it bypasses the
+    /// `allow_raw_tokens` policy (a session-derived, deprovisionable, expiring
+    /// credential, not a raw operator secret). Valid for every repo in the org
+    /// (see [`Catalog::token_valid`]).
+    pub async fn create_session_token(
+        &self,
+        org_id: Uuid,
+        label: &str,
+        ttl_secs: i64,
+    ) -> Result<String, sqlx::Error> {
+        let token = generate_token();
+        sqlx::query(
+            "insert into tokens (org_id, token_hash, label, expires_at, origin) values \
+             ($1, $2, $3, now() + make_interval(secs => $4::double precision), 'session')",
+        )
+        .bind(org_id)
+        .bind(token_hash(&token))
+        .bind(label)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(token)
+    }
+
+    /// Open a device-authorization flow (RFC 8628). Generates the opaque
+    /// `device_code` (returned to the CLI, stored only as its sha256) and the
+    /// short human `user_code` the user types into the approval page. Returns
+    /// `(device_code, user_code)`. TTL in seconds.
+    pub async fn start_device_flow(&self, ttl_secs: i64) -> Result<(String, String), sqlx::Error> {
+        let device_code = generate_secret("scdv_");
+        let user_code = generate_user_code();
+        sqlx::query(
+            "insert into device_flows (device_code_hash, user_code, expires_at) values \
+             ($1, $2, now() + make_interval(secs => $3::double precision))",
+        )
+        .bind(token_hash(&device_code))
+        .bind(&user_code)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok((device_code, user_code))
+    }
+
+    /// Whether `user_code` names a flow still awaiting approval (pending + not
+    /// expired) — gates the approval page.
+    pub async fn device_flow_pending(&self, user_code: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "select exists (select 1 from device_flows \
+             where user_code = $1 and status = 'pending' and expires_at > now())",
+        )
+        .bind(user_code)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Approve a pending device flow: bind the chosen `org_id` + approver and
+    /// flip it to `approved`. Returns `false` if there's no matching pending +
+    /// fresh flow (unknown / expired / already-decided code).
+    pub async fn approve_device_flow(
+        &self,
+        user_code: &str,
+        org_id: Uuid,
+        approved_by: Option<Uuid>,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query(
+            "update device_flows set status = 'approved', org_id = $2, approved_by = $3 \
+             where user_code = $1 and status = 'pending' and expires_at > now()",
+        )
+        .bind(user_code)
+        .bind(org_id)
+        .bind(approved_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    /// Deny a pending device flow, so the CLI's next poll fails fast with
+    /// `access_denied` instead of waiting out the TTL. No-op for an unknown or
+    /// already-decided code.
+    pub async fn deny_device_flow(&self, user_code: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update device_flows set status = 'denied' \
+             where user_code = $1 and status = 'pending' and expires_at > now()",
+        )
+        .bind(user_code)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Poll a device flow by its `device_code`. On approval this **consumes** the
+    /// flow (deletes the row) and returns the org to mint a token for — a
+    /// `device_code` is thus single-use. Pending flows are left in place.
+    pub async fn poll_device_flow(&self, device_code: &str) -> Result<DeviceFlowPoll, sqlx::Error> {
+        let hash = token_hash(device_code);
+        // Consume an approved + fresh flow atomically.
+        if let Some(org_id) = sqlx::query_scalar::<_, Uuid>(
+            "delete from device_flows \
+             where device_code_hash = $1 and status = 'approved' and expires_at > now() \
+             returning org_id",
+        )
+        .bind(&hash)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(DeviceFlowPoll::Approved { org_id });
+        }
+        // Otherwise report the current state.
+        let row = sqlx::query(
+            "select status, expires_at > now() as fresh from device_flows \
+             where device_code_hash = $1",
+        )
+        .bind(&hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => DeviceFlowPoll::Expired,
+            Some(r) => {
+                let fresh: bool = r.try_get("fresh")?;
+                let status: String = r.try_get("status")?;
+                if !fresh {
+                    DeviceFlowPoll::Expired
+                } else if status == "denied" {
+                    DeviceFlowPoll::Denied
+                } else {
+                    DeviceFlowPoll::Pending
+                }
+            }
+        })
+    }
+
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
     ///
     /// Concurrent migrators (multiple app instances starting at once, or
@@ -4237,9 +4386,15 @@ impl Catalog {
     /// here (the two credential types are intentionally kept in separate tables;
     /// see the service-token section below).
     pub async fn token_valid(&self, repo_id: Uuid, token: &str) -> Result<bool, sqlx::Error> {
+        // A token authenticates this repo if it's the repo's own per-repo token
+        // (t.repo_id = r.id) OR an org-scoped token for the repo's org
+        // (t.org_id = r.org_id) — the latter minted by the device-login flow.
         let updated = sqlx::query(
-            "update tokens set last_used_at = now() where repo_id = $1 and token_hash = $2 \
-             and (expires_at is null or expires_at > now())",
+            "update tokens t set last_used_at = now() \
+             from repositories r \
+             where r.id = $1 and t.token_hash = $2 \
+             and (t.expires_at is null or t.expires_at > now()) \
+             and (t.repo_id = r.id or t.org_id = r.org_id)",
         )
         .bind(repo_id)
         .bind(token_hash(token))
@@ -4419,11 +4574,18 @@ impl Catalog {
         repo_id: Uuid,
         token: &str,
     ) -> Result<Option<PolicyOverride>, sqlx::Error> {
+        // Matches the repo's own per-repo token (t.repo_id = r.id) or an
+        // org-scoped token covering the repo's org (t.org_id = r.org_id, minted
+        // by device login) — the same rule as [`Catalog::token_valid`]. An
+        // org-scoped token carries no per-token policy override, so the repo's
+        // default policy applies.
         let row = sqlx::query(
-            "update tokens set last_used_at = now() \
-             where repo_id = $1 and token_hash = $2 \
-               and (expires_at is null or expires_at > now()) \
-             returning update_mode, cooldown_days",
+            "update tokens t set last_used_at = now() \
+             from repositories r \
+             where r.id = $1 and t.token_hash = $2 \
+               and (t.expires_at is null or t.expires_at > now()) \
+               and (t.repo_id = r.id or t.org_id = r.org_id) \
+             returning t.update_mode, t.cooldown_days",
         )
         .bind(repo_id)
         .bind(token_hash(token))
@@ -6028,6 +6190,14 @@ fn generate_token() -> String {
     generate_secret("sconce_")
 }
 
+/// A short, human-typeable device `user_code` like `WXYZ-1234` (8 hex chars from
+/// a v4 UUID, upper-cased and hyphenated) — shown in the terminal and typed into
+/// the approval page.
+fn generate_user_code() -> String {
+    let hex = Uuid::new_v4().simple().to_string();
+    format!("{}-{}", &hex[..4], &hex[4..8]).to_uppercase()
+}
+
 /// A fresh, high-entropy secret with the given prefix for recognizability.
 /// Randomness comes from two v4 UUIDs (CSPRNG-backed) — 32 bytes, hex-encoded.
 fn generate_secret(prefix: &str) -> String {
@@ -6630,6 +6800,119 @@ mod tests {
             !cat.token_valid(repo_b, &token).await.unwrap(),
             "not valid for another repo"
         );
+    }
+
+    /// The org that owns a `repo()`-made repository (one fresh org per repo).
+    async fn org_of(cat: &Catalog, repo_id: Uuid) -> Uuid {
+        cat.list_repositories()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == repo_id)
+            .unwrap()
+            .org_id
+    }
+
+    #[tokio::test]
+    async fn device_flow_approve_mints_org_scoped_token() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of(&cat, repo_id).await;
+
+        // Start a flow; it's pending and polling reports so.
+        let (device_code, user_code) = cat.start_device_flow(600).await.unwrap();
+        assert!(cat.device_flow_pending(&user_code).await.unwrap());
+        assert!(matches!(
+            cat.poll_device_flow(&device_code).await.unwrap(),
+            DeviceFlowPoll::Pending
+        ));
+
+        // Approve it for the org (no approver row needed).
+        assert!(
+            cat.approve_device_flow(&user_code, org_id, None)
+                .await
+                .unwrap()
+        );
+        // It's no longer pending once decided.
+        assert!(!cat.device_flow_pending(&user_code).await.unwrap());
+
+        // The first post-approval poll consumes the flow and yields the org.
+        match cat.poll_device_flow(&device_code).await.unwrap() {
+            DeviceFlowPoll::Approved { org_id: got } => assert_eq!(got, org_id),
+            other => panic!("expected Approved, got {other:?}"),
+        }
+        // A device_code is single-use: the second poll finds nothing.
+        assert!(matches!(
+            cat.poll_device_flow(&device_code).await.unwrap(),
+            DeviceFlowPoll::Expired
+        ));
+
+        // The minted org-scoped token authenticates this repo on both serving
+        // paths: `token_valid` (snapshot downloads) and `resolve_token_policy`
+        // (the packages.json/p2/dist `authorize` path).
+        let token = cat
+            .create_session_token(org_id, "bougie login", 3600)
+            .await
+            .unwrap();
+        assert!(
+            cat.token_valid(repo_id, &token).await.unwrap(),
+            "org-scoped token authenticates a repo in its org"
+        );
+        assert!(
+            cat.resolve_token_policy(repo_id, &token)
+                .await
+                .unwrap()
+                .is_some(),
+            "org-scoped token resolves on the wire serving path"
+        );
+        // ...but not a repo in a different org.
+        let (_, other_repo) = repo().await.unwrap();
+        assert!(
+            !cat.token_valid(other_repo, &token).await.unwrap(),
+            "org-scoped token does not cross org boundaries"
+        );
+        assert!(
+            cat.resolve_token_policy(other_repo, &token)
+                .await
+                .unwrap()
+                .is_none(),
+            "org-scoped token does not resolve for another org on the wire path"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_flow_deny_reports_denied() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let (device_code, user_code) = cat.start_device_flow(600).await.unwrap();
+        cat.deny_device_flow(&user_code).await.unwrap();
+        assert!(matches!(
+            cat.poll_device_flow(&device_code).await.unwrap(),
+            DeviceFlowPoll::Denied
+        ));
+        // Approving a denied flow is a no-op (nothing pending to update).
+        let org_id = org_of(&cat, repo_id).await;
+        assert!(
+            !cat.approve_device_flow(&user_code, org_id, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn device_flow_expired_before_approval() {
+        let Some((cat, _)) = repo().await else {
+            return;
+        };
+        // A zero-second TTL is already expired by the time we poll.
+        let (device_code, user_code) = cat.start_device_flow(0).await.unwrap();
+        assert!(!cat.device_flow_pending(&user_code).await.unwrap());
+        assert!(matches!(
+            cat.poll_device_flow(&device_code).await.unwrap(),
+            DeviceFlowPoll::Expired
+        ));
     }
 
     #[tokio::test]
