@@ -525,7 +525,7 @@
   </form>
 
   <h2>License keys</h2>
-  <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs (a date = “updates until”, or ≤ a major version) — it keeps everything in-window forever. Entitling a key to a <strong>set</strong> unlocks every package it resolves to, by reference (auto-grows).</p>
+  <p class=muted>Perpetual-fallback: an <strong>update bound</strong> caps which versions a key installs (a date = “updates until”, or ≤ a major version) — it keeps everything in-window forever. Entitling a key to a <strong>set</strong> unlocks every package it resolves to, by reference (auto-grows). On an accumulated <strong>account key</strong> each set edge carries its own bound (shown on the chip); the key-level bound stays empty and applies only to legacy standalone keys.</p>
   <table>
     <tr><th>Buyer</th><th>Status</th><th>Entitled packages</th><th>Sets</th><th>Policy</th><th>Update bound</th><th>Merge</th></tr>
     {% for l in licenses %}
@@ -534,7 +534,7 @@
         <td>{{ l.status }}</td>
         <td>{{ l.packages }}</td>
         <td>
-          {% for st in l.sets %}<span class=badge>{{ st.name }} <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/set/remove"><input type=hidden name=id value="{{ l.id }}"><input type=hidden name=set_id value="{{ st.set_id }}"><button class=linkbtn title="Revoke set">×</button></form></span> {% endfor %}
+          {% for st in l.sets %}<span class=badge>{{ st.name }}{% if !st.bound.is_empty() %} <span class=muted>{{ st.bound }}</span>{% endif %} <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/set/remove"><input type=hidden name=id value="{{ l.id }}"><input type=hidden name=set_id value="{{ st.set_id }}"><button class=linkbtn title="Revoke set">×</button></form></span> {% endfor %}
           {% if org_sets_empty %}{% if l.sets.is_empty() %}<span class=muted>—</span>{% endif %}{% else %}
             <form class=inline method=post action="/r/{{ org }}/{{ repo }}/license/set">
               <input type=hidden name=id value="{{ l.id }}">
