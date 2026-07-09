@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.4.0...sconce-v0.5.0) (2026-07-09)
+
+
+### Features
+
+* **api:** GET /api/v1/repos to list an org token's repositories ([7f9da3d](https://github.com/cresset-tools/sconce/commit/7f9da3d0704eb2639177a32fc8bdf4894922724e))
+* **api:** GET /api/v1/repos to list an org token's repositories ([6ffe5b4](https://github.com/cresset-tools/sconce/commit/6ffe5b4f06d1149c9684703ff5ebd3d7df00c140))
+* **api:** report the edition's edge bound on issue(account)/add responses ([0712650](https://github.com/cresset-tools/sconce/commit/0712650e40403a62157be9b6447739a0924b5d39))
+* **auth:** OAuth 2.0 device authorization grant for CLI login ([b24120e](https://github.com/cresset-tools/sconce/commit/b24120eab7d74e58a1b2c10b2b1816fe90d3a9a0))
+* **auth:** OAuth 2.0 device authorization grant for CLI login ([8840f01](https://github.com/cresset-tools/sconce/commit/8840f01f0511a65703e5d62b3c3687648022afa4))
+* **licensing:** account-key issuance — bound on the edge from day one ([159066c](https://github.com/cresset-tools/sconce/commit/159066cd97019f2324f7f9f890401fccc754b715))
+* **licensing:** per-entitlement update bounds — one key per customer ([7da945b](https://github.com/cresset-tools/sconce/commit/7da945bdcad0b6b31a0a42d317ae86cecb9478ce))
+* **ui:** merge two license keys from the admin UI ([c2065d4](https://github.com/cresset-tools/sconce/commit/c2065d4a8bcfec8e8fd806958f2215c2491d72ab))
+
+
+### Bug Fixes
+
+* **ui:** show each set edge's own update bound on the license row ([bf685de](https://github.com/cresset-tools/sconce/commit/bf685de17469789615b8656cf8a4972190769b35))
+
 ## [0.4.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.3.0...sconce-v0.4.0) (2026-07-08)
 
 
