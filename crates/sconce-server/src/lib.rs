@@ -154,6 +154,10 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             "/api/v1/repos/{org}/{repo}/license-keys/{id}/editions/{edition}/renew",
             post(api::renew_license_edition),
         )
+        .route(
+            "/api/v1/repos/{org}/{repo}/license-keys/{id}/merge",
+            post(api::merge_license),
+        )
         .route("/healthz", get(healthz))
         .with_state(AppState {
             catalog,
