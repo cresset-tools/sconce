@@ -179,12 +179,20 @@ pub(crate) struct IssueReq {
     edition: String,
     /// Buyer reference (email / order id / company).
     buyer: Option<String>,
+    /// Issue an **account key**: the key itself is unbounded and the edition's
+    /// bound lands on the entitlement edge (0047), so later purchases of any
+    /// edition can merge onto it. Front-ends that accumulate purchases onto one
+    /// key per customer should always set this. Default `false` = legacy
+    /// standalone shape (bound on the key).
+    #[serde(default)]
+    account: bool,
 }
 
 /// `POST /api/v1/repos/{org}/{repo}/license-keys` — issue a key against an
 /// edition. Idempotent on the `Idempotency-Key` header: a repeat returns the
 /// existing license (200, no `key`) instead of a duplicate; a fresh issue is
-/// `201` and includes the one-time `key`.
+/// `201` and includes the one-time `key`. With `"account": true` the key is
+/// minted unbounded and the edition's bound lands on its entitlement edge.
 pub(crate) async fn issue_license(
     State(s): State<AppState>,
     Path((org, repo)): Path<(String, String)>,
@@ -205,11 +213,16 @@ pub(crate) async fn issue_license(
         .as_deref()
         .map(str::trim)
         .filter(|b| !b.is_empty());
-    let issued = s
-        .catalog
-        .issue_from_edition(repo_id, edition_id, buyer, idem)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest(format!("edition '{}' is inactive", req.edition)))?;
+    let issued = if req.account {
+        s.catalog
+            .issue_account_key_from_edition(repo_id, edition_id, buyer, idem)
+            .await?
+    } else {
+        s.catalog
+            .issue_from_edition(repo_id, edition_id, buyer, idem)
+            .await?
+    }
+    .ok_or_else(|| ApiError::BadRequest(format!("edition '{}' is inactive", req.edition)))?;
     let detail = s
         .catalog
         .license_detail(repo_id, issued.id)

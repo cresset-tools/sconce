@@ -5109,6 +5109,37 @@ impl Catalog {
         buyer: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> Result<Option<IssuedLicense>, sqlx::Error> {
+        self.issue_from_edition_inner(repo_id, edition_id, buyer, idempotency_key, false)
+            .await
+    }
+
+    /// Issue an **account key** from an edition: the key itself is minted
+    /// unbounded and the edition's bound lands on its entitlement edge (0047) —
+    /// so the key is a valid merge target for every later purchase, no matter
+    /// which edition came first. This is what a commerce front-end that
+    /// accumulates purchases onto one key per customer should always use; the
+    /// plain [`Self::issue_from_edition`] keeps the legacy standalone shape
+    /// (bound on the key). Snapshot editions freeze per-package rows, which now
+    /// carry the bound per row.
+    pub async fn issue_account_key_from_edition(
+        &self,
+        repo_id: Uuid,
+        edition_id: Uuid,
+        buyer: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Option<IssuedLicense>, sqlx::Error> {
+        self.issue_from_edition_inner(repo_id, edition_id, buyer, idempotency_key, true)
+            .await
+    }
+
+    async fn issue_from_edition_inner(
+        &self,
+        repo_id: Uuid,
+        edition_id: Uuid,
+        buyer: Option<&str>,
+        idempotency_key: Option<&str>,
+        bound_on_edge: bool,
+    ) -> Result<Option<IssuedLicense>, sqlx::Error> {
         // Fast path: a prior issue for this (repo, edition, idempotency_key) is a
         // replay — return the existing key (recovered from at-rest ciphertext, if a
         // secret key is configured), so the caller isn't stuck without it.
@@ -5125,17 +5156,18 @@ impl Catalog {
         }
         let mut tx = self.pool.begin().await?;
         // Insert the key with the bound resolved inline from the edition (time ->
-        // now()+months, version -> cap), so no clock/date handling in Rust. A
-        // missing/inactive edition yields no row.
+        // now()+months, version -> cap), so no clock/date handling in Rust — or,
+        // for an account key, unbounded (`$7` — the bound lands on the edge
+        // below). A missing/inactive edition yields no row.
         let (key, hash, ciphertext) = self.mint_license_key();
         let inserted = sqlx::query(
             "insert into license_keys \
                  (repo_id, key_hash, key_ciphertext, buyer_ref, edition_id, idempotency_key, \
                   update_until, version_cap_major, update_mode, cooldown_days) \
              select $1, $2, $6, $3, ed.id, $5, \
-                    case when ed.bound_kind = 'time' \
+                    case when not $7 and ed.bound_kind = 'time' \
                          then now() + make_interval(months => ed.bound_period_months) end, \
-                    case when ed.bound_kind = 'version' then ed.bound_major end, \
+                    case when not $7 and ed.bound_kind = 'version' then ed.bound_major end, \
                     ed.update_mode, ed.cooldown_days \
              from editions ed where ed.id = $4 and ed.repo_id = $1 and ed.active \
              returning id, (select set_id from editions where id = $4) as set_id, \
@@ -5147,6 +5179,7 @@ impl Catalog {
         .bind(edition_id)
         .bind(idempotency_key)
         .bind(ciphertext)
+        .bind(bound_on_edge)
         .fetch_optional(&mut *tx)
         .await;
         // Lost the race with a concurrent replay: the partial unique index on
@@ -5179,7 +5212,14 @@ impl Catalog {
         let license_id: Uuid = row.try_get("id")?;
         let set_id: Uuid = row.try_get("set_id")?;
         let snapshot: bool = row.try_get("snapshot")?;
-        Self::attach_edition_set(&mut tx, license_id, set_id, snapshot).await?;
+        Self::attach_edition_set(
+            &mut tx,
+            license_id,
+            set_id,
+            snapshot,
+            bound_on_edge.then_some(edition_id),
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(IssuedLicense {
             id: license_id,
@@ -5188,25 +5228,33 @@ impl Catalog {
         }))
     }
 
-    /// Attach an edition's target set to a **freshly issued** license inside a
-    /// transaction: freeze current membership as explicit per-package
-    /// entitlements when the edition snapshots at issue, else unlock the set by
-    /// reference (auto-growing as the set grows). Edges are written unbounded
-    /// (NULL, 0047) — the freshly minted key itself carries the edition's bound.
-    /// Idempotent (`on conflict do nothing`). [`Self::add_edition_to_license`]
-    /// deliberately does NOT share this: when merging onto an existing (account)
-    /// key the bound must land on the edge instead.
+    /// Attach an edition's target set to a license inside a transaction: freeze
+    /// current membership as explicit per-package entitlements when the edition
+    /// snapshots at issue, else unlock the set by reference (auto-growing as the
+    /// set grows). Idempotent (`on conflict do nothing`). Shared by issuance
+    /// (both shapes) and [`Self::add_edition_to_license`]; `bound_from_edition`
+    /// picks where the update bound lives (edge vs key — 0047).
     async fn attach_edition_set(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         license_id: Uuid,
         set_id: Uuid,
         snapshot: bool,
+        // `Some(edition)` (account-key issuance) resolves that edition's bound
+        // template onto the inserted edges; `None` leaves them NULL (the key
+        // carries the bound — legacy standalone issuance).
+        bound_from_edition: Option<Uuid>,
     ) -> Result<(), sqlx::Error> {
         if snapshot {
-            // Freeze current set membership as explicit per-package entitlements.
+            // Freeze current set membership as explicit per-package entitlements
+            // (each row carrying the edge bound when issuing an account key).
             sqlx::query(
-                "insert into entitlements (license_key_id, package_id) \
-                 select $1, p.id from packages p \
+                "insert into entitlements (license_key_id, package_id, update_until, version_cap_major) \
+                 select $1, p.id, \
+                        case when ed.bound_kind = 'time' \
+                             then now() + make_interval(months => ed.bound_period_months) end, \
+                        case when ed.bound_kind = 'version' then ed.bound_major end \
+                 from packages p \
+                 left join editions ed on ed.id = $3 \
                  where p.id in (select package_id from package_set_members where set_id = $2) \
                     or ( p.repo_id in (select id from repositories \
                                        where org_id = (select org_id from package_sets where id = $2)) \
@@ -5217,16 +5265,25 @@ impl Catalog {
             )
             .bind(license_id)
             .bind(set_id)
+            .bind(bound_from_edition)
             .execute(&mut **tx)
             .await?;
         } else {
             // Unlock by reference — auto-grows with the set.
             sqlx::query(
-                "insert into license_set_entitlements (license_key_id, set_id) values ($1, $2) \
+                "insert into license_set_entitlements \
+                     (license_key_id, set_id, update_until, version_cap_major) \
+                 select $1, $2, \
+                        case when ed.bound_kind = 'time' \
+                             then now() + make_interval(months => ed.bound_period_months) end, \
+                        case when ed.bound_kind = 'version' then ed.bound_major end \
+                 from (select 1) one \
+                 left join editions ed on ed.id = $3 \
                  on conflict do nothing",
             )
             .bind(license_id)
             .bind(set_id)
+            .bind(bound_from_edition)
             .execute(&mut **tx)
             .await?;
         }
@@ -5285,7 +5342,7 @@ impl Catalog {
         .bind(repo_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((_set_id, snapshot)) = ed else {
+        let Some((set_id, snapshot)) = ed else {
             tx.rollback().await?;
             return Ok(EditionAdd::NoEdition);
         };
@@ -5294,21 +5351,8 @@ impl Catalog {
             return Ok(EditionAdd::Standalone);
         }
         // Unlock the set by reference with the edition's bound resolved onto the
-        // edge, mirroring how issue_from_edition resolves it onto the key.
-        sqlx::query(
-            "insert into license_set_entitlements \
-                 (license_key_id, set_id, update_until, version_cap_major) \
-             select $1, ed.set_id, \
-                    case when ed.bound_kind = 'time' \
-                         then now() + make_interval(months => ed.bound_period_months) end, \
-                    case when ed.bound_kind = 'version' then ed.bound_major end \
-             from editions ed where ed.id = $2 \
-             on conflict do nothing",
-        )
-        .bind(license_id)
-        .bind(edition_id)
-        .execute(&mut *tx)
-        .await?;
+        // edge, exactly as account-key issuance attaches it.
+        Self::attach_edition_set(&mut tx, license_id, set_id, false, Some(edition_id)).await?;
         tx.commit().await?;
         Ok(EditionAdd::Added)
     }
@@ -9068,6 +9112,39 @@ mod tests {
             .into_iter()
             .collect();
         assert!(tbounds["acme/c"].until_unix.is_some());
+
+        // Account-key issuance solves the bounded-first-purchase ordering: the
+        // ANNUAL edition issued as an account key mints an unbounded key with the
+        // bound on the edge — a valid merge target for later perpetual purchases,
+        // unlike the standalone shape above.
+        let akey = cat
+            .issue_account_key_from_edition(repo_id, ed_c, Some("buyer2@x"), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .unwrap();
+        let alic = cat.resolve_license(repo_id, &akey).await.unwrap().unwrap();
+        assert_eq!(
+            cat.add_edition_to_license(repo_id, alic, ed_a)
+                .await
+                .unwrap(),
+            EditionAdd::Added
+        );
+        let abounds: std::collections::HashMap<String, LicenseBound> = cat
+            .entitled_package_bounds(alic)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(
+            abounds["acme/c"].until_unix.is_some(),
+            "annual stays bounded"
+        );
+        assert_eq!(
+            abounds["acme/a"].until_unix, None,
+            "perpetual add unbounded"
+        );
 
         // Unknown key / edition are distinct, non-mutating outcomes.
         assert_eq!(
