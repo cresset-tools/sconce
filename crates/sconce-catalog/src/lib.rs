@@ -397,7 +397,61 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0047_entitlement_bounds",
         include_str!("../migrations/0047_entitlement_bounds.sql"),
     ),
+    (
+        "0048_org_remotes",
+        include_str!("../migrations/0048_org_remotes.sql"),
+    ),
 ];
+
+/// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
+/// for the same repository maps to one [`org_remotes`](../migrations) row.
+/// Handles the common shapes:
+///   - `https://github.com/acme/shop.git`   -> `github.com/acme/shop`
+///   - `git@github.com:acme/shop.git`       -> `github.com/acme/shop`
+///   - `ssh://git@github.com/acme/shop`     -> `github.com/acme/shop`
+///   - `https://user@github.com/acme/shop/` -> `github.com/acme/shop`
+///
+/// Steps: trim, lowercase, drop a `scheme://` prefix, drop a `user@` credential
+/// prefix, convert an scp-style `host:path` colon to `/`, then strip a trailing
+/// `.git` and any surrounding slashes. A `:port` (digits) is preserved as part
+/// of the host. Total: an unparseable string is just trimmed + lowercased,
+/// which simply won't match any registered remote.
+#[must_use]
+pub fn normalize_git_remote(remote: &str) -> String {
+    let mut s = remote.trim().to_ascii_lowercase();
+
+    // Drop a URL scheme (`https://`, `ssh://`, `git://`, …).
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest.to_string();
+    }
+
+    // Drop a `user@` credential prefix, but only from the authority (before the
+    // first `/`), so an `@` inside a path is left alone.
+    let first_slash = s.find('/').unwrap_or(s.len());
+    if let Some(at) = s[..first_slash].find('@') {
+        s = s[at + 1..].to_string();
+    }
+
+    // scp-style `host:path` (no scheme): the first `:` before any `/` separates
+    // host from path — turn it into `/`. A `:port` (all digits) is left as part
+    // of the host.
+    let first_slash = s.find('/').unwrap_or(s.len());
+    if let Some(colon) = s[..first_slash].find(':') {
+        let after = &s[colon + 1..];
+        let is_port = after.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && after
+                .chars()
+                .take_while(|c| *c != '/')
+                .all(|c| c.is_ascii_digit());
+        if !is_port {
+            s.replace_range(colon..=colon, "/");
+        }
+    }
+
+    // Strip a trailing `.git`, then trim surrounding slashes.
+    let trimmed = s.strip_suffix(".git").unwrap_or(s.as_str());
+    trimmed.trim_matches('/').to_string()
+}
 
 /// Arbitrary fixed key for the migration advisory lock (so all sconce instances
 /// agree on the same lock).
@@ -1717,6 +1771,60 @@ impl Catalog {
                 })
             })
             .collect()
+    }
+
+    /// The org slug for an id, or `None` if the org doesn't exist. The reverse
+    /// of [`Self::org_id_by_slug`].
+    pub async fn org_slug_by_id(&self, org_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("select slug from organizations where id = $1")
+            .bind(org_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Register (or reassign) a git remote to the org with slug `org_slug`,
+    /// returning the row id. `remote` must already be normalized (see
+    /// [`normalize_git_remote`]). Idempotent on the remote: re-registering it —
+    /// even to a different org — updates the owner. Errors (no row) if the org
+    /// is unknown, mirroring [`Self::create_repo`].
+    pub async fn set_org_remote(&self, org_slug: &str, remote: &str) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "insert into org_remotes (org_id, remote) \
+             select o.id, $2 from organizations o where o.slug = $1 \
+             on conflict (remote) do update set org_id = excluded.org_id \
+             returning id",
+        )
+        .bind(org_slug)
+        .bind(remote)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The org that owns a (normalized) git remote, or `None` if unregistered.
+    /// Backs the `/api/v1/manifest` lookup: a project's `git remote get-url`
+    /// resolves to its team.
+    pub async fn org_for_remote(&self, remote: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("select org_id from org_remotes where remote = $1")
+            .bind(remote)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Every git remote registered to an org, sorted. For `sconce remote list`.
+    pub async fn remotes_for_org(&self, org_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("select remote from org_remotes where org_id = $1 order by remote")
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Unregister a (normalized) git remote. Returns whether a row was removed.
+    pub async fn delete_org_remote(&self, remote: &str) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("delete from org_remotes where remote = $1")
+            .bind(remote)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// Repos in an org with per-repo counts + last sync — the C1 org overview.
@@ -6951,6 +7059,15 @@ mod tests {
         Some((cat, repo_id))
     }
 
+    /// A migrated catalog with no pre-made org/repo, for tests that create their
+    /// own orgs (skipped without `DATABASE_URL`, like [`repo`]).
+    async fn catalog_only() -> Option<Catalog> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let cat = Catalog::connect(&url).await.expect("connect");
+        cat.migrate().await.expect("migrate");
+        Some(cat)
+    }
+
     /// Serialize queue tests across processes (the job queue is global, and test
     /// binaries run in parallel against one DB) and give each a clean slate. The
     /// returned connection holds a Postgres advisory lock until dropped.
@@ -6973,6 +7090,66 @@ mod tests {
     async fn migrate_is_idempotent() {
         let Some((cat, _)) = repo().await else { return };
         cat.migrate().await.expect("re-migrate");
+    }
+
+    #[test]
+    fn normalize_git_remote_folds_common_forms() {
+        let want = "github.com/acme/shop";
+        for form in [
+            "https://github.com/acme/shop.git",
+            "https://github.com/acme/shop",
+            "http://github.com/acme/shop/",
+            "git@github.com:acme/shop.git",
+            "git@github.com:acme/shop",
+            "ssh://git@github.com/acme/shop.git",
+            "  HTTPS://GitHub.com/Acme/Shop.git  ",
+        ] {
+            assert_eq!(normalize_git_remote(form), want, "form: {form}");
+        }
+        // A custom SSH port stays part of the host (not read as an scp path).
+        assert_eq!(
+            normalize_git_remote("ssh://git@git.acme.example:2222/acme/shop.git"),
+            "git.acme.example:2222/acme/shop"
+        );
+        // Distinct repos don't collide.
+        assert_ne!(
+            normalize_git_remote("git@github.com:acme/shop.git"),
+            normalize_git_remote("git@github.com:acme/blog.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn org_remote_maps_forms_to_org_and_reassigns() {
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let pid = std::process::id();
+        let (a, b) = (format!("orgrem_a_{pid}"), format!("orgrem_b_{pid}"));
+        let oa = cat.create_org(&a, None).await.expect("org a");
+        let ob = cat.create_org(&b, None).await.expect("org b");
+        assert_eq!(
+            cat.org_slug_by_id(oa).await.unwrap().as_deref(),
+            Some(a.as_str())
+        );
+
+        // Register via one URL form; look up via a *different* form → same org.
+        let remote = format!("github.com/test{pid}/shop");
+        let reg = normalize_git_remote(&format!("git@github.com:test{pid}/shop.git"));
+        assert_eq!(reg, remote);
+        cat.set_org_remote(&a, &reg).await.expect("register");
+        let looked = normalize_git_remote(&format!("https://github.com/test{pid}/shop"));
+        assert_eq!(cat.org_for_remote(&looked).await.unwrap(), Some(oa));
+        assert_eq!(cat.remotes_for_org(oa).await.unwrap(), vec![remote.clone()]);
+
+        // Re-registering reassigns ownership to org b.
+        cat.set_org_remote(&b, &reg).await.expect("reassign");
+        assert_eq!(cat.org_for_remote(&remote).await.unwrap(), Some(ob));
+        assert!(cat.remotes_for_org(oa).await.unwrap().is_empty());
+
+        // Delete is idempotent (true then false).
+        assert!(cat.delete_org_remote(&remote).await.unwrap());
+        assert_eq!(cat.org_for_remote(&remote).await.unwrap(), None);
+        assert!(!cat.delete_org_remote(&remote).await.unwrap());
     }
 
     #[tokio::test]

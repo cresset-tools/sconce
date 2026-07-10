@@ -184,6 +184,35 @@ enum Command {
         database_url: String,
     },
 
+    /// Register a project's git remote so a client can fetch its team config
+    /// (Composer repositories, and later pinned services / policy) keyed by the
+    /// remote alone. Any URL form (https, ssh, scp) is accepted and normalized;
+    /// re-registering reassigns the remote to the given org.
+    RemoteAdd {
+        /// Organization slug.
+        org: String,
+        /// The project's git remote URL.
+        remote: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// List the git remotes registered to an organization.
+    RemoteList {
+        /// Organization slug.
+        org: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Unregister a git remote (any URL form).
+    RemoteRemove {
+        /// The project's git remote URL.
+        remote: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Rename an organization. The old slug keeps redirecting (so composer.lock
     /// URLs still work) and is permanently retired.
     OrgRename {
@@ -1230,6 +1259,16 @@ fn main() -> Result<()> {
             repo,
             database_url,
         } => repo_create(&org, &repo, &database_url),
+        Command::RemoteAdd {
+            org,
+            remote,
+            database_url,
+        } => remote_add(&org, &remote, &database_url),
+        Command::RemoteList { org, database_url } => remote_list(&org, &database_url),
+        Command::RemoteRemove {
+            remote,
+            database_url,
+        } => remote_remove(&remote, &database_url),
         Command::OrgRename {
             org,
             new_slug,
@@ -2428,6 +2467,58 @@ fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
             .await
             .with_context(|| format!("creating repo (does org '{org}' exist?)"))?;
         println!("repo created: {org}/{repo}");
+        Ok(())
+    })
+}
+
+fn remote_add(org: &str, remote: &str, database_url: &str) -> Result<()> {
+    let normalized = sconce_catalog::normalize_git_remote(remote);
+    if normalized.is_empty() {
+        anyhow::bail!("'{remote}' does not look like a git remote URL");
+    }
+    with_catalog(database_url, async |catalog| {
+        catalog
+            .set_org_remote(org, &normalized)
+            .await
+            .with_context(|| format!("registering remote (does org '{org}' exist?)"))?;
+        println!("remote registered: {normalized} -> {org}");
+        Ok(())
+    })
+}
+
+fn remote_list(org: &str, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let org_id = catalog
+            .org_id_by_slug(org)
+            .await
+            .context("looking up org")?
+            .with_context(|| format!("no such org: {org}"))?;
+        let remotes = catalog
+            .remotes_for_org(org_id)
+            .await
+            .context("listing remotes")?;
+        if remotes.is_empty() {
+            println!("(no remotes registered for {org})");
+        }
+        for r in remotes {
+            println!("{r}");
+        }
+        Ok(())
+    })
+}
+
+fn remote_remove(remote: &str, database_url: &str) -> Result<()> {
+    let normalized = sconce_catalog::normalize_git_remote(remote);
+    with_catalog(database_url, async |catalog| {
+        if catalog
+            .delete_org_remote(&normalized)
+            .await
+            .context("removing remote")?
+        {
+            println!("remote unregistered: {normalized}");
+        } else {
+            println!("no such remote: {normalized}");
+        }
         Ok(())
     })
 }

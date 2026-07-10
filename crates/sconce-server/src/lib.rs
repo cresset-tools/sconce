@@ -30,7 +30,7 @@ mod snapshots;
 pub mod ui;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, post, put};
@@ -131,6 +131,10 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         // `repositories` without pasted URLs. Org-session-bearer auth (distinct
         // from the repo-scoped, service-token `/api/v1/repos/{org}/{repo}/…` below).
         .route("/api/v1/repos", get(list_org_repos))
+        // Team manifest: a project's team config keyed by its git remote, so a
+        // clone fetches its config from login + remote alone. Org-session-bearer
+        // auth; returns config only for a remote owned by the token's own org.
+        .route("/api/v1/manifest", get(get_manifest))
         // Management API (service-token auth) — provisioning for commerce
         // front-ends like the Magento module. See `api`.
         .route(
@@ -736,6 +740,60 @@ async fn list_org_repos(
         })
         .collect();
     Ok(Json(json!({ "repositories": list })))
+}
+
+/// Query params for [`get_manifest`].
+#[derive(Debug, serde::Deserialize)]
+struct ManifestQuery {
+    /// The project's git remote URL, any form — normalized server-side.
+    remote: String,
+}
+
+/// `GET /api/v1/manifest?remote=<git-url>` — a project's team config, keyed by
+/// its git remote. Org-session-bearer auth, like `/api/v1/repos`. The manifest
+/// is returned only when the remote is registered to the token's *own* org, so
+/// a token can't read another team's config; an unregistered remote (or one
+/// owned by a different org) is a 404. The body is forward-compatible: today the
+/// org identity plus its Composer repositories; pinned service versions, policy,
+/// and the default data profile slot in later.
+async fn get_manifest(
+    State(s): State<AppState>,
+    Query(q): Query<ManifestQuery>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cred = extract_token(&headers).ok_or(AppError::Unauthorized)?;
+    let tok = s
+        .catalog
+        .resolve_org_session_token(&cred)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let remote = sconce_catalog::normalize_git_remote(&q.remote);
+    // The remote must be registered AND owned by the token's org.
+    if s.catalog.org_for_remote(&remote).await? != Some(tok.org_id) {
+        return Err(AppError::NotFound);
+    }
+    let org = s
+        .catalog
+        .org_slug_by_id(tok.org_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let repos = s.catalog.repos_for_org(tok.org_id).await?;
+    let repositories: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|r| {
+            json!({
+                "org": r.org,
+                "repo": r.repo,
+                "url": repo_base(&s.base_url, &r.org, &r.repo),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "schema_version": 1,
+        "org": org,
+        "remote": remote,
+        "repositories": repositories,
+    })))
 }
 
 #[derive(Debug, thiserror::Error)]
