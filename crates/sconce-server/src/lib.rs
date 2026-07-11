@@ -788,12 +788,22 @@ async fn get_manifest(
             })
         })
         .collect();
-    Ok(Json(json!({
+    let mut body = json!({
         "schema_version": 1,
         "org": org,
         "remote": remote,
         "repositories": repositories,
-    })))
+    });
+    // The database snapshot source, when the remote has one configured (`sconce
+    // remote-snapshot`). Lets `bougie db pull` default `--repo`/`--env` from the
+    // manifest instead of the dev naming the dataset repo. Omitted when unset.
+    if let Some((snap_org, snap_repo, snap_env)) = s.catalog.snapshot_for_remote(&remote).await? {
+        body["snapshot"] = json!({
+            "repo": format!("{snap_org}/{snap_repo}"),
+            "env": snap_env,
+        });
+    }
+    Ok(Json(body))
 }
 
 #[derive(Debug, thiserror::Error)]
