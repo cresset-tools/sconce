@@ -213,6 +213,25 @@ enum Command {
         database_url: String,
     },
 
+    /// Set (or clear) the database snapshot source a registered remote's team
+    /// manifest advertises, so `bougie db pull` needs no `--repo`. Point it at
+    /// the repo whose `snapshots/<env>/latest` holds the dump.
+    RemoteSnapshot {
+        /// The project's git remote URL (any form; normalized).
+        remote: String,
+        /// Dataset repository holding the snapshots, as `<org>/<repo>`.
+        #[arg(long, value_name = "ORG/REPO", conflicts_with = "clear")]
+        repo: Option<String>,
+        /// Environment whose snapshots to seed from.
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Clear the snapshot config instead of setting it.
+        #[arg(long, conflicts_with = "repo")]
+        clear: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Rename an organization. The old slug keeps redirecting (so composer.lock
     /// URLs still work) and is permanently retired.
     OrgRename {
@@ -1269,6 +1288,13 @@ fn main() -> Result<()> {
             remote,
             database_url,
         } => remote_remove(&remote, &database_url),
+        Command::RemoteSnapshot {
+            remote,
+            repo,
+            env,
+            clear,
+            database_url,
+        } => remote_snapshot(&remote, repo.as_deref(), &env, clear, &database_url),
         Command::OrgRename {
             org,
             new_slug,
@@ -2518,6 +2544,52 @@ fn remote_remove(remote: &str, database_url: &str) -> Result<()> {
             println!("remote unregistered: {normalized}");
         } else {
             println!("no such remote: {normalized}");
+        }
+        Ok(())
+    })
+}
+
+fn remote_snapshot(
+    remote: &str,
+    repo: Option<&str>,
+    env: &str,
+    clear: bool,
+    database_url: &str,
+) -> Result<()> {
+    let normalized = sconce_catalog::normalize_git_remote(remote);
+    if normalized.is_empty() {
+        anyhow::bail!("'{remote}' does not look like a git remote URL");
+    }
+    with_catalog(database_url, async |catalog| {
+        if clear {
+            if catalog
+                .clear_remote_snapshot(&normalized)
+                .await
+                .context("clearing snapshot config")?
+            {
+                println!("snapshot source cleared for {normalized}");
+            } else {
+                println!("no such remote: {normalized}");
+            }
+            return Ok(());
+        }
+        let Some(repo) = repo else {
+            anyhow::bail!(
+                "pass --repo <org/repo> to set the snapshot source (or --clear to remove it)"
+            );
+        };
+        // Resolve the dataset repo up front so an unknown repo is a clean error.
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        if catalog
+            .set_remote_snapshot(&normalized, repo_id, env)
+            .await
+            .context("setting snapshot config")?
+        {
+            println!("snapshot source for {normalized}: {repo} ({env})");
+        } else {
+            anyhow::bail!(
+                "remote '{normalized}' is not registered — run `sconce remote-add <org> {remote}` first"
+            );
         }
         Ok(())
     })

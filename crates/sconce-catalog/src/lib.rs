@@ -401,6 +401,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0048_org_remotes",
         include_str!("../migrations/0048_org_remotes.sql"),
     ),
+    (
+        "0049_org_remote_snapshot",
+        include_str!("../migrations/0049_org_remote_snapshot.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -1825,6 +1829,57 @@ impl Catalog {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// Point a registered remote's team manifest at a database snapshot source:
+    /// the repo whose `snapshots/{env}/latest` `bougie db pull` should fetch.
+    /// Returns `false` if the remote isn't registered (`remote-add` it first).
+    pub async fn set_remote_snapshot(
+        &self,
+        remote: &str,
+        snapshot_repo_id: Uuid,
+        env: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "update org_remotes set snapshot_repo_id = $2, snapshot_env = $3 where remote = $1",
+        )
+        .bind(remote)
+        .bind(snapshot_repo_id)
+        .bind(env)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Clear a remote's snapshot config — the manifest drops the snapshot block.
+    /// Returns `false` if the remote isn't registered.
+    pub async fn clear_remote_snapshot(&self, remote: &str) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "update org_remotes set snapshot_repo_id = null, snapshot_env = null \
+             where remote = $1",
+        )
+        .bind(remote)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The dataset a remote's team manifest points at, as `(org_slug, repo_slug,
+    /// env)`. `None` when no snapshot is configured (or the remote is unknown).
+    pub async fn snapshot_for_remote(
+        &self,
+        remote: &str,
+    ) -> Result<Option<(String, String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "select o.slug, r.slug, coalesce(orm.snapshot_env, 'production') \
+             from org_remotes orm \
+             join repositories r on r.id = orm.snapshot_repo_id \
+             join organizations o on o.id = r.org_id \
+             where orm.remote = $1 and orm.snapshot_repo_id is not null",
+        )
+        .bind(remote)
+        .fetch_optional(&self.pool)
+        .await
     }
 
     /// Repos in an org with per-repo counts + last sync — the C1 org overview.
@@ -7150,6 +7205,55 @@ mod tests {
         assert!(cat.delete_org_remote(&remote).await.unwrap());
         assert_eq!(cat.org_for_remote(&remote).await.unwrap(), None);
         assert!(!cat.delete_org_remote(&remote).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_config_set_read_and_clear() {
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let pid = std::process::id();
+        let org = format!("snaporg_{pid}");
+        cat.create_org(&org, None).await.expect("org");
+        let repo_id = cat.create_repo(&org, "data").await.expect("repo");
+        let remote = normalize_git_remote(&format!("git@github.com:snap{pid}/shop.git"));
+
+        // Setting on an unregistered remote does nothing (register first).
+        assert!(
+            !cat.set_remote_snapshot(&remote, repo_id, "production")
+                .await
+                .unwrap()
+        );
+        assert_eq!(cat.snapshot_for_remote(&remote).await.unwrap(), None);
+
+        // Register the remote, then point it at the dataset.
+        cat.set_org_remote(&org, &remote).await.expect("register");
+        assert!(
+            cat.set_remote_snapshot(&remote, repo_id, "staging")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cat.snapshot_for_remote(&remote).await.unwrap(),
+            Some((org.clone(), "data".to_string(), "staging".to_string()))
+        );
+
+        // Re-set overwrites the env.
+        cat.set_remote_snapshot(&remote, repo_id, "production")
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.snapshot_for_remote(&remote).await.unwrap(),
+            Some((org.clone(), "data".to_string(), "production".to_string()))
+        );
+
+        // Clearing drops the config but leaves the remote registered.
+        assert!(cat.clear_remote_snapshot(&remote).await.unwrap());
+        assert_eq!(cat.snapshot_for_remote(&remote).await.unwrap(), None);
+        assert_eq!(
+            cat.org_for_remote(&remote).await.unwrap(),
+            Some(cat.org_id_by_slug(&org).await.unwrap().unwrap())
+        );
     }
 
     #[tokio::test]
