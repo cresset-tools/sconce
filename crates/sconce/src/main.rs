@@ -232,6 +232,34 @@ enum Command {
         database_url: String,
     },
 
+    /// Set (or clear) a named database source a registered remote's team
+    /// manifest advertises, for `bougie db get --source <name>`. Point it at the
+    /// jibs SSH host a dev with access reproduces prod/staging rows from — the
+    /// manifest carries the connection, never a credential.
+    RemoteSource {
+        /// The project's git remote URL (any form; normalized).
+        remote: String,
+        /// Source name, e.g. `production` or `staging`.
+        name: String,
+        /// SSH target jibs connects to on the source side (`user@host`).
+        #[arg(long, conflicts_with = "clear")]
+        host: Option<String>,
+        /// Source-side MySQL/MariaDB DSN jibs reads (defaults to jibs's own).
+        #[arg(long)]
+        remote_mysql: Option<String>,
+        /// SSH identity file to authenticate with.
+        #[arg(long)]
+        identity: Option<String>,
+        /// SSH port, if not the default 22.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Remove this named source instead of setting it.
+        #[arg(long, conflicts_with = "host")]
+        clear: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Rename an organization. The old slug keeps redirecting (so composer.lock
     /// URLs still work) and is permanently retired.
     OrgRename {
@@ -1295,6 +1323,25 @@ fn main() -> Result<()> {
             clear,
             database_url,
         } => remote_snapshot(&remote, repo.as_deref(), &env, clear, &database_url),
+        Command::RemoteSource {
+            remote,
+            name,
+            host,
+            remote_mysql,
+            identity,
+            port,
+            clear,
+            database_url,
+        } => remote_source(
+            &remote,
+            &name,
+            host.as_deref(),
+            remote_mysql.as_deref(),
+            identity.as_deref(),
+            port,
+            clear,
+            &database_url,
+        ),
         Command::OrgRename {
             org,
             new_slug,
@@ -2586,6 +2633,59 @@ fn remote_snapshot(
             .context("setting snapshot config")?
         {
             println!("snapshot source for {normalized}: {repo} ({env})");
+        } else {
+            anyhow::bail!(
+                "remote '{normalized}' is not registered — run `sconce remote-add <org> {remote}` first"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_source(
+    remote: &str,
+    name: &str,
+    host: Option<&str>,
+    remote_mysql: Option<&str>,
+    identity: Option<&str>,
+    port: Option<u16>,
+    clear: bool,
+    database_url: &str,
+) -> Result<()> {
+    let normalized = sconce_catalog::normalize_git_remote(remote);
+    if normalized.is_empty() {
+        anyhow::bail!("'{remote}' does not look like a git remote URL");
+    }
+    with_catalog(database_url, async |catalog| {
+        if clear {
+            if catalog
+                .clear_remote_source(&normalized, name)
+                .await
+                .context("clearing source")?
+            {
+                println!("source '{name}' cleared for {normalized}");
+            } else {
+                println!("no such source '{name}' on {normalized}");
+            }
+            return Ok(());
+        }
+        let Some(host) = host else {
+            anyhow::bail!("pass --host <user@host> to set the source (or --clear to remove it)");
+        };
+        if catalog
+            .set_remote_source(
+                &normalized,
+                name,
+                host,
+                remote_mysql,
+                identity,
+                port.map(i32::from),
+            )
+            .await
+            .context("setting source")?
+        {
+            println!("source '{name}' for {normalized}: {host}");
         } else {
             anyhow::bail!(
                 "remote '{normalized}' is not registered — run `sconce remote-add <org> {remote}` first"
