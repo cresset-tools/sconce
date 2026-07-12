@@ -803,6 +803,30 @@ async fn get_manifest(
             "env": snap_env,
         });
     }
+    // Named database sources the team advertises (`sconce remote-source`), for
+    // `bougie db get --source <name>`. Each carries the jibs SSH target and
+    // optional connection refinements (never a credential). Omitted when none.
+    let sources = s.catalog.sources_for_remote(&remote).await?;
+    if !sources.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = sources
+            .into_iter()
+            .map(|src| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("host".to_string(), json!(src.host));
+                if let Some(remote_mysql) = src.remote_mysql {
+                    obj.insert("remote_mysql".to_string(), json!(remote_mysql));
+                }
+                if let Some(identity) = src.identity {
+                    obj.insert("identity".to_string(), json!(identity));
+                }
+                if let Some(port) = src.port {
+                    obj.insert("port".to_string(), json!(port));
+                }
+                (src.name, serde_json::Value::Object(obj))
+            })
+            .collect();
+        body["sources"] = serde_json::Value::Object(map);
+    }
     Ok(Json(body))
 }
 

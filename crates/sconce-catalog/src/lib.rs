@@ -409,6 +409,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0050_snapshot_seq",
         include_str!("../migrations/0050_snapshot_seq.sql"),
     ),
+    (
+        "0051_org_remote_sources",
+        include_str!("../migrations/0051_org_remote_sources.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -891,6 +895,19 @@ pub struct HomeRepo {
     pub pending: i64,
     /// Newest successful sync across the repo's packages (text), if any.
     pub last_sync: Option<String>,
+}
+
+/// A named database source a team advertises in its manifest (set with `sconce
+/// remote-source`), consumed by `bougie db get --source <name>`. `host` is the
+/// SSH target jibs connects to on the source side; the rest refine that
+/// connection. Connection metadata only — never a credential.
+#[derive(Debug, Clone)]
+pub struct RemoteSource {
+    pub name: String,
+    pub host: String,
+    pub remote_mysql: Option<String>,
+    pub identity: Option<String>,
+    pub port: Option<i32>,
 }
 
 /// A repository in the admin listing.
@@ -1884,6 +1901,78 @@ impl Catalog {
         .bind(remote)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// The named database sources a remote's team manifest advertises (`sconce
+    /// remote-source`), sorted by name. Empty when none are configured (or the
+    /// remote is unknown). Backs `bougie db get --source <name>`.
+    pub async fn sources_for_remote(&self, remote: &str) -> Result<Vec<RemoteSource>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select s.name, s.host, s.remote_mysql, s.identity, s.port \
+             from org_remote_sources s \
+             join org_remotes orm on orm.id = s.org_remote_id \
+             where orm.remote = $1 \
+             order by s.name",
+        )
+        .bind(remote)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RemoteSource {
+                    name: row.try_get("name")?,
+                    host: row.try_get("host")?,
+                    remote_mysql: row.try_get("remote_mysql")?,
+                    identity: row.try_get("identity")?,
+                    port: row.try_get("port")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set (upsert) a named database source on a registered remote's manifest.
+    /// Returns `false` if the remote isn't registered (`remote-add` it first).
+    pub async fn set_remote_source(
+        &self,
+        remote: &str,
+        name: &str,
+        host: &str,
+        remote_mysql: Option<&str>,
+        identity: Option<&str>,
+        port: Option<i32>,
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "insert into org_remote_sources \
+                 (org_remote_id, name, host, remote_mysql, identity, port) \
+             select orm.id, $2, $3, $4, $5, $6 from org_remotes orm where orm.remote = $1 \
+             on conflict (org_remote_id, name) do update set \
+                 host = excluded.host, remote_mysql = excluded.remote_mysql, \
+                 identity = excluded.identity, port = excluded.port",
+        )
+        .bind(remote)
+        .bind(name)
+        .bind(host)
+        .bind(remote_mysql)
+        .bind(identity)
+        .bind(port)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Remove a named source from a remote's manifest. Returns `false` if no
+    /// such `(remote, name)` source existed.
+    pub async fn clear_remote_source(&self, remote: &str, name: &str) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "delete from org_remote_sources s \
+             using org_remotes orm \
+             where s.org_remote_id = orm.id and orm.remote = $1 and s.name = $2",
+        )
+        .bind(remote)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// Repos in an org with per-repo counts + last sync — the C1 org overview.
@@ -7254,6 +7343,92 @@ mod tests {
         // Clearing drops the config but leaves the remote registered.
         assert!(cat.clear_remote_snapshot(&remote).await.unwrap());
         assert_eq!(cat.snapshot_for_remote(&remote).await.unwrap(), None);
+        assert_eq!(
+            cat.org_for_remote(&remote).await.unwrap(),
+            Some(cat.org_id_by_slug(&org).await.unwrap().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_source_config_set_read_and_clear() {
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let pid = std::process::id();
+        let org = format!("srcorg_{pid}");
+        cat.create_org(&org, None).await.expect("org");
+        let remote = normalize_git_remote(&format!("git@github.com:src{pid}/shop.git"));
+
+        // Setting on an unregistered remote does nothing (register first).
+        assert!(
+            !cat.set_remote_source(&remote, "production", "deploy@prod", None, None, None)
+                .await
+                .unwrap()
+        );
+        assert!(cat.sources_for_remote(&remote).await.unwrap().is_empty());
+
+        // Register the remote, then add two named sources.
+        cat.set_org_remote(&org, &remote).await.expect("register");
+        assert!(
+            cat.set_remote_source(
+                &remote,
+                "production",
+                "deploy@prod",
+                Some("mysql://ro@10.0.0.9:3306"),
+                Some("/home/u/.ssh/prod"),
+                Some(2201),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            cat.set_remote_source(&remote, "staging", "deploy@staging", None, None, None)
+                .await
+                .unwrap()
+        );
+
+        // Read back, sorted by name, with optional fields round-tripped.
+        let sources = cat.sources_for_remote(&remote).await.unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "production");
+        assert_eq!(sources[0].host, "deploy@prod");
+        assert_eq!(
+            sources[0].remote_mysql.as_deref(),
+            Some("mysql://ro@10.0.0.9:3306")
+        );
+        assert_eq!(sources[0].identity.as_deref(), Some("/home/u/.ssh/prod"));
+        assert_eq!(sources[0].port, Some(2201));
+        assert_eq!(sources[1].name, "staging");
+        assert_eq!(sources[1].host, "deploy@staging");
+        assert_eq!(sources[1].remote_mysql, None);
+        assert_eq!(sources[1].port, None);
+
+        // Re-setting overwrites (host + drops the optional fields).
+        assert!(
+            cat.set_remote_source(&remote, "production", "deploy@prod2", None, None, None)
+                .await
+                .unwrap()
+        );
+        let sources = cat.sources_for_remote(&remote).await.unwrap();
+        assert_eq!(sources[0].host, "deploy@prod2");
+        assert_eq!(sources[0].remote_mysql, None);
+
+        // Clearing one leaves the other; clearing is idempotent (true then false).
+        assert!(
+            cat.clear_remote_source(&remote, "production")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !cat.clear_remote_source(&remote, "production")
+                .await
+                .unwrap()
+        );
+        let sources = cat.sources_for_remote(&remote).await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "staging");
+
+        // The remote itself stays registered.
         assert_eq!(
             cat.org_for_remote(&remote).await.unwrap(),
             Some(cat.org_id_by_slug(&org).await.unwrap().unwrap())
