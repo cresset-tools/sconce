@@ -405,6 +405,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0049_org_remote_snapshot",
         include_str!("../migrations/0049_org_remote_snapshot.sql"),
     ),
+    (
+        "0050_snapshot_seq",
+        include_str!("../migrations/0050_snapshot_seq.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -6527,7 +6531,7 @@ impl Catalog {
                     extract(epoch from created_at)::bigint as created_at \
              from snapshots \
              where repo_id = $1 and environment = $2 and blob_sha256 = $3 \
-             order by created_at desc limit 1",
+             order by created_at desc, seq desc limit 1",
         )
         .bind(repo_id)
         .bind(environment)
@@ -6547,7 +6551,7 @@ impl Catalog {
             "select id, environment, blob_sha256, size_bytes, source_ref, \
                     extract(epoch from created_at)::bigint as created_at \
              from snapshots where repo_id = $1 and environment = $2 \
-             order by created_at desc",
+             order by created_at desc, seq desc",
         )
         .bind(repo_id)
         .bind(environment)
@@ -6577,7 +6581,7 @@ impl Catalog {
                and id not in ( \
                    select id from snapshots \
                    where repo_id = $1 and environment = $2 \
-                   order by created_at desc limit $3 \
+                   order by created_at desc, seq desc limit $3 \
                )",
         )
         .bind(repo_id)
