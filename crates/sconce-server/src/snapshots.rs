@@ -1,10 +1,12 @@
 //! Database **snapshot** (dataset) API — a sibling of [`crate::publish`].
 //!
-//! A workload (the scheduled dump job) uploads a `.jibsdump` for an environment,
+//! A workload (the scheduled dump job) uploads a `.jibsdump` for an environment
+//! (and optionally a data **profile** — `?profile=small|perf|…`, default `full`),
 //! authenticated by the same short-lived **publish token** and staged through the
 //! same chunked-upload machinery as a package. Unlike a package the bytes are
 //! stored **verbatim** — a dump is opaque, not re-archived — and registered as a
-//! [`sconce_catalog::Snapshot`] with a moving per-environment `latest` pointer.
+//! [`sconce_catalog::Snapshot`] with a moving per-(environment, profile) `latest`
+//! pointer.
 //!
 //! Downstream, a client fetches `…/snapshots/{env}/latest`, which 302s to a
 //! short-lived presigned URL exactly like a dist download.
@@ -14,7 +16,7 @@
 //! [`crate::publish::upload_complete`] dispatches assembly back to [`finish_upload`].
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::{Value, json};
@@ -28,6 +30,27 @@ use crate::{AppError, AppState};
 
 /// How long an unfinished snapshot upload session lives before the sweep aborts it.
 const UPLOAD_TTL_SECS: i64 = 24 * 3600;
+
+/// The data profile addressed when a request names none — the complete dump.
+const DEFAULT_PROFILE: &str = "full";
+
+/// `?profile=<name>` on the snapshot routes — the data-profile dimension beside
+/// the `{env}` path segment (a query param, so the profile-less URLs stay
+/// byte-identical and keep meaning `full`).
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ProfileQuery {
+    profile: Option<String>,
+}
+
+impl ProfileQuery {
+    /// The addressed profile: the non-empty `?profile=`, else `full`.
+    fn name(&self) -> &str {
+        match self.profile.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => p,
+            _ => DEFAULT_PROFILE,
+        }
+    }
+}
 
 /// Lifetime of a presigned snapshot-download redirect — short, but with slack for
 /// clock skew between sconce and the object store.
@@ -53,6 +76,7 @@ pub(crate) async fn upload_single(
     PublishAuthedRepo(repo_id): PublishAuthedRepo,
     State(s): State<AppState>,
     Path((_org, _repo, environment)): Path<(String, String, String)>,
+    Query(q): Query<ProfileQuery>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     let bytes = body.to_vec();
@@ -62,8 +86,8 @@ pub(crate) async fn upload_single(
         store.put(&bytes).map(|id| (id, size))
     })
     .await?;
-    register_snapshot(&s, repo_id, &environment, blob, size).await?;
-    Ok(created_response(&environment, &blob))
+    register_snapshot(&s, repo_id, &environment, q.name(), blob, size).await?;
+    Ok(created_response(&environment, q.name(), &blob))
 }
 
 /// `POST /{org}/{repo}/snapshots/{env}/uploads` — open a chunked snapshot session.
@@ -73,10 +97,11 @@ pub(crate) async fn upload_init(
     PublishAuthedRepo(repo_id): PublishAuthedRepo,
     State(s): State<AppState>,
     Path((_org, _repo, environment)): Path<(String, String, String)>,
+    Query(q): Query<ProfileQuery>,
 ) -> Result<Json<Value>, AppError> {
     let id = s
         .catalog
-        .create_snapshot_upload_session(repo_id, &environment, UPLOAD_TTL_SECS)
+        .create_snapshot_upload_session(repo_id, &environment, q.name(), UPLOAD_TTL_SECS)
         .await?;
     Ok(Json(json!({
         "upload_id": id,
@@ -100,6 +125,10 @@ pub(crate) async fn finish_upload(
         return Err(AppError::PayloadTooLarge);
     }
     let environment = session.environment.clone().unwrap_or_default();
+    let profile = session
+        .profile
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
     let store = s.store.clone();
     let ids = ids.to_vec();
     let cap = max_snapshot_bytes();
@@ -107,8 +136,8 @@ pub(crate) async fn finish_upload(
         tokio::task::spawn_blocking(move || assemble_snapshot(&store, &ids, expected_sha, cap))
             .await
             .map_err(|e| AppError::Storage(std::io::Error::other(e)))??;
-    register_snapshot(s, session.repo_id, &environment, blob, size).await?;
-    Ok(created_response(&environment, &blob))
+    register_snapshot(s, session.repo_id, &environment, &profile, blob, size).await?;
+    Ok(created_response(&environment, &profile, &blob))
 }
 
 /// Fetch the staged chunks in order, verify the assembled sha256, and store the
@@ -147,24 +176,28 @@ async fn register_snapshot(
     s: &AppState,
     repo_id: Uuid,
     environment: &str,
+    profile: &str,
     blob: BlobId,
     size: i64,
 ) -> Result<Uuid, AppError> {
     s.catalog.upsert_blob(blob.as_bytes(), size).await?;
     let id = s
         .catalog
-        .create_snapshot(repo_id, environment, blob.as_bytes(), size, None)
+        .create_snapshot(repo_id, environment, profile, blob.as_bytes(), size, None)
         .await?;
-    s.catalog.advance_latest(repo_id, environment, id).await?;
+    s.catalog
+        .advance_latest(repo_id, environment, profile, id)
+        .await?;
     Ok(id)
 }
 
-fn created_response(environment: &str, blob: &BlobId) -> Response {
+fn created_response(environment: &str, profile: &str, blob: &BlobId) -> Response {
     (
         StatusCode::CREATED,
         Json(json!({
             "status": "created",
             "environment": environment,
+            "profile": profile,
             "digest": blob.to_hex(),
         })),
     )
@@ -175,17 +208,19 @@ fn created_response(environment: &str, blob: &BlobId) -> Response {
 // Download
 // ---------------------------------------------------------------------------
 
-/// `GET /{org}/{repo}/snapshots/{env}/latest` — download the environment's current
-/// latest snapshot. Gated on a repo **read** token.
+/// `GET /{org}/{repo}/snapshots/{env}/latest[?profile=<name>]` — download the
+/// environment's current latest snapshot for a data profile (`full` when the
+/// query names none). Gated on a repo **read** token.
 pub(crate) async fn download_latest(
     State(s): State<AppState>,
     Path((org, repo, environment)): Path<(String, String, String)>,
+    Query(q): Query<ProfileQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let repo_id = authorize_read(&s, &org, &repo, &headers).await?;
     let snapshot = s
         .catalog
-        .resolve_latest(repo_id, &environment)
+        .resolve_latest(repo_id, &environment, q.name())
         .await?
         .ok_or(AppError::NotFound)?;
     serve_blob(&s, snapshot.blob_sha256).await
@@ -199,13 +234,14 @@ pub(crate) async fn download_latest(
 pub(crate) async fn download_digest(
     State(s): State<AppState>,
     Path((org, repo, environment, digest)): Path<(String, String, String, String)>,
+    Query(q): Query<ProfileQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let repo_id = authorize_read(&s, &org, &repo, &headers).await?;
     let sha = crate::parse_hex32(&digest).ok_or(AppError::NotFound)?;
     let snapshot = s
         .catalog
-        .resolve_snapshot_by_digest(repo_id, &environment, &sha)
+        .resolve_snapshot_by_digest(repo_id, &environment, q.name(), &sha)
         .await?
         .ok_or(AppError::NotFound)?;
     serve_blob(&s, snapshot.blob_sha256).await

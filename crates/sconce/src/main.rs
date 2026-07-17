@@ -225,6 +225,9 @@ enum Command {
         /// Environment whose snapshots to seed from.
         #[arg(long, default_value = "production")]
         env: String,
+        /// Default data profile the manifest advertises (omit for `full`).
+        #[arg(long, conflicts_with = "clear")]
+        profile: Option<String>,
         /// Clear the snapshot config instead of setting it.
         #[arg(long, conflicts_with = "repo")]
         clear: bool,
@@ -994,9 +997,9 @@ enum SnapshotAction {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
-    /// Retention: keep the newest `--keep` snapshots in a repo+environment,
-    /// deleting the rest. Never deletes the current `latest`; freed blobs are
-    /// reclaimed by `sconce gc`.
+    /// Retention: keep the newest `--keep` snapshots in a repo+environment+
+    /// profile, deleting the rest. Never deletes the current `latest`; freed
+    /// blobs are reclaimed by `sconce gc`.
     Prune {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
@@ -1004,6 +1007,9 @@ enum SnapshotAction {
         /// Environment label (e.g. production, staging).
         #[arg(long)]
         env: String,
+        /// Data profile whose history to prune.
+        #[arg(long, default_value = "full")]
+        profile: String,
         /// How many of the newest snapshots to keep.
         #[arg(long)]
         keep: i64,
@@ -1027,6 +1033,10 @@ enum SnapshotAction {
         /// Environment label the snapshot belongs to (e.g. production, staging).
         #[arg(long)]
         env: String,
+        /// Data profile this dump is a variant of (e.g. small, perf). Each
+        /// profile is a separately produced dump with its own `latest`.
+        #[arg(long, default_value = "full")]
+        profile: String,
         /// OIDC audience the repo's publish policy expects.
         #[arg(long, default_value = "sconce")]
         audience: String,
@@ -1320,9 +1330,17 @@ fn main() -> Result<()> {
             remote,
             repo,
             env,
+            profile,
             clear,
             database_url,
-        } => remote_snapshot(&remote, repo.as_deref(), &env, clear, &database_url),
+        } => remote_snapshot(
+            &remote,
+            repo.as_deref(),
+            &env,
+            profile.as_deref(),
+            clear,
+            &database_url,
+        ),
         Command::RemoteSource {
             remote,
             name,
@@ -1493,14 +1511,16 @@ fn main() -> Result<()> {
             SnapshotAction::Prune {
                 repo,
                 env,
+                profile,
                 keep,
                 database_url,
-            } => snapshot_prune(&repo, &env, keep, &database_url),
+            } => snapshot_prune(&repo, &env, &profile, keep, &database_url),
             SnapshotAction::Push {
                 file,
                 repo,
                 url,
                 env,
+                profile,
                 audience,
                 token,
                 part_size,
@@ -1509,6 +1529,7 @@ fn main() -> Result<()> {
                 &repo,
                 &url,
                 &env,
+                &profile,
                 &audience,
                 token.as_deref(),
                 part_size,
@@ -2600,6 +2621,7 @@ fn remote_snapshot(
     remote: &str,
     repo: Option<&str>,
     env: &str,
+    profile: Option<&str>,
     clear: bool,
     database_url: &str,
 ) -> Result<()> {
@@ -2628,11 +2650,12 @@ fn remote_snapshot(
         // Resolve the dataset repo up front so an unknown repo is a clean error.
         let repo_id = resolve_repo(&catalog, repo).await?;
         if catalog
-            .set_remote_snapshot(&normalized, repo_id, env)
+            .set_remote_snapshot(&normalized, repo_id, env, profile)
             .await
             .context("setting snapshot config")?
         {
-            println!("snapshot source for {normalized}: {repo} ({env})");
+            let profile = profile.unwrap_or("full");
+            println!("snapshot source for {normalized}: {repo} ({env}/{profile})");
         } else {
             anyhow::bail!(
                 "remote '{normalized}' is not registered — run `sconce remote-add <org> {remote}` first"
@@ -2776,11 +2799,13 @@ fn publish(
 /// `sconce snapshot push` — upload a database snapshot file as a repo+environment's
 /// new `latest`, from CI. Mirrors `publish` (HTTP + OIDC), but the file is stored
 /// verbatim (no tar/gzip) and it targets the `snapshots/{env}` routes.
+#[allow(clippy::too_many_arguments)]
 fn snapshot_push(
     file: &Path,
     repo_path: &str,
     url: &str,
     environment: &str,
+    profile: &str,
     audience: &str,
     token: Option<&str>,
     part_size: Option<u64>,
@@ -2798,18 +2823,25 @@ fn snapshot_push(
         None => obtain_publish_token(base, repo_path, audience)?,
     };
 
+    // The default profile stays off the URL so it keeps working against a
+    // server predating profiles.
+    let query = if profile == "full" {
+        String::new()
+    } else {
+        format!("?profile={profile}")
+    };
     let part_size = part_size.unwrap_or(DEFAULT_PART_SIZE).max(1);
     println!(
-        "Uploading snapshot {} ({} bytes) → {base}/{org}/{repo} [{environment}]",
+        "Uploading snapshot {} ({} bytes) → {base}/{org}/{repo} [{environment}/{profile}]",
         file.display(),
         body.len()
     );
 
     if u64::try_from(body.len()).unwrap_or(u64::MAX) <= part_size {
-        let single_url = format!("{base}/{org}/{repo}/snapshots/{environment}");
+        let single_url = format!("{base}/{org}/{repo}/snapshots/{environment}{query}");
         upload_single(&single_url, "application/octet-stream", &token, &body)
     } else {
-        let init_url = format!("{base}/{org}/{repo}/snapshots/{environment}/uploads");
+        let init_url = format!("{base}/{org}/{repo}/snapshots/{environment}/uploads{query}");
         upload_chunked(base, org, repo, &init_url, &token, &body, part_size)
     }
 }
@@ -3369,17 +3401,26 @@ fn service_token_list(repo: &str, database_url: &str) -> Result<()> {
 fn snapshot_list(repo: &str, env: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
-        let latest = catalog.resolve_latest(repo_id, env).await?.map(|s| s.id);
         let snapshots = catalog.list_snapshots(repo_id, env).await?;
         if snapshots.is_empty() {
             println!("no snapshots for {repo} [{env}]");
             return Ok(());
         }
+        // Each profile has its own moving "latest"; mark them all.
+        let mut latest = std::collections::HashSet::new();
+        let profiles: std::collections::BTreeSet<&str> =
+            snapshots.iter().map(|s| s.profile.as_str()).collect();
+        for profile in profiles {
+            if let Some(s) = catalog.resolve_latest(repo_id, env, profile).await? {
+                latest.insert(s.id);
+            }
+        }
         for s in snapshots {
-            let marker = if Some(s.id) == latest { '*' } else { ' ' };
+            let marker = if latest.contains(&s.id) { '*' } else { ' ' };
             println!(
-                "{marker} {}  {}  {} bytes  {}",
+                "{marker} {}  [{}]  {}  {} bytes  {}",
                 s.id,
+                s.profile,
                 sconce_cas::BlobId::from_bytes(s.blob_sha256).to_hex(),
                 s.size_bytes,
                 s.source_ref.unwrap_or_else(|| "-".to_owned()),
@@ -3389,11 +3430,19 @@ fn snapshot_list(repo: &str, env: &str, database_url: &str) -> Result<()> {
     })
 }
 
-fn snapshot_prune(repo: &str, env: &str, keep: i64, database_url: &str) -> Result<()> {
+fn snapshot_prune(
+    repo: &str,
+    env: &str,
+    profile: &str,
+    keep: i64,
+    database_url: &str,
+) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         let repo_id = resolve_repo(&catalog, repo).await?;
-        let deleted = catalog.prune_snapshots(repo_id, env, keep).await?;
-        println!("pruned {deleted} snapshot(s) from {repo} [{env}] (kept the newest {keep})");
+        let deleted = catalog.prune_snapshots(repo_id, env, profile, keep).await?;
+        println!(
+            "pruned {deleted} snapshot(s) from {repo} [{env}/{profile}] (kept the newest {keep})"
+        );
         eprintln!("run `sconce gc` to reclaim any now-orphaned blobs.");
         Ok(())
     })

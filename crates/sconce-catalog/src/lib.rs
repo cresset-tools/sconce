@@ -413,6 +413,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0051_org_remote_sources",
         include_str!("../migrations/0051_org_remote_sources.sql"),
     ),
+    (
+        "0052_snapshot_profiles",
+        include_str!("../migrations/0052_snapshot_profiles.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -720,6 +724,9 @@ pub struct UploadSession {
     pub name: Option<String>,
     pub version: Option<String>,
     pub environment: Option<String>,
+    /// Snapshot sessions only: the data profile the dump belongs to (`None` =
+    /// `full`).
+    pub profile: Option<String>,
     pub status: String,
 }
 
@@ -737,6 +744,9 @@ pub struct UploadPart {
 pub struct Snapshot {
     pub id: Uuid,
     pub environment: String,
+    /// The data profile this dump belongs to (`full` unless the publisher named
+    /// one — e.g. `small`, `perf`).
+    pub profile: String,
     pub blob_sha256: [u8; 32],
     pub size_bytes: i64,
     pub source_ref: Option<String>,
@@ -1853,20 +1863,25 @@ impl Catalog {
     }
 
     /// Point a registered remote's team manifest at a database snapshot source:
-    /// the repo whose `snapshots/{env}/latest` `bougie db pull` should fetch.
-    /// Returns `false` if the remote isn't registered (`remote-add` it first).
+    /// the repo whose `snapshots/{env}/latest` `bougie db pull` should fetch, and
+    /// (optionally) the default data profile to seed (`None` = `full`). Returns
+    /// `false` if the remote isn't registered (`remote-add` it first).
     pub async fn set_remote_snapshot(
         &self,
         remote: &str,
         snapshot_repo_id: Uuid,
         env: &str,
+        profile: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let done = sqlx::query(
-            "update org_remotes set snapshot_repo_id = $2, snapshot_env = $3 where remote = $1",
+            "update org_remotes \
+             set snapshot_repo_id = $2, snapshot_env = $3, snapshot_profile = $4 \
+             where remote = $1",
         )
         .bind(remote)
         .bind(snapshot_repo_id)
         .bind(env)
+        .bind(profile)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() > 0)
@@ -1876,7 +1891,8 @@ impl Catalog {
     /// Returns `false` if the remote isn't registered.
     pub async fn clear_remote_snapshot(&self, remote: &str) -> Result<bool, sqlx::Error> {
         let done = sqlx::query(
-            "update org_remotes set snapshot_repo_id = null, snapshot_env = null \
+            "update org_remotes \
+             set snapshot_repo_id = null, snapshot_env = null, snapshot_profile = null \
              where remote = $1",
         )
         .bind(remote)
@@ -1886,13 +1902,15 @@ impl Catalog {
     }
 
     /// The dataset a remote's team manifest points at, as `(org_slug, repo_slug,
-    /// env)`. `None` when no snapshot is configured (or the remote is unknown).
+    /// env, profile)`. `None` when no snapshot is configured (or the remote is
+    /// unknown); `profile` defaults to `full` when unset.
     pub async fn snapshot_for_remote(
         &self,
         remote: &str,
-    ) -> Result<Option<(String, String, String)>, sqlx::Error> {
+    ) -> Result<Option<(String, String, String, String)>, sqlx::Error> {
         sqlx::query_as(
-            "select o.slug, r.slug, coalesce(orm.snapshot_env, 'production') \
+            "select o.slug, r.slug, coalesce(orm.snapshot_env, 'production'), \
+                    coalesce(orm.snapshot_profile, 'full') \
              from org_remotes orm \
              join repositories r on r.id = orm.snapshot_repo_id \
              join organizations o on o.id = r.org_id \
@@ -6429,7 +6447,7 @@ impl Catalog {
     /// Fetch a session by id (any status). `None` if unknown.
     pub async fn upload_session(&self, id: Uuid) -> Result<Option<UploadSession>, sqlx::Error> {
         let row = sqlx::query(
-            "select id, repo_id, kind, vendor, name, version, environment, status \
+            "select id, repo_id, kind, vendor, name, version, environment, profile, status \
              from upload_sessions where id = $1",
         )
         .bind(id)
@@ -6444,6 +6462,7 @@ impl Catalog {
                 name: r.try_get("name")?,
                 version: r.try_get("version")?,
                 environment: r.try_get("environment")?,
+                profile: r.try_get("profile")?,
                 status: r.try_get("status")?,
             })
         })
@@ -6458,15 +6477,17 @@ impl Catalog {
         &self,
         repo_id: Uuid,
         environment: &str,
+        profile: &str,
         ttl_secs: i64,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
-            "insert into upload_sessions (repo_id, kind, environment, expires_at) \
-             values ($1, 'snapshot', $2, now() + make_interval(secs => $3::double precision)) \
+            "insert into upload_sessions (repo_id, kind, environment, profile, expires_at) \
+             values ($1, 'snapshot', $2, $3, now() + make_interval(secs => $4::double precision)) \
              returning id",
         )
         .bind(repo_id)
         .bind(environment)
+        .bind(profile)
         .bind(ttl_secs)
         .fetch_one(&self.pool)
         .await
@@ -6546,16 +6567,19 @@ impl Catalog {
         &self,
         repo_id: Uuid,
         environment: &str,
+        profile: &str,
         blob_sha256: &[u8; 32],
         size_bytes: i64,
         source_ref: Option<&str>,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
-            "insert into snapshots (repo_id, environment, blob_sha256, size_bytes, source_ref) \
-             values ($1, $2, $3, $4, $5) returning id",
+            "insert into snapshots \
+                 (repo_id, environment, profile, blob_sha256, size_bytes, source_ref) \
+             values ($1, $2, $3, $4, $5, $6) returning id",
         )
         .bind(repo_id)
         .bind(environment)
+        .bind(profile)
         .bind(&blob_sha256[..])
         .bind(size_bytes)
         .bind(source_ref)
@@ -6563,81 +6587,88 @@ impl Catalog {
         .await
     }
 
-    /// Point `(repo, environment)`'s "latest" at `snapshot_id`. Upsert, so the first
-    /// upload creates the pointer and every later one moves it.
+    /// Point `(repo, environment, profile)`'s "latest" at `snapshot_id`. Upsert,
+    /// so the first upload creates the pointer and every later one moves it.
     pub async fn advance_latest(
         &self,
         repo_id: Uuid,
         environment: &str,
+        profile: &str,
         snapshot_id: Uuid,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "insert into snapshot_latest (repo_id, environment, snapshot_id) \
-             values ($1, $2, $3) \
-             on conflict (repo_id, environment) do update set \
+            "insert into snapshot_latest (repo_id, environment, profile, snapshot_id) \
+             values ($1, $2, $3, $4) \
+             on conflict (repo_id, environment, profile) do update set \
                  snapshot_id = excluded.snapshot_id, updated_at = now()",
         )
         .bind(repo_id)
         .bind(environment)
+        .bind(profile)
         .bind(snapshot_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Resolve `(repo, environment)`'s current "latest" snapshot. `None` if the
-    /// environment has never had a snapshot uploaded.
+    /// Resolve `(repo, environment, profile)`'s current "latest" snapshot. `None`
+    /// if that variant has never had a snapshot uploaded.
     pub async fn resolve_latest(
         &self,
         repo_id: Uuid,
         environment: &str,
+        profile: &str,
     ) -> Result<Option<Snapshot>, sqlx::Error> {
         let row = sqlx::query(
-            "select s.id, s.environment, s.blob_sha256, s.size_bytes, s.source_ref, \
+            "select s.id, s.environment, s.profile, s.blob_sha256, s.size_bytes, s.source_ref, \
                     extract(epoch from s.created_at)::bigint as created_at \
              from snapshot_latest l join snapshots s on s.id = l.snapshot_id \
-             where l.repo_id = $1 and l.environment = $2",
+             where l.repo_id = $1 and l.environment = $2 and l.profile = $3",
         )
         .bind(repo_id)
         .bind(environment)
+        .bind(profile)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(row_to_snapshot).transpose()
     }
 
-    /// Resolve a snapshot pinned by its blob digest within a repo+environment — for
-    /// reproducible downloads. Scoped to the repo+environment so a read token can't
-    /// resolve an arbitrary CAS blob it was never granted. `None` if no snapshot in
-    /// that repo+environment references the digest.
+    /// Resolve a snapshot pinned by its blob digest within a repo+environment+
+    /// profile — for reproducible downloads. Scoped so a read token can't resolve
+    /// an arbitrary CAS blob it was never granted. `None` if no snapshot in that
+    /// variant references the digest.
     pub async fn resolve_snapshot_by_digest(
         &self,
         repo_id: Uuid,
         environment: &str,
+        profile: &str,
         blob_sha256: &[u8; 32],
     ) -> Result<Option<Snapshot>, sqlx::Error> {
         let row = sqlx::query(
-            "select id, environment, blob_sha256, size_bytes, source_ref, \
+            "select id, environment, profile, blob_sha256, size_bytes, source_ref, \
                     extract(epoch from created_at)::bigint as created_at \
              from snapshots \
-             where repo_id = $1 and environment = $2 and blob_sha256 = $3 \
+             where repo_id = $1 and environment = $2 and profile = $3 and blob_sha256 = $4 \
              order by created_at desc, seq desc limit 1",
         )
         .bind(repo_id)
         .bind(environment)
+        .bind(profile)
         .bind(&blob_sha256[..])
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(row_to_snapshot).transpose()
     }
 
-    /// A repo+environment's snapshots, newest first.
+    /// A repo+environment's snapshots across **all** profiles, newest first (each
+    /// row carries its [`Snapshot::profile`]).
     pub async fn list_snapshots(
         &self,
         repo_id: Uuid,
         environment: &str,
     ) -> Result<Vec<Snapshot>, sqlx::Error> {
         let rows = sqlx::query(
-            "select id, environment, blob_sha256, size_bytes, source_ref, \
+            "select id, environment, profile, blob_sha256, size_bytes, source_ref, \
                     extract(epoch from created_at)::bigint as created_at \
              from snapshots where repo_id = $1 and environment = $2 \
              order by created_at desc, seq desc",
@@ -6649,32 +6680,34 @@ impl Catalog {
         rows.iter().map(row_to_snapshot).collect()
     }
 
-    /// Retention: keep the `keep` newest snapshots in `(repo, environment)`, deleting
-    /// the rest. Never deletes the one the "latest" pointer references (so `latest`
-    /// always resolves). Deleting a row decrements its blob's refcount; the existing
-    /// orphan GC (`sconce gc`) then reclaims any blob that hits refcount 0. Returns
-    /// how many snapshots were deleted.
+    /// Retention: keep the `keep` newest snapshots in `(repo, environment,
+    /// profile)`, deleting the rest. Never deletes the one the "latest" pointer
+    /// references (so `latest` always resolves). Deleting a row decrements its
+    /// blob's refcount; the existing orphan GC (`sconce gc`) then reclaims any
+    /// blob that hits refcount 0. Returns how many snapshots were deleted.
     pub async fn prune_snapshots(
         &self,
         repo_id: Uuid,
         environment: &str,
+        profile: &str,
         keep: i64,
     ) -> Result<u64, sqlx::Error> {
         let n = sqlx::query(
             "delete from snapshots \
-             where repo_id = $1 and environment = $2 \
+             where repo_id = $1 and environment = $2 and profile = $3 \
                and id not in ( \
                    select snapshot_id from snapshot_latest \
-                   where repo_id = $1 and environment = $2 \
+                   where repo_id = $1 and environment = $2 and profile = $3 \
                ) \
                and id not in ( \
                    select id from snapshots \
-                   where repo_id = $1 and environment = $2 \
-                   order by created_at desc, seq desc limit $3 \
+                   where repo_id = $1 and environment = $2 and profile = $3 \
+                   order by created_at desc, seq desc limit $4 \
                )",
         )
         .bind(repo_id)
         .bind(environment)
+        .bind(profile)
         .bind(keep.max(0))
         .execute(&self.pool)
         .await?;
@@ -7179,6 +7212,7 @@ fn row_to_snapshot(row: &sqlx::postgres::PgRow) -> Result<Snapshot, sqlx::Error>
     Ok(Snapshot {
         id: row.try_get("id")?,
         environment: row.try_get("environment")?,
+        profile: row.try_get("profile")?,
         blob_sha256: blob,
         size_bytes: row.try_get("size_bytes")?,
         source_ref: row.try_get("source_ref")?,
@@ -7313,31 +7347,42 @@ mod tests {
 
         // Setting on an unregistered remote does nothing (register first).
         assert!(
-            !cat.set_remote_snapshot(&remote, repo_id, "production")
+            !cat.set_remote_snapshot(&remote, repo_id, "production", None)
                 .await
                 .unwrap()
         );
         assert_eq!(cat.snapshot_for_remote(&remote).await.unwrap(), None);
 
-        // Register the remote, then point it at the dataset.
+        // Register the remote, then point it at the dataset. No profile set →
+        // the manifest advertises the `full` default.
         cat.set_org_remote(&org, &remote).await.expect("register");
         assert!(
-            cat.set_remote_snapshot(&remote, repo_id, "staging")
+            cat.set_remote_snapshot(&remote, repo_id, "staging", None)
                 .await
                 .unwrap()
         );
         assert_eq!(
             cat.snapshot_for_remote(&remote).await.unwrap(),
-            Some((org.clone(), "data".to_string(), "staging".to_string()))
+            Some((
+                org.clone(),
+                "data".to_string(),
+                "staging".to_string(),
+                "full".to_string()
+            ))
         );
 
-        // Re-set overwrites the env.
-        cat.set_remote_snapshot(&remote, repo_id, "production")
+        // Re-set overwrites the env and can name a default profile.
+        cat.set_remote_snapshot(&remote, repo_id, "production", Some("small"))
             .await
             .unwrap();
         assert_eq!(
             cat.snapshot_for_remote(&remote).await.unwrap(),
-            Some((org.clone(), "data".to_string(), "production".to_string()))
+            Some((
+                org.clone(),
+                "data".to_string(),
+                "production".to_string(),
+                "small".to_string()
+            ))
         );
 
         // Clearing drops the config but leaves the remote registered.
@@ -9533,7 +9578,7 @@ mod tests {
 
         // Nothing uploaded yet.
         assert!(
-            cat.resolve_latest(repo_id, "production")
+            cat.resolve_latest(repo_id, "production", "full")
                 .await
                 .unwrap()
                 .is_none()
@@ -9541,28 +9586,33 @@ mod tests {
 
         cat.upsert_blob(&sha1, 1000).await.unwrap();
         let s1 = cat
-            .create_snapshot(repo_id, "production", &sha1, 1000, Some("commit-a"))
+            .create_snapshot(repo_id, "production", "full", &sha1, 1000, Some("commit-a"))
             .await
             .unwrap();
-        cat.advance_latest(repo_id, "production", s1).await.unwrap();
+        cat.advance_latest(repo_id, "production", "full", s1)
+            .await
+            .unwrap();
         let latest = cat
-            .resolve_latest(repo_id, "production")
+            .resolve_latest(repo_id, "production", "full")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(latest.blob_sha256, sha1);
         assert_eq!(latest.size_bytes, 1000);
         assert_eq!(latest.source_ref.as_deref(), Some("commit-a"));
+        assert_eq!(latest.profile, "full");
 
         // A second upload moves the pointer.
         cat.upsert_blob(&sha2, 2000).await.unwrap();
         let s2 = cat
-            .create_snapshot(repo_id, "production", &sha2, 2000, None)
+            .create_snapshot(repo_id, "production", "full", &sha2, 2000, None)
             .await
             .unwrap();
-        cat.advance_latest(repo_id, "production", s2).await.unwrap();
+        cat.advance_latest(repo_id, "production", "full", s2)
+            .await
+            .unwrap();
         assert_eq!(
-            cat.resolve_latest(repo_id, "production")
+            cat.resolve_latest(repo_id, "production", "full")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9573,7 +9623,7 @@ mod tests {
 
         // Environments are independent.
         assert!(
-            cat.resolve_latest(repo_id, "staging")
+            cat.resolve_latest(repo_id, "staging", "full")
                 .await
                 .unwrap()
                 .is_none()
@@ -9597,22 +9647,29 @@ mod tests {
         };
         let sha = test_sha(repo_id, 41);
         cat.upsert_blob(&sha, 500).await.unwrap();
-        cat.create_snapshot(repo_id, "production", &sha, 500, None)
+        cat.create_snapshot(repo_id, "production", "full", &sha, 500, None)
             .await
             .unwrap();
 
-        // Pinned resolve of the exact digest in its repo+env.
+        // Pinned resolve of the exact digest in its repo+env+profile.
         let got = cat
-            .resolve_snapshot_by_digest(repo_id, "production", &sha)
+            .resolve_snapshot_by_digest(repo_id, "production", "full", &sha)
             .await
             .unwrap()
-            .expect("digest resolves in its repo+env");
+            .expect("digest resolves in its repo+env+profile");
         assert_eq!(got.blob_sha256, sha);
         assert_eq!(got.size_bytes, 500);
 
         // Same digest, wrong environment → not found (env-scoped).
         assert!(
-            cat.resolve_snapshot_by_digest(repo_id, "staging", &sha)
+            cat.resolve_snapshot_by_digest(repo_id, "staging", "full", &sha)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Same digest, wrong profile → not found (profile-scoped).
+        assert!(
+            cat.resolve_snapshot_by_digest(repo_id, "production", "small", &sha)
                 .await
                 .unwrap()
                 .is_none()
@@ -9622,7 +9679,7 @@ mod tests {
         let other = test_sha(repo_id, 42);
         cat.upsert_blob(&other, 500).await.unwrap();
         assert!(
-            cat.resolve_snapshot_by_digest(repo_id, "production", &other)
+            cat.resolve_snapshot_by_digest(repo_id, "production", "full", &other)
                 .await
                 .unwrap()
                 .is_none()
@@ -9641,10 +9698,12 @@ mod tests {
             let sha = test_sha(repo_id, 30 + i);
             cat.upsert_blob(&sha, 100).await.unwrap();
             let id = cat
-                .create_snapshot(repo_id, "production", &sha, 100, None)
+                .create_snapshot(repo_id, "production", "full", &sha, 100, None)
                 .await
                 .unwrap();
-            cat.advance_latest(repo_id, "production", id).await.unwrap();
+            cat.advance_latest(repo_id, "production", "full", id)
+                .await
+                .unwrap();
             shas.push(sha);
         }
         for sha in &shas {
@@ -9652,7 +9711,10 @@ mod tests {
         }
 
         // Keep only the newest → the two oldest are pruned.
-        let deleted = cat.prune_snapshots(repo_id, "production", 1).await.unwrap();
+        let deleted = cat
+            .prune_snapshots(repo_id, "production", "full", 1)
+            .await
+            .unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(
             cat.list_snapshots(repo_id, "production")
@@ -9664,7 +9726,7 @@ mod tests {
 
         // The latest survives (pointer still resolves) and keeps its blob…
         assert_eq!(
-            cat.resolve_latest(repo_id, "production")
+            cat.resolve_latest(repo_id, "production", "full")
                 .await
                 .unwrap()
                 .unwrap()
@@ -9675,6 +9737,100 @@ mod tests {
         // …while the pruned snapshots' blobs drop to 0 (now orphan-GC eligible).
         assert_eq!(refcount(&cat, &shas[0]).await, Some(0));
         assert_eq!(refcount(&cat, &shas[1]).await, Some(0));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn snapshot_profiles_are_independent_dimensions() {
+        let _serial = serial_blobs();
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let (full_sha, small_a, small_b) = (
+            test_sha(repo_id, 51),
+            test_sha(repo_id, 52),
+            test_sha(repo_id, 53),
+        );
+
+        // Publish a `full` and a `small` dump under the same (repo, env).
+        for (sha, profile) in [(&full_sha, "full"), (&small_a, "small")] {
+            cat.upsert_blob(sha, 100).await.unwrap();
+            let id = cat
+                .create_snapshot(repo_id, "production", profile, sha, 100, None)
+                .await
+                .unwrap();
+            cat.advance_latest(repo_id, "production", profile, id)
+                .await
+                .unwrap();
+        }
+
+        // Each profile has its own latest.
+        let full = cat
+            .resolve_latest(repo_id, "production", "full")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (full.blob_sha256, full.profile.as_str()),
+            (full_sha, "full")
+        );
+        let small = cat
+            .resolve_latest(repo_id, "production", "small")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (small.blob_sha256, small.profile.as_str()),
+            (small_a, "small")
+        );
+        // An unpublished profile resolves to nothing.
+        assert!(
+            cat.resolve_latest(repo_id, "production", "perf")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Advancing `small` doesn't move `full`.
+        cat.upsert_blob(&small_b, 200).await.unwrap();
+        let id = cat
+            .create_snapshot(repo_id, "production", "small", &small_b, 200, None)
+            .await
+            .unwrap();
+        cat.advance_latest(repo_id, "production", "small", id)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.resolve_latest(repo_id, "production", "small")
+                .await
+                .unwrap()
+                .unwrap()
+                .blob_sha256,
+            small_b
+        );
+        assert_eq!(
+            cat.resolve_latest(repo_id, "production", "full")
+                .await
+                .unwrap()
+                .unwrap()
+                .blob_sha256,
+            full_sha,
+            "full latest untouched by a small publish"
+        );
+
+        // Pruning `small` to 1 deletes only its older row; `full` is untouched.
+        let deleted = cat
+            .prune_snapshots(repo_id, "production", "small", 1)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let all = cat.list_snapshots(repo_id, "production").await.unwrap();
+        let mut kinds: Vec<(&str, [u8; 32])> = all
+            .iter()
+            .map(|s| (s.profile.as_str(), s.blob_sha256))
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, vec![("full", full_sha), ("small", small_b)]);
     }
 
     #[tokio::test]
