@@ -456,10 +456,11 @@ enum Command {
 
     /// Publish (push) a package directory to a sconce server.
     ///
-    /// Tars `dir`, obtains a short-lived **publish token** (via GitHub Actions
-    /// OIDC, or `--token`), and uploads it to `<url>/<org>/<repo>` — one request for
-    /// small packages, resumable chunks for large ones. The package **name** is read
-    /// from `dir/composer.json`; the **version** is `--version` or `$GITHUB_REF_NAME`.
+    /// Tars `dir`, obtains a short-lived **publish token** (via CI OIDC —
+    /// GitHub Actions or GitLab CI — or `--token`), and uploads it to
+    /// `<url>/<org>/<repo>` — one request for small packages, resumable chunks for
+    /// large ones. The package **name** is read from `dir/composer.json`; the
+    /// **version** is `--version`, `$GITHUB_REF_NAME`, or `$CI_COMMIT_TAG`.
     /// Unlike the other commands, this talks to the running server over HTTP, not the
     /// database.
     Publish {
@@ -471,13 +472,14 @@ enum Command {
         /// Base URL of the sconce wire server, e.g. `https://repo.example.com`.
         #[arg(long, env = "SCONCE_URL")]
         url: String,
-        /// Version to publish (e.g. `1.2.0`). Defaults to `$GITHUB_REF_NAME`.
+        /// Version to publish (e.g. `1.2.0`). Defaults to `$GITHUB_REF_NAME`,
+        /// then `$CI_COMMIT_TAG` (GitLab).
         #[arg(long)]
         version: Option<String>,
         /// OIDC audience the repo's publish policy expects.
         #[arg(long, default_value = "sconce")]
         audience: String,
-        /// A publish token to use directly (otherwise obtained via GitHub OIDC).
+        /// A publish token to use directly (otherwise obtained via CI OIDC).
         #[arg(long, env = "SCONCE_PUBLISH_TOKEN")]
         token: Option<String>,
         /// Upload as chunks of at most this many bytes (also the single-shot
@@ -1018,9 +1020,9 @@ enum SnapshotAction {
     },
     /// Upload a database snapshot file as the environment's new `latest`, from CI.
     /// Unlike `list`/`prune`, this talks to the running server over HTTP (like
-    /// `publish`), authenticated by a publish token or a GitHub OIDC exchange —
-    /// no database access. The file is stored verbatim (small ones in a single
-    /// request, larger ones in resumable chunks).
+    /// `publish`), authenticated by a publish token or a CI OIDC exchange
+    /// (GitHub Actions or GitLab CI) — no database access. The file is stored
+    /// verbatim (small ones in a single request, larger ones in resumable chunks).
     Push {
         /// Snapshot file to upload (e.g. a `.jibsdump`).
         file: PathBuf,
@@ -1040,7 +1042,7 @@ enum SnapshotAction {
         /// OIDC audience the repo's publish policy expects.
         #[arg(long, default_value = "sconce")]
         audience: String,
-        /// A publish token to use directly (otherwise obtained via GitHub OIDC).
+        /// A publish token to use directly (otherwise obtained via CI OIDC).
         #[arg(long, env = "SCONCE_PUBLISH_TOKEN")]
         token: Option<String>,
         /// Upload as chunks of at most this many bytes (also the single-shot
@@ -2764,16 +2766,23 @@ fn publish(
         .split_once('/')
         .context("composer.json \"name\" must be vendor/name")?;
 
-    // Version from --version or the pushed git tag.
+    // Version from --version or the pushed git tag (GitHub, then GitLab).
     let version = match version {
         Some(v) => v.to_owned(),
         None => std::env::var("GITHUB_REF_NAME")
             .ok()
             .filter(|s| !s.is_empty())
-            .context("no --version given and $GITHUB_REF_NAME is unset")?,
+            .or_else(|| {
+                std::env::var("CI_COMMIT_TAG")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+            .context(
+                "no --version given, and neither $GITHUB_REF_NAME nor $CI_COMMIT_TAG is set",
+            )?,
     };
 
-    // A publish token: an explicit one, else exchange a GitHub Actions OIDC token.
+    // A publish token: an explicit one, else exchange a CI OIDC token.
     let token = match token {
         Some(t) => t.to_owned(),
         None => obtain_publish_token(base, repo_path, audience)?,
@@ -2817,7 +2826,7 @@ fn snapshot_push(
 
     let body = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
 
-    // A publish token: an explicit one, else exchange a GitHub Actions OIDC token.
+    // A publish token: an explicit one, else exchange a CI OIDC token.
     let token = match token {
         Some(t) => t.to_owned(),
         None => obtain_publish_token(base, repo_path, audience)?,
@@ -2846,33 +2855,18 @@ fn snapshot_push(
     }
 }
 
-/// Obtain a short-lived publish token by exchanging a GitHub Actions OIDC JWT.
+/// Obtain a short-lived publish token by exchanging a CI OIDC JWT.
+///
+/// The JWT comes from `$SCONCE_ID_TOKEN` if set — GitLab CI's model, where
+/// `id_tokens: SCONCE_ID_TOKEN: aud: …` mints one straight into the job's
+/// environment — else it is requested from GitHub Actions' on-demand endpoint.
 fn obtain_publish_token(base: &str, repo_path: &str, audience: &str) -> Result<String> {
-    let req_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").unwrap_or_default();
-    let req_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").unwrap_or_default();
-    if req_url.is_empty() || req_token.is_empty() {
-        anyhow::bail!(
-            "no --token / $SCONCE_PUBLISH_TOKEN, and no GitHub Actions OIDC available \
-             (the workflow needs `permissions: id-token: write`). Publishing needs a token."
-        );
-    }
-    // 1. Ask GitHub Actions for an OIDC JWT with the audience the policy expects.
-    let jwt_body = ureq::get(&req_url)
-        .query("audience", audience)
-        .set("Authorization", &format!("Bearer {req_token}"))
-        .call()
-        .map_err(publish_http_err)
-        .context("requesting a GitHub OIDC token")?
-        .into_string()
-        .context("reading the OIDC token response")?;
-    let jwt_json: serde_json::Value =
-        serde_json::from_str(&jwt_body).context("parsing the OIDC token response")?;
-    let jwt = jwt_json
-        .get("value")
-        .and_then(serde_json::Value::as_str)
-        .context("OIDC token response has no \"value\"")?;
+    let jwt = match std::env::var("SCONCE_ID_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => github_actions_jwt(audience)?,
+    };
 
-    // 2. Exchange it for a publish token.
+    // Exchange it for a publish token.
     let exch_url = format!("{base}/oauth/ci-publish");
     let body = serde_json::to_vec(&serde_json::json!({ "repository": repo_path, "jwt": jwt }))?;
     let text = ureq::post(&exch_url)
@@ -2888,6 +2882,35 @@ fn obtain_publish_token(base: &str, repo_path: &str, audience: &str) -> Result<S
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .context("exchange response has no \"access_token\"")
+}
+
+/// Request an OIDC JWT with the given audience from GitHub Actions (via
+/// `ACTIONS_ID_TOKEN_REQUEST_URL` / `_TOKEN`, exposed by `id-token: write`).
+fn github_actions_jwt(audience: &str) -> Result<String> {
+    let req_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").unwrap_or_default();
+    let req_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").unwrap_or_default();
+    if req_url.is_empty() || req_token.is_empty() {
+        anyhow::bail!(
+            "no --token / $SCONCE_PUBLISH_TOKEN, no $SCONCE_ID_TOKEN (GitLab CI's \
+             `id_tokens:`), and no GitHub Actions OIDC available (the workflow needs \
+             `permissions: id-token: write`). Publishing needs a token."
+        );
+    }
+    let jwt_body = ureq::get(&req_url)
+        .query("audience", audience)
+        .set("Authorization", &format!("Bearer {req_token}"))
+        .call()
+        .map_err(publish_http_err)
+        .context("requesting a GitHub OIDC token")?
+        .into_string()
+        .context("reading the OIDC token response")?;
+    let jwt_json: serde_json::Value =
+        serde_json::from_str(&jwt_body).context("parsing the OIDC token response")?;
+    jwt_json
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .context("OIDC token response has no \"value\"")
 }
 
 /// Tar + gzip a package directory (contents at the archive root, symlinks preserved).
