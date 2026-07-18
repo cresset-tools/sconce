@@ -226,6 +226,34 @@ pub(crate) async fn download_latest(
     serve_blob(&s, snapshot.blob_sha256).await
 }
 
+/// `GET /{org}/{repo}/snapshots/{env}/latest/info[?profile=<name>]` — metadata
+/// about the latest snapshot (digest, size, publish time) **without** the
+/// bytes. Backs `bougie db status`: a client compares its seed marker's digest
+/// against `digest` to tell "up to date" from "behind", cheaply. Same read-token
+/// gate as the download (it reveals facts about prod data).
+pub(crate) async fn latest_info(
+    State(s): State<AppState>,
+    Path((org, repo, environment)): Path<(String, String, String)>,
+    Query(q): Query<ProfileQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let repo_id = authorize_read(&s, &org, &repo, &headers).await?;
+    let snapshot = s
+        .catalog
+        .resolve_latest(repo_id, &environment, q.name())
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(json!({
+        "digest": BlobId::from_bytes(snapshot.blob_sha256).to_hex(),
+        "size_bytes": snapshot.size_bytes,
+        // Unix seconds of when this snapshot was published.
+        "created_at": snapshot.created_at,
+        "environment": snapshot.environment,
+        "profile": snapshot.profile,
+        "source_ref": snapshot.source_ref,
+    })))
+}
+
 /// `GET /{org}/{repo}/snapshots/{env}/{digest}` — download a **pinned** snapshot by
 /// its 64-hex blob digest, for reproducible pulls (a lockfile / CI parity can pin
 /// the exact bytes a dev used). The digest must name a snapshot registered in this
