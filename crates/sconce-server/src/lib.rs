@@ -122,6 +122,13 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             "/{org}/{repo}/snapshots/{env}/latest",
             get(snapshots::download_latest),
         )
+        // Metadata about the latest snapshot without downloading it — backs
+        // `bougie db status`'s staleness check (compare the local seed marker's
+        // digest against the registry's latest).
+        .route(
+            "/{org}/{repo}/snapshots/{env}/latest/info",
+            get(snapshots::latest_info),
+        )
         .route(
             "/{org}/{repo}/snapshots/{env}/{digest}",
             get(snapshots::download_digest),
