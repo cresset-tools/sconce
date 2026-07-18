@@ -2777,10 +2777,12 @@ fn publish(
                     .ok()
                     .filter(|s| !s.is_empty())
             })
-            .context("no --version given, and neither $GITHUB_REF_NAME nor $CI_COMMIT_TAG is set")?,
+            .context(
+                "no --version given, and neither $GITHUB_REF_NAME nor $CI_COMMIT_TAG is set",
+            )?,
     };
 
-    // A publish token: an explicit one, else exchange a GitHub Actions OIDC token.
+    // A publish token: an explicit one, else exchange a CI OIDC token.
     let token = match token {
         Some(t) => t.to_owned(),
         None => obtain_publish_token(base, repo_path, audience)?,
@@ -2824,7 +2826,7 @@ fn snapshot_push(
 
     let body = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
 
-    // A publish token: an explicit one, else exchange a GitHub Actions OIDC token.
+    // A publish token: an explicit one, else exchange a CI OIDC token.
     let token = match token {
         Some(t) => t.to_owned(),
         None => obtain_publish_token(base, repo_path, audience)?,
