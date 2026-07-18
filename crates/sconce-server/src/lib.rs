@@ -795,12 +795,17 @@ async fn get_manifest(
         "repositories": repositories,
     });
     // The database snapshot source, when the remote has one configured (`sconce
-    // remote-snapshot`). Lets `bougie db pull` default `--repo`/`--env` from the
-    // manifest instead of the dev naming the dataset repo. Omitted when unset.
-    if let Some((snap_org, snap_repo, snap_env)) = s.catalog.snapshot_for_remote(&remote).await? {
+    // remote-snapshot`). Lets `bougie db pull` default `--repo`/`--env`/
+    // `--profile` from the manifest instead of the dev naming the dataset repo.
+    // `profile` is the team's default data profile (`full` unless set). Omitted
+    // when unset.
+    if let Some((snap_org, snap_repo, snap_env, snap_profile)) =
+        s.catalog.snapshot_for_remote(&remote).await?
+    {
         body["snapshot"] = json!({
             "repo": format!("{snap_org}/{snap_repo}"),
             "env": snap_env,
+            "profile": snap_profile,
         });
     }
     // Named database sources the team advertises (`sconce remote-source`), for
