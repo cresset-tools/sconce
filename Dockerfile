@@ -3,8 +3,9 @@
 # admin UI, and the in-process mirror worker. Postgres is the only dependency.
 #
 # Published multi-arch (linux/amd64 + linux/arm64) by
-# .github/workflows/build-docker.yml on Depot's native per-arch builders — no
-# QEMU, no cross-compile. This Dockerfile compiles natively on each arch.
+# .github/workflows/build-docker.yml, which builds each arch natively on its
+# own GitHub-hosted runner — no QEMU, no cross-compile. This Dockerfile
+# compiles natively on each arch.
 
 # Tracks rust-toolchain.toml (the toolchain file still wins at build time; this
 # only picks the base image). Bumps flow through PRs so the image stays pinned.
