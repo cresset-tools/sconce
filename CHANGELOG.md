@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.5.0...sconce-v0.6.0) (2026-07-18)
+
+
+### Features
+
+* **api:** add data profiles as a snapshot dimension (small|full|perf) ([#33](https://github.com/cresset-tools/sconce/issues/33)) ([708059d](https://github.com/cresset-tools/sconce/commit/708059d669d1078f4ecc82b266a6b29f3394e343))
+* **api:** advertise a per-remote database snapshot source in the team manifest ([#29](https://github.com/cresset-tools/sconce/issues/29)) ([dda3e39](https://github.com/cresset-tools/sconce/commit/dda3e39600f4876766e8be5ddb1b61a757aac00a))
+* **api:** advertise named database sources in the team manifest ([#32](https://github.com/cresset-tools/sconce/issues/32)) ([4d5a1c9](https://github.com/cresset-tools/sconce/commit/4d5a1c95be26fff753c3667535adc6b9e52a685e))
+* **api:** expose license-key merge in the management API ([7189da7](https://github.com/cresset-tools/sconce/commit/7189da79ad6c54b5bb22c47ff183000fcb818744))
+* **api:** expose license-key merge in the management API ([9f79e4e](https://github.com/cresset-tools/sconce/commit/9f79e4ea69ac8bc02bbe2715f66e23cd95aba623))
+* **api:** serve a git-remote-keyed team manifest (GET /api/v1/manifest) ([0c3f4d2](https://github.com/cresset-tools/sconce/commit/0c3f4d20b27ffbfed5147d898b8a023786e87b59))
+* **api:** serve a git-remote-keyed team manifest (GET /api/v1/manifest) ([ef03d63](https://github.com/cresset-tools/sconce/commit/ef03d631e2259f167269183df5cc85268f92e357))
+* **auth:** accept a set of introspect secrets for zero-downtime rotation ([59ff675](https://github.com/cresset-tools/sconce/commit/59ff6752e6de3de5ec5f54382df68a95392f8fbe))
+* **auth:** zero-downtime rotation for the introspect secret ([19ba5c6](https://github.com/cresset-tools/sconce/commit/19ba5c6296d8c55f91895108d650f8cb797e9289))
+* **publish:** zero-secret publishes from GitLab CI via id_tokens ([#34](https://github.com/cresset-tools/sconce/issues/34)) ([834db43](https://github.com/cresset-tools/sconce/commit/834db4351e8da655399a942169e6a27d835e3dcd))
+* **ui:** collapse a package's versions into one row on the Packages tab ([b6f8469](https://github.com/cresset-tools/sconce/commit/b6f84693978fcd24861e0f5eefb6b80fca9d70f4))
+* **ui:** collapse a package's versions into one row on the Packages tab ([94ed951](https://github.com/cresset-tools/sconce/commit/94ed9514a209b37d54f6dd7e9c70e789ae2e29d4))
+
+
+### Bug Fixes
+
+* **catalog:** stable newest-first snapshot ordering with a monotonic seq ([#31](https://github.com/cresset-tools/sconce/issues/31)) ([e6b9e81](https://github.com/cresset-tools/sconce/commit/e6b9e817d081d5d8f6769b4d29b3239deeba3d0f))
+
 ## [0.5.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.4.0...sconce-v0.5.0) (2026-07-09)
 
 
