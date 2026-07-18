@@ -92,11 +92,12 @@ mirror, so pushed and mirrored packages dedupe identically and get a stable
 `dist.shasum`; the new version lands in the normal approval queue and is
 **immutable** (re-publishing the same version with different bytes is rejected).
 
-Auth is **zero-secret via GitHub OIDC** — no upload password is stored anywhere.
+Auth is **zero-secret via CI OIDC** (GitHub Actions or GitLab CI) — no upload
+password is stored anywhere.
 
 1. **Add a publish CI policy** (admin UI → repo → *CI access* tab, or CLI). Pick
-   capability **publish**, issuer `https://token.actions.githubusercontent.com`,
-   an audience, and claim matchers (e.g. `repository=acme/app`, `ref=refs/tags/*`):
+   capability **publish**, the provider's issuer, an audience, and claim
+   matchers (e.g. `repository=acme/app`, `ref=refs/tags/*`):
 
    ```bash
    sconce ci-policy add --repo acme/tools --provider github \
@@ -131,7 +132,26 @@ Auth is **zero-secret via GitHub OIDC** — no upload password is stored anywher
    fetches a GitHub OIDC JWT, exchanges it at `POST /oauth/ci-publish` for a
    short-lived publish token, then uploads. `sconce publish <dir> --repo <org/repo>
    --url <base>` is also usable directly (pass a token via `--token` /
-   `SCONCE_PUBLISH_TOKEN` outside GitHub Actions).
+   `SCONCE_PUBLISH_TOKEN` outside CI OIDC).
+
+3. **Or publish from GitLab CI.** The job declares an ID token and `sconce
+   publish` picks the pre-issued JWT up from `$SCONCE_ID_TOKEN` (the policy's
+   issuer is `https://gitlab.com` — or your instance URL — with claim
+   matchers like `project_path=acme/tools`):
+
+   ```yaml
+   publish:
+     id_tokens:
+       SCONCE_ID_TOKEN:
+         aud: sconce
+     rules:
+       - if: $CI_COMMIT_TAG
+     script:
+       - curl --proto '=https' --tlsv1.2 -fLsS https://github.com/cresset-tools/sconce/releases/latest/download/sconce-installer.sh | sh
+       - export PATH="$HOME/.local/bin:$PATH"
+       - sconce publish . --repo acme/tools --url https://repo.example.com
+       # version defaults to the pushed tag; audience defaults to "sconce"
+   ```
 
 Large packages upload in **resumable chunks**, so a single request body limit
 (a proxy's 100 MB cap, say) isn't the ceiling — the client splits automatically.
