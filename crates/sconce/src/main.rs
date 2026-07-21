@@ -263,6 +263,36 @@ enum Command {
         database_url: String,
     },
 
+    /// Set (or clear) a team-shared `bougie make` task a registered remote's
+    /// manifest advertises. Every clone runs it (`bougie make <name>`), folded
+    /// between the framework built-in and the project's own tasks — so it
+    /// overrides the framework default but a project's own same-named task wins.
+    RemoteRecipe {
+        /// The project's git remote URL (any form; normalized).
+        remote: String,
+        /// Task name, e.g. `test`, `lint`, `deploy-check`.
+        name: String,
+        /// The shell script the task runs.
+        #[arg(long, conflicts_with = "clear")]
+        run: Option<String>,
+        /// Skip-if-exit-0 probe run before `run` (freshness gate).
+        #[arg(long)]
+        check: Option<String>,
+        /// A dependency: another task name, or a file path for freshness
+        /// (repeatable).
+        #[arg(long = "dep", value_name = "TASK_OR_PATH")]
+        deps: Vec<String>,
+        /// A path this task creates — skipped when newer than its deps
+        /// (repeatable).
+        #[arg(long = "creates", value_name = "PATH")]
+        creates: Vec<String>,
+        /// Remove this named task instead of setting it.
+        #[arg(long, conflicts_with = "run")]
+        clear: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Rename an organization. The old slug keeps redirecting (so composer.lock
     /// URLs still work) and is permanently retired.
     OrgRename {
@@ -1359,6 +1389,25 @@ fn main() -> Result<()> {
             remote_mysql.as_deref(),
             identity.as_deref(),
             port,
+            clear,
+            &database_url,
+        ),
+        Command::RemoteRecipe {
+            remote,
+            name,
+            run,
+            check,
+            deps,
+            creates,
+            clear,
+            database_url,
+        } => remote_recipe(
+            &remote,
+            &name,
+            run.as_deref(),
+            check.as_deref(),
+            &deps,
+            &creates,
             clear,
             &database_url,
         ),
@@ -2711,6 +2760,52 @@ fn remote_source(
             .context("setting source")?
         {
             println!("source '{name}' for {normalized}: {host}");
+        } else {
+            anyhow::bail!(
+                "remote '{normalized}' is not registered — run `sconce remote-add <org> {remote}` first"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_recipe(
+    remote: &str,
+    name: &str,
+    run: Option<&str>,
+    check: Option<&str>,
+    deps: &[String],
+    creates: &[String],
+    clear: bool,
+    database_url: &str,
+) -> Result<()> {
+    let normalized = sconce_catalog::normalize_git_remote(remote);
+    if normalized.is_empty() {
+        anyhow::bail!("'{remote}' does not look like a git remote URL");
+    }
+    with_catalog(database_url, async |catalog| {
+        if clear {
+            if catalog
+                .clear_remote_recipe(&normalized, name)
+                .await
+                .context("clearing recipe task")?
+            {
+                println!("recipe task '{name}' cleared for {normalized}");
+            } else {
+                println!("no such recipe task '{name}' on {normalized}");
+            }
+            return Ok(());
+        }
+        if run.is_none() {
+            anyhow::bail!("pass --run '<script>' to set the task (or --clear to remove it)");
+        }
+        if catalog
+            .set_remote_recipe(&normalized, name, run, check, deps, creates)
+            .await
+            .context("setting recipe task")?
+        {
+            println!("recipe task '{name}' for {normalized}");
         } else {
             anyhow::bail!(
                 "remote '{normalized}' is not registered — run `sconce remote-add <org> {remote}` first"

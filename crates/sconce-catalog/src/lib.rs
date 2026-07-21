@@ -417,6 +417,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0052_snapshot_profiles",
         include_str!("../migrations/0052_snapshot_profiles.sql"),
     ),
+    (
+        "0053_org_remote_recipes",
+        include_str!("../migrations/0053_org_remote_recipes.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -918,6 +922,19 @@ pub struct RemoteSource {
     pub remote_mysql: Option<String>,
     pub identity: Option<String>,
     pub port: Option<i32>,
+}
+
+/// A team-shared recipe task a team advertises in its manifest (set with
+/// `sconce remote-recipe`), folded into `bougie make`. Mirrors a `bougie-recipe`
+/// `TaskDef`: `run` is the shell script, `check` a skip-if-exit-0 probe,
+/// `deps`/`creates` the dependency + freshness path arrays.
+#[derive(Debug, Clone)]
+pub struct RemoteRecipe {
+    pub name: String,
+    pub run: Option<String>,
+    pub check: Option<String>,
+    pub deps: Vec<String>,
+    pub creates: Vec<String>,
 }
 
 /// A repository in the admin listing.
@@ -1985,6 +2002,78 @@ impl Catalog {
             "delete from org_remote_sources s \
              using org_remotes orm \
              where s.org_remote_id = orm.id and orm.remote = $1 and s.name = $2",
+        )
+        .bind(remote)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The team-shared recipe tasks a remote's manifest advertises (`sconce
+    /// remote-recipe`), sorted by name. Empty when none configured (or the
+    /// remote is unknown). Folded into `bougie make`.
+    pub async fn recipes_for_remote(&self, remote: &str) -> Result<Vec<RemoteRecipe>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select r.name, r.run, r.check_cmd, r.deps, r.creates \
+             from org_remote_recipes r \
+             join org_remotes orm on orm.id = r.org_remote_id \
+             where orm.remote = $1 \
+             order by r.name",
+        )
+        .bind(remote)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RemoteRecipe {
+                    name: row.try_get("name")?,
+                    run: row.try_get("run")?,
+                    check: row.try_get("check_cmd")?,
+                    deps: row.try_get("deps")?,
+                    creates: row.try_get("creates")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Set (upsert) a team-shared recipe task on a registered remote's manifest.
+    /// Returns `false` if the remote isn't registered (`remote-add` it first).
+    pub async fn set_remote_recipe(
+        &self,
+        remote: &str,
+        name: &str,
+        run: Option<&str>,
+        check: Option<&str>,
+        deps: &[String],
+        creates: &[String],
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "insert into org_remote_recipes \
+                 (org_remote_id, name, run, check_cmd, deps, creates) \
+             select orm.id, $2, $3, $4, $5, $6 from org_remotes orm where orm.remote = $1 \
+             on conflict (org_remote_id, name) do update set \
+                 run = excluded.run, check_cmd = excluded.check_cmd, \
+                 deps = excluded.deps, creates = excluded.creates",
+        )
+        .bind(remote)
+        .bind(name)
+        .bind(run)
+        .bind(check)
+        .bind(deps)
+        .bind(creates)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Remove a team-shared recipe task from a remote's manifest. Returns
+    /// `false` if no such `(remote, name)` task existed.
+    pub async fn clear_remote_recipe(&self, remote: &str, name: &str) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            "delete from org_remote_recipes r \
+             using org_remotes orm \
+             where r.org_remote_id = orm.id and orm.remote = $1 and r.name = $2",
         )
         .bind(remote)
         .bind(name)
@@ -7478,6 +7567,81 @@ mod tests {
             cat.org_for_remote(&remote).await.unwrap(),
             Some(cat.org_id_by_slug(&org).await.unwrap().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn remote_recipe_config_set_read_and_clear() {
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let pid = std::process::id();
+        let org = format!("recorg_{pid}");
+        cat.create_org(&org, None).await.expect("org");
+        let remote = normalize_git_remote(&format!("git@github.com:rec{pid}/shop.git"));
+
+        // Setting on an unregistered remote does nothing (register first).
+        assert!(
+            !cat.set_remote_recipe(&remote, "test", Some("phpunit"), None, &[], &[])
+                .await
+                .unwrap()
+        );
+        assert!(cat.recipes_for_remote(&remote).await.unwrap().is_empty());
+
+        // Register, then add two tasks — one with deps/check, one leaf.
+        cat.set_org_remote(&org, &remote).await.expect("register");
+        assert!(
+            cat.set_remote_recipe(
+                &remote,
+                "test",
+                Some("bougie run -- vendor/bin/phpunit"),
+                Some("test -f phpunit.xml"),
+                &["vendor".to_string(), "services".to_string()],
+                &["build/coverage".to_string()],
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            cat.set_remote_recipe(
+                &remote,
+                "lint",
+                Some("bougie format --check"),
+                None,
+                &[],
+                &[]
+            )
+            .await
+            .unwrap()
+        );
+
+        // Read back, sorted by name, arrays + optionals round-tripped.
+        let recipes = cat.recipes_for_remote(&remote).await.unwrap();
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].name, "lint");
+        assert_eq!(recipes[0].run.as_deref(), Some("bougie format --check"));
+        assert!(recipes[0].deps.is_empty());
+        assert_eq!(recipes[1].name, "test");
+        assert_eq!(recipes[1].check.as_deref(), Some("test -f phpunit.xml"));
+        assert_eq!(recipes[1].deps, vec!["vendor", "services"]);
+        assert_eq!(recipes[1].creates, vec!["build/coverage"]);
+
+        // Re-setting overwrites (new run, deps cleared).
+        assert!(
+            cat.set_remote_recipe(&remote, "test", Some("echo new"), None, &[], &[])
+                .await
+                .unwrap()
+        );
+        let recipes = cat.recipes_for_remote(&remote).await.unwrap();
+        let test = recipes.iter().find(|r| r.name == "test").unwrap();
+        assert_eq!(test.run.as_deref(), Some("echo new"));
+        assert!(test.deps.is_empty());
+
+        // Clearing one leaves the other; idempotent (true then false).
+        assert!(cat.clear_remote_recipe(&remote, "test").await.unwrap());
+        assert!(!cat.clear_remote_recipe(&remote, "test").await.unwrap());
+        let recipes = cat.recipes_for_remote(&remote).await.unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].name, "lint");
     }
 
     #[tokio::test]

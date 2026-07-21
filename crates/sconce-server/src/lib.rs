@@ -839,6 +839,29 @@ async fn get_manifest(
             .collect();
         body["sources"] = serde_json::Value::Object(map);
     }
+    // Team-shared recipe tasks (`sconce remote-recipe`), folded into `bougie
+    // make` between the framework built-in and the project's own tasks. Each is
+    // a bougie-recipe TaskDef shape; `deps`/`creates` are always arrays so the
+    // client parses them straight in. Omitted when none.
+    let recipes = s.catalog.recipes_for_remote(&remote).await?;
+    if !recipes.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = recipes
+            .into_iter()
+            .map(|task| {
+                let mut obj = serde_json::Map::new();
+                if let Some(run) = task.run {
+                    obj.insert("run".to_string(), json!(run));
+                }
+                if let Some(check) = task.check {
+                    obj.insert("check".to_string(), json!(check));
+                }
+                obj.insert("deps".to_string(), json!(task.deps));
+                obj.insert("creates".to_string(), json!(task.creates));
+                (task.name, serde_json::Value::Object(obj))
+            })
+            .collect();
+        body["recipes"] = serde_json::Value::Object(map);
+    }
     Ok(Json(body))
 }
 
