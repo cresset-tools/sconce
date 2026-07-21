@@ -3723,6 +3723,9 @@ async fn add_ci(
             &claims,
             ttl,
             capability,
+            // Org-scoped read policies are opt-in via `sconce ci-policy add
+            // --scope org`; the UI form creates repo-scoped policies for now.
+            "repo",
         )
         .await
         .map_err(e500)?;

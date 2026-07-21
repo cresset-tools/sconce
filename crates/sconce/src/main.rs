@@ -840,6 +840,11 @@ enum CiPolicyAction {
         /// `publish` (upload package versions via the publish API).
         #[arg(long, default_value = "read")]
         capability: String,
+        /// Scope of a `read` token: `repo` (default — this repo only) or `org`
+        /// (every repo in the org, like a device login — what a team's CI needs
+        /// to `bougie sync` an app spanning many private package repos).
+        #[arg(long, default_value = "repo")]
+        scope: String,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -1442,6 +1447,7 @@ fn main() -> Result<()> {
                 claims,
                 ttl_secs,
                 capability,
+                scope,
                 database_url,
             } => ci_policy_add(
                 &repo,
@@ -1451,6 +1457,7 @@ fn main() -> Result<()> {
                 &claims,
                 ttl_secs,
                 &capability,
+                &scope,
                 &database_url,
             ),
             CiPolicyAction::List { repo, database_url } => ci_policy_list(&repo, &database_url),
@@ -3169,10 +3176,17 @@ fn ci_policy_add(
     claims: &[(String, String)],
     ttl_secs: i64,
     capability: &str,
+    scope: &str,
     database_url: &str,
 ) -> Result<()> {
     if !matches!(capability, "read" | "publish") {
         anyhow::bail!("--capability must be 'read' or 'publish'");
+    }
+    if !matches!(scope, "repo" | "org") {
+        anyhow::bail!("--scope must be 'repo' or 'org'");
+    }
+    if scope == "org" && capability != "read" {
+        anyhow::bail!("--scope org is only valid for --capability read");
     }
     let claims_json = serde_json::Value::Object(
         claims
@@ -3191,6 +3205,7 @@ fn ci_policy_add(
                 &claims_json,
                 ttl_secs,
                 capability,
+                scope,
             )
             .await
             .context("adding CI policy")?;
@@ -3207,9 +3222,21 @@ fn ci_policy_list(repo: &str, database_url: &str) -> Result<()> {
             .await
             .context("listing CI policies")?
         {
+            let scope = if p.capability == "read" {
+                format!("/{}", p.token_scope)
+            } else {
+                String::new()
+            };
             println!(
-                "{}  [{}]  iss={} aud={} ttl={}s  claims={}",
-                p.id, p.provider, p.issuer, p.audience, p.token_ttl_secs, p.claims
+                "{}  [{}] {}{}  iss={} aud={} ttl={}s  claims={}",
+                p.id,
+                p.provider,
+                p.capability,
+                scope,
+                p.issuer,
+                p.audience,
+                p.token_ttl_secs,
+                p.claims
             );
         }
         Ok(())
