@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.6.0...sconce-v0.7.0) (2026-07-21)
+
+
+### Features
+
+* **api:** advertise team-shared recipe tasks in the team manifest ([#38](https://github.com/cresset-tools/sconce/issues/38)) ([e21d20f](https://github.com/cresset-tools/sconce/commit/e21d20fd6499c99b3aa3cadaaeb8f5e16854fc1e))
+* **api:** org-scoped CI read tokens for zero-secret team CI ([#39](https://github.com/cresset-tools/sconce/issues/39)) ([168bb47](https://github.com/cresset-tools/sconce/commit/168bb476bbfe5976b3ae926052d3a7226b232ebe))
+* **api:** serve latest-snapshot metadata at snapshots/{env}/latest/info ([#36](https://github.com/cresset-tools/sconce/issues/36)) ([d0caac5](https://github.com/cresset-tools/sconce/commit/d0caac5b977de712f6c7abf7cd432f7ea4b2a4b4))
+
 ## [0.6.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.5.0...sconce-v0.6.0) (2026-07-18)
 
 
