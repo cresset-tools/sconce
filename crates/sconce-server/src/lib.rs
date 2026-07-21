@@ -476,14 +476,23 @@ struct CiExchange {
     jwt: String,
 }
 
+/// A CI policy match: the repo the policy is on, the workload label, the token
+/// TTL, and the read-token scope (`repo` / `org`).
+struct CiMatch {
+    repo_id: Uuid,
+    label: String,
+    ttl: i64,
+    token_scope: String,
+}
+
 /// Validate a CI OIDC JWT against the repo's policies of a given `capability`
 /// (signature via the issuer's JWKS, `iss`/`aud`/`exp`, then the claim matchers).
-/// Returns the first matching `(repo_id, workload label, token ttl)`, or `None`.
+/// Returns the first matching policy, or `None`.
 async fn ci_match(
     s: &AppState,
     req: &CiExchange,
     capability: &str,
-) -> Result<Option<(Uuid, String, i64)>, AppError> {
+) -> Result<Option<CiMatch>, AppError> {
     let (org, repo) = req.repository.split_once('/').ok_or(AppError::NotFound)?;
     let repo_id = s
         .catalog
@@ -512,24 +521,45 @@ async fn ci_match(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("ci")
             .to_owned();
-        return Ok(Some((repo_id, label, policy.token_ttl_secs)));
+        return Ok(Some(CiMatch {
+            repo_id,
+            label,
+            ttl: policy.token_ttl_secs,
+            token_scope: policy.token_scope,
+        }));
     }
     Ok(None)
 }
 
 /// Trade a CI OIDC JWT for a short-lived **read** token (zero stored secret) — the
 /// serving credential a Composer client uses. 401 if no `read` policy matches.
+/// The policy's `token_scope` decides whether the token authenticates only its
+/// repo (`repo`) or every repo in the org (`org`) — the latter is what a team's
+/// CI needs to `bougie sync` an app spanning many private package repos.
 async fn oauth_ci(
     State(s): State<AppState>,
     Json(req): Json<CiExchange>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     match ci_match(&s, &req, "read").await? {
-        Some((repo_id, label, ttl)) => {
-            let token = s.catalog.create_ci_token(repo_id, &label, ttl).await?;
+        Some(m) => {
+            let token = if m.token_scope == "org" {
+                let org_id = s
+                    .catalog
+                    .org_id_for_repo(m.repo_id)
+                    .await?
+                    .ok_or(AppError::NotFound)?;
+                s.catalog
+                    .create_org_ci_token(org_id, &m.label, m.ttl)
+                    .await?
+            } else {
+                s.catalog
+                    .create_ci_token(m.repo_id, &m.label, m.ttl)
+                    .await?
+            };
             Ok(Json(json!({
                 "access_token": token,
                 "token_type": "Bearer",
-                "expires_in": ttl,
+                "expires_in": m.ttl,
             })))
         }
         None => Err(AppError::Unauthorized),
@@ -543,12 +573,17 @@ async fn oauth_ci_publish(
     Json(req): Json<CiExchange>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     match ci_match(&s, &req, "publish").await? {
-        Some((repo_id, label, ttl)) => {
-            let token = s.catalog.create_publish_token(repo_id, &label, ttl).await?;
+        // Publish tokens are always repo-targeted; `token_scope` is a read-only
+        // concern and ignored here.
+        Some(m) => {
+            let token = s
+                .catalog
+                .create_publish_token(m.repo_id, &m.label, m.ttl)
+                .await?;
             Ok(Json(json!({
                 "access_token": token,
                 "token_type": "Bearer",
-                "expires_in": ttl,
+                "expires_in": m.ttl,
             })))
         }
         None => Err(AppError::Unauthorized),

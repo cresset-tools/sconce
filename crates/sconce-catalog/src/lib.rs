@@ -421,6 +421,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0053_org_remote_recipes",
         include_str!("../migrations/0053_org_remote_recipes.sql"),
     ),
+    (
+        "0054_ci_policy_scope",
+        include_str!("../migrations/0054_ci_policy_scope.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -700,6 +704,10 @@ pub struct CiPolicy {
     /// What the minted token can do: `"read"` (Composer serving) or `"publish"`
     /// (upload package versions). Selected by the matching exchange endpoint.
     pub capability: String,
+    /// Scope of the minted **read** token: `"repo"` (default — this repo only)
+    /// or `"org"` (every repo in the org, like a device login). Ignored for
+    /// `publish`, which is always repo-targeted.
+    pub token_scope: String,
 }
 
 /// The result of an immutable publish insert ([`Catalog::insert_pushed_version`]).
@@ -3233,11 +3241,13 @@ impl Catalog {
         claims: &Value,
         token_ttl_secs: i64,
         capability: &str,
+        token_scope: &str,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
             "insert into ci_oidc_policies \
-                 (repo_id, provider, issuer, audience, claims, token_ttl_secs, capability) \
-             values ($1, $2, $3, $4, $5, $6, $7) returning id",
+                 (repo_id, provider, issuer, audience, claims, token_ttl_secs, capability, \
+                  token_scope) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) returning id",
         )
         .bind(repo_id)
         .bind(provider)
@@ -3246,6 +3256,7 @@ impl Catalog {
         .bind(claims)
         .bind(token_ttl_secs)
         .bind(capability)
+        .bind(token_scope)
         .fetch_one(&self.pool)
         .await
     }
@@ -3253,7 +3264,8 @@ impl Catalog {
     /// A repo's CI OIDC policies.
     pub async fn ci_policies(&self, repo_id: Uuid) -> Result<Vec<CiPolicy>, sqlx::Error> {
         let rows = sqlx::query(
-            "select id, repo_id, provider, issuer, audience, claims, token_ttl_secs, capability \
+            "select id, repo_id, provider, issuer, audience, claims, token_ttl_secs, capability, \
+                    token_scope \
              from ci_oidc_policies where repo_id = $1 order by created_at",
         )
         .bind(repo_id)
@@ -3270,9 +3282,19 @@ impl Catalog {
                     claims: r.try_get("claims")?,
                     token_ttl_secs: r.try_get("token_ttl_secs")?,
                     capability: r.try_get("capability")?,
+                    token_scope: r.try_get("token_scope")?,
                 })
             })
             .collect()
+    }
+
+    /// The org that owns a repo, by repo id. Backs the org-scoped CI read-token
+    /// exchange (mint a token for the whole org, not just the policy's repo).
+    pub async fn org_id_for_repo(&self, repo_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("select org_id from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     /// Remove a CI OIDC policy by id, scoped to its repo. Returns whether one was
@@ -3301,6 +3323,31 @@ impl Catalog {
              ($1, $2, $3, now() + make_interval(secs => $4::double precision), 'ci')",
         )
         .bind(repo_id)
+        .bind(token_hash(&token))
+        .bind(label)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(token)
+    }
+
+    /// Mint a short-lived **org-scoped CI** token (`origin = 'ci'`) — valid for
+    /// every repo in the org (see [`Catalog::token_valid`]), like a device
+    /// login but from an OIDC read policy with `token_scope = 'org'`. Lets a
+    /// team's CI `bougie sync` an app that pulls many private package repos.
+    /// Same deprovisionable-workload posture as [`Catalog::create_ci_token`].
+    pub async fn create_org_ci_token(
+        &self,
+        org_id: Uuid,
+        label: &str,
+        ttl_secs: i64,
+    ) -> Result<String, sqlx::Error> {
+        let token = generate_token();
+        sqlx::query(
+            "insert into tokens (org_id, token_hash, label, expires_at, origin) values \
+             ($1, $2, $3, now() + make_interval(secs => $4::double precision), 'ci')",
+        )
+        .bind(org_id)
         .bind(token_hash(&token))
         .bind(label)
         .bind(ttl_secs)
@@ -7642,6 +7689,56 @@ mod tests {
         let recipes = cat.recipes_for_remote(&remote).await.unwrap();
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].name, "lint");
+    }
+
+    #[tokio::test]
+    async fn ci_read_policy_org_scope_mints_org_wide_token() {
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let pid = std::process::id();
+        let org = format!("ciorg_{pid}");
+        cat.create_org(&org, None).await.expect("org");
+        let repo_a = cat.create_repo(&org, "app").await.expect("repo a");
+        let repo_b = cat.create_repo(&org, "lib").await.expect("repo b");
+
+        // An org-scoped read policy on repo A round-trips its scope.
+        let claims = serde_json::json!({ "repository": format!("{org}/app") });
+        cat.add_ci_policy(
+            repo_a,
+            "github",
+            "https://iss",
+            "sconce",
+            &claims,
+            900,
+            "read",
+            "org",
+        )
+        .await
+        .expect("policy");
+        let policies = cat.ci_policies(repo_a).await.unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].capability, "read");
+        assert_eq!(policies[0].token_scope, "org");
+
+        // The org-scoped CI token `oauth_ci` mints for that policy authenticates
+        // *every* repo in the org, not just the policy's repo.
+        let org_id = cat.org_id_for_repo(repo_a).await.unwrap().unwrap();
+        let org_token = cat.create_org_ci_token(org_id, "ci", 900).await.unwrap();
+        assert!(cat.token_valid(repo_a, &org_token).await.unwrap());
+        assert!(
+            cat.token_valid(repo_b, &org_token).await.unwrap(),
+            "an org-scoped CI token must span sibling repos"
+        );
+
+        // A repo-scoped CI token (the default) authenticates only its own repo —
+        // this is exactly why org scope is needed for a multi-repo app CI.
+        let repo_token = cat.create_ci_token(repo_a, "ci", 900).await.unwrap();
+        assert!(cat.token_valid(repo_a, &repo_token).await.unwrap());
+        assert!(
+            !cat.token_valid(repo_b, &repo_token).await.unwrap(),
+            "a repo-scoped CI token must not span sibling repos"
+        );
     }
 
     #[tokio::test]
