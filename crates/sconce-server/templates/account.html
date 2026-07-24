@@ -1,5 +1,23 @@
 <h1>Account</h1>
 <p>Signed in as <strong>{{ email }}</strong>{% if is_superadmin %} (superadmin){% endif %}.</p>
+
+{% if !notice.is_empty() %}
+  <div class=okbanner><svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#127544 stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=9></circle><path d="M8 12l3 3 5-6"></path></svg><span>{{ notice }}</span></div>
+{% endif %}
+{% if !error.is_empty() %}
+  <div class=errbanner><svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#c0362c stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=9></circle><path d="M12 8v5M12 16h0"></path></svg><span>{{ error }}</span></div>
+{% endif %}
+
+<h2>Change password</h2>
+<p class=muted>Set a new password using your current one. This signs out your other
+  sessions but keeps you signed in here.</p>
+<form class=row method=post action=/account/password>
+  <p>Current password <input name=current type=password autocomplete=current-password required style="width:18em"></p>
+  <p>New password <input name=password type=password autocomplete=new-password minlength=8 required style="width:18em"></p>
+  <p>Confirm new password <input name=confirm type=password autocomplete=new-password minlength=8 required style="width:18em"></p>
+  <button>Change password</button>
+</form>
+
 <h2>Active sessions</h2>
 <p class=muted>Revoke any session to sign that device out. Revoking <em>this device</em>
   signs you out here.</p>

@@ -142,6 +142,7 @@ pub fn router(
         )
         .route("/logout", post(logout))
         .route("/account", get(account_page))
+        .route("/account/password", post(change_my_password))
         .route("/account/revoke", post(revoke_my_session))
         .route("/users", get(users_page).post(create_user))
         .route("/activity", get(activity_page))
@@ -391,6 +392,10 @@ const FORGOT_WINDOW: Duration = Duration::from_mins(15);
 /// already infeasible — 128-bit tokens — this just keeps it boring).
 const RESET_MAX_PER_IP: usize = 10;
 const RESET_WINDOW: Duration = Duration::from_mins(5);
+/// Password-change attempts per signed-in user per window — bounds guessing of
+/// the *current* password from an already-authenticated session.
+const PW_CHANGE_MAX: usize = 10;
+const PW_CHANGE_WINDOW: Duration = Duration::from_mins(5);
 /// Wrong single-tenant basic passwords per client address per window.
 const BASIC_MAX_FAILURES_PER_IP: usize = 10;
 const BASIC_WINDOW: Duration = Duration::from_mins(5);
@@ -1968,10 +1973,22 @@ async fn account_page(
     Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
+    render_account(&s, &user, &headers, "", "").await
+}
+
+/// Render `/account` for the signed-in user. `notice`/`error` (empty = none) show
+/// inline banners; the GET view and the password-change POST both reuse this.
+async fn render_account(
+    s: &Ui,
+    user: &CurrentUser,
+    headers: &HeaderMap,
+    notice: &str,
+    error: &str,
+) -> Result<Html<String>, StatusCode> {
     let Some(uid) = user.id else {
         return Ok(shell(
-            &s,
-            &user,
+            s,
+            user,
             "Account",
             "<h1>Account</h1><p class=muted>Single-tenant mode uses HTTP-basic admin auth — \
              there's no per-user account here.</p>",
@@ -1983,7 +2000,7 @@ async fn account_page(
         .await
         .map_err(e500)?
         .unwrap_or_default();
-    let current = session_cookie(&headers);
+    let current = session_cookie(headers);
     let sessions = s
         .catalog
         .list_sessions(uid, current.as_deref())
@@ -1992,6 +2009,8 @@ async fn account_page(
     let view = views::Account {
         email,
         is_superadmin: user.is_superadmin,
+        notice: notice.to_owned(),
+        error: error.to_owned(),
         sessions: sessions
             .into_iter()
             .map(|sn| views::SessionRow {
@@ -2002,7 +2021,75 @@ async fn account_page(
             })
             .collect(),
     };
-    Ok(shell(&s, &user, "Account", &view.render().map_err(e500)?))
+    Ok(shell(s, user, "Account", &view.render().map_err(e500)?))
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordForm {
+    current: String,
+    password: String,
+    confirm: String,
+}
+
+/// Self-service password change: verify the current password, validate the new
+/// one, update it, and sign out the user's other sessions. Reuses the same
+/// hashing as `/reset`, gated by the current password instead of an email token
+/// (so it needs no SMTP).
+async fn change_my_password(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Form(f): Form<ChangePasswordForm>,
+) -> Result<Response, StatusCode> {
+    // Only real accounts have a password to change (single-tenant uses basic auth).
+    let uid = user.id.ok_or(StatusCode::FORBIDDEN)?;
+    if !s
+        .limiter
+        .allow(&format!("pwchange:{uid}"), PW_CHANGE_MAX, PW_CHANGE_WINDOW)
+    {
+        return Ok(too_many_attempts());
+    }
+    let err = if f.password.chars().count() < MIN_PASSWORD_LEN {
+        Some("New password must be at least 8 characters.")
+    } else if f.password != f.confirm {
+        Some("The new passwords didn't match.")
+    } else if f.password == f.current {
+        Some("Your new password must be different from your current one.")
+    } else {
+        None
+    };
+    if let Some(e) = err {
+        return Ok(render_account(&s, &user, &headers, "", e)
+            .await?
+            .into_response());
+    }
+    // Keep this device signed in; every other session is revoked.
+    let keep = session_cookie(&headers);
+    match s
+        .catalog
+        .change_password(uid, &f.current, &f.password, keep.as_deref())
+        .await
+        .map_err(e500)?
+    {
+        sconce_catalog::PasswordChange::WrongCurrent => Ok(render_account(
+            &s,
+            &user,
+            &headers,
+            "",
+            "Your current password is incorrect.",
+        )
+        .await?
+        .into_response()),
+        sconce_catalog::PasswordChange::Changed => Ok(render_account(
+            &s,
+            &user,
+            &headers,
+            "Password changed. Your other sessions have been signed out.",
+            "",
+        )
+        .await?
+        .into_response()),
+    }
 }
 
 #[derive(Deserialize)]

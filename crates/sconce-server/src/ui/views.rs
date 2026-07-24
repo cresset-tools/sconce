@@ -149,6 +149,10 @@ pub struct SessionRow {
 pub struct Account {
     pub email: String,
     pub is_superadmin: bool,
+    /// Success banner after a password change (empty = none).
+    pub notice: String,
+    /// Error banner, e.g. a wrong current password (empty = none).
+    pub error: String,
     pub sessions: Vec<SessionRow>,
 }
 
