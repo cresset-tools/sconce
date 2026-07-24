@@ -336,7 +336,10 @@ fn basic_password(headers: &HeaderMap) -> Option<String> {
 fn basic_challenge() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"sconce admin\"")],
+        [(
+            header::WWW_AUTHENTICATE,
+            "Basic realm=\"Bougie Repo admin\"",
+        )],
     )
         .into_response()
 }

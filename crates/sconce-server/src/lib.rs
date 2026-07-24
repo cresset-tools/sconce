@@ -302,7 +302,7 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"sconce\"")],
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"Bougie Repo\"")],
     )
         .into_response()
 }
