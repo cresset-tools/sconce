@@ -723,6 +723,15 @@ pub enum PublishOutcome {
     Conflict,
 }
 
+/// The result of a self-service password change ([`Catalog::change_password`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordChange {
+    /// The password was updated and the user's other sessions were revoked.
+    Changed,
+    /// The supplied current password didn't match (or the user is gone).
+    WrongCurrent,
+}
+
 /// A chunked-upload session ([`Catalog::create_upload_session`] /
 /// [`Catalog::create_snapshot_upload_session`]). `kind` discriminates: a
 /// `"package"` session carries `vendor`/`name`/`version`, a `"snapshot"` session
@@ -3194,6 +3203,60 @@ impl Catalog {
             .await?;
         tx.commit().await?;
         Ok(Some(user_id))
+    }
+
+    /// Change a signed-in user's password after verifying their *current* one —
+    /// the self-service counterpart to [`Self::reset_password`], gated by the
+    /// current password instead of an email token (so it needs no SMTP). On
+    /// success writes the new hash and revokes every *other* session, keeping
+    /// `keep_token`'s so the caller stays signed in. Returns
+    /// [`PasswordChange::WrongCurrent`] if the current password doesn't match.
+    pub async fn change_password(
+        &self,
+        user_id: Uuid,
+        current_password: &str,
+        new_password: &str,
+        keep_token: Option<&str>,
+    ) -> Result<PasswordChange, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Lock the row so a concurrent change can't race the verify → write.
+        let hash: Option<String> =
+            sqlx::query_scalar("select password_hash from users where id = $1 for update")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(hash) = hash else {
+            tx.rollback().await?;
+            return Ok(PasswordChange::WrongCurrent);
+        };
+        if !verify_password(current_password, &hash) {
+            tx.rollback().await?;
+            return Ok(PasswordChange::WrongCurrent);
+        }
+        sqlx::query("update users set password_hash = $2 where id = $1")
+            .bind(user_id)
+            .bind(hash_password(new_password))
+            .execute(&mut *tx)
+            .await?;
+        // Sign out every *other* session; the caller's own survives (if given) so
+        // they aren't bounced to the login page mid-change.
+        match keep_token {
+            Some(t) => {
+                sqlx::query("delete from sessions where user_id = $1 and token_hash <> $2")
+                    .bind(user_id)
+                    .bind(token_hash(t))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            None => {
+                sqlx::query("delete from sessions where user_id = $1")
+                    .bind(user_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(PasswordChange::Changed)
     }
 
     /// A SCIM member's `(email, active)` by id within an org.
@@ -8799,6 +8862,65 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn change_password_round_trip() {
+        let Some((cat, _)) = repo().await else {
+            return;
+        };
+        let email = format!("cp{}@x.io", std::process::id());
+        let uid = cat
+            .create_user(&email, "old-password", false)
+            .await
+            .unwrap();
+        // The caller's session (kept) plus another device (revoked on change).
+        let mine = cat.create_session(uid, 7).await.unwrap();
+        let other = cat.create_session(uid, 7).await.unwrap();
+
+        // Wrong current password: no change, no session revoked.
+        assert_eq!(
+            cat.change_password(uid, "nope", "new-password", Some(&mine))
+                .await
+                .unwrap(),
+            PasswordChange::WrongCurrent
+        );
+        assert_eq!(
+            cat.verify_credentials(&email, "old-password")
+                .await
+                .unwrap(),
+            Some(uid)
+        );
+        assert!(cat.resolve_session(&other).await.unwrap().is_some());
+
+        // Correct current password: new one works, old one doesn't.
+        assert_eq!(
+            cat.change_password(uid, "old-password", "new-password", Some(&mine))
+                .await
+                .unwrap(),
+            PasswordChange::Changed
+        );
+        assert_eq!(
+            cat.verify_credentials(&email, "new-password")
+                .await
+                .unwrap(),
+            Some(uid)
+        );
+        assert!(
+            cat.verify_credentials(&email, "old-password")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The caller's own session survives; every other session is signed out.
+        assert!(
+            cat.resolve_session(&mine).await.unwrap().is_some(),
+            "kept session survives"
+        );
+        assert!(
+            cat.resolve_session(&other).await.unwrap().is_none(),
+            "other sessions revoked"
         );
     }
 
