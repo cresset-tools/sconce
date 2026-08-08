@@ -32,11 +32,12 @@
       {% endif %}
       <div><label>Email</label>
         <input class=mono name=email type=email placeholder="you@studio.com" required autofocus></div>
-      <div>
-        <div class=pwhead><label>Password</label><a class=forgot href="/forgot">Forgot?</a></div>
+      <div class=pwfield>
+        <label>Password</label>
         <div class=pwwrap>
           <input name=password type=password placeholder="••••••••" required>
-          <button type=button id=pwtoggle class=pwtoggle>Show</button></div></div>
+          <button type=button id=pwtoggle class=pwtoggle>Show</button></div>
+        <a class=forgot href="/forgot">Forgot?</a></div>
       <button id=loginsubmit class=primary type=submit>Sign in</button>
     </form>
     <script src=/assets/login.js></script>

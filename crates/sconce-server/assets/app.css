@@ -695,6 +695,28 @@ pre code {
 .pwhead label {
   margin-bottom: 0;
 }
+/* sign-in password field: "Forgot?" sits after the input in the DOM so Tab runs
+   email -> password; the grid puts it back on the label row visually. */
+.pwfield {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "label forgot"
+    "input input";
+  align-items: baseline;
+  row-gap: 6px;
+}
+.pwfield > label {
+  grid-area: label;
+  margin-bottom: 0;
+}
+.pwfield > .pwwrap {
+  grid-area: input;
+}
+.pwfield > .forgot {
+  grid-area: forgot;
+  justify-self: end;
+}
 .forgot {
   font-size: 11.5px;
   font-weight: 600;
