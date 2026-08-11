@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.0...sconce-v0.7.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* **console:** keep Tab going from email straight to password on sign-in ([e552963](https://github.com/cresset-tools/sconce/commit/e55296333d8fb4b9a912df1a027ea09ebf292a7f))
+
 ## [0.7.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.6.0...sconce-v0.7.0) (2026-07-24)
 
 
