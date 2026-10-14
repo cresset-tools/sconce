@@ -1837,10 +1837,15 @@ fn mirror_package(
         for (ver, reason) in &report.skipped {
             println!("  - {ver}: {reason}");
         }
+        for (ver, reason) in &report.conflicts {
+            println!("  ! {ver}: {reason} (stored version kept)");
+        }
         println!(
-            "mirrored {} version(s), skipped {}",
+            "mirrored {} version(s), {} unchanged, skipped {}, {} conflict(s)",
             report.mirrored.len(),
-            report.skipped.len()
+            report.unchanged,
+            report.skipped.len(),
+            report.conflicts.len()
         );
         Ok::<_, anyhow::Error>(())
     })
@@ -1871,11 +1876,16 @@ fn mirror_registry(upstream: uuid::Uuid, cas: Option<&Path>, database_url: &str)
         for (item, reason) in &report.skipped {
             println!("  - {item}: {reason}");
         }
+        for (item, reason) in &report.conflicts {
+            println!("  ! {item}: {reason} (stored version kept)");
+        }
         println!(
-            "mirrored {} version(s) across {} package(s); {} skipped",
+            "mirrored {} version(s) across {} package(s); {} unchanged, {} skipped, {} conflict(s)",
             report.mirrored.len(),
             by_pkg.len(),
-            report.skipped.len()
+            report.unchanged,
+            report.skipped.len(),
+            report.conflicts.len()
         );
         Ok::<_, anyhow::Error>(())
     })
@@ -2032,10 +2042,13 @@ async fn run_job(
                 .upstream_id
                 .ok_or_else(|| bad_job("job missing upstream_id"))?;
             let r = sconce_mirror::mirror_upstream(catalog, store, uid, key).await?;
+            log_conflicts(&r);
             Ok(format!(
-                "{} mirrored, {} skipped",
+                "{} mirrored, {} unchanged, {} skipped, {} conflict(s)",
                 r.mirrored.len(),
-                r.skipped.len()
+                r.unchanged,
+                r.skipped.len(),
+                r.conflicts.len()
             ))
         }
         "mirror_package" => {
@@ -2047,7 +2060,13 @@ async fn run_job(
                 .as_deref()
                 .ok_or_else(|| bad_job("job missing package"))?;
             let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg).await?;
-            Ok(format!("{pkg}: {} version(s)", r.mirrored.len()))
+            log_conflicts(&r);
+            Ok(format!(
+                "{pkg}: {} version(s), {} unchanged, {} conflict(s)",
+                r.mirrored.len(),
+                r.unchanged,
+                r.conflicts.len()
+            ))
         }
         "resolve_closure" => {
             let rid = job.repo_id.ok_or_else(|| bad_job("job missing repo_id"))?;
@@ -2063,6 +2082,14 @@ async fn run_job(
             Ok(format!("resolved {} dependencies", plan.len()))
         }
         other => Err(bad_job(format!("unknown job kind: {other}"))),
+    }
+}
+
+/// Surface each immutability conflict from a background sync: the job summary
+/// only carries the count.
+fn log_conflicts(report: &sconce_mirror::Report) {
+    for (item, reason) in &report.conflicts {
+        tracing::warn!(version = %item, reason = %reason, "upstream changed a mirrored version; stored version kept");
     }
 }
 

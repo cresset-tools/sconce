@@ -172,6 +172,12 @@ pub struct Report {
     pub mirrored: Vec<Mirrored>,
     /// `(tag, reason)` for tags that were skipped.
     pub skipped: Vec<(String, String)>,
+    /// Versions already stored and unchanged upstream (not downloaded again).
+    pub unchanged: usize,
+    /// `("vendor/name version", reason)` for versions the upstream now serves
+    /// differently from what is stored. The stored version is kept: once a
+    /// version is mirrored its bytes never change.
+    pub conflicts: Vec<(String, String)>,
 }
 
 /// Mirror every tagged version of the git repository at `repo_path` into the
@@ -354,6 +360,8 @@ async fn mirror_composer_registry(
             Ok(r) => {
                 report.mirrored.extend(r.mirrored);
                 report.skipped.extend(r.skipped);
+                report.unchanged += r.unchanged;
+                report.conflicts.extend(r.conflicts);
             }
             // Don't let one bad package abort a large registry mirror. (A terminal
             // failure already flagged that package broken inside the call.)
@@ -431,6 +439,7 @@ async fn mirror_one_composer_package(
     result
 }
 
+#[allow(clippy::too_many_lines)]
 async fn mirror_one_composer_package_inner(
     catalog: &Catalog,
     store: &(impl BlobStore + Sync),
@@ -459,6 +468,14 @@ async fn mirror_one_composer_package_inner(
         .map(serde_json::Value::Object)
         .collect();
 
+    // Mirrored versions are immutable: compare against what is stored first, so
+    // an unchanged version costs no download and a changed one is reported
+    // instead of replacing bytes Composer clients have locked.
+    let stored = catalog
+        .stored_dists(up.repo_id, package)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
+
     let mut report = Report::default();
     for obj in &versions {
         let version = obj.get("version").and_then(serde_json::Value::as_str);
@@ -476,6 +493,10 @@ async fn mirror_one_composer_package_inner(
             .and_then(|d| d.get("shasum"))
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty());
+        let reference = dist
+            .and_then(|d| d.get("reference"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty());
         let (Some(version), Some(normalized), Some(dist_url)) = (version, normalized, dist_url)
         else {
             // No dist (e.g. some metapackages) → nothing to store.
@@ -490,6 +511,16 @@ async fn mirror_one_composer_package_inner(
             report
                 .skipped
                 .push((version.to_owned(), "below version floor".to_owned()));
+            continue;
+        }
+
+        if let Some(existing) = stored.get(normalized) {
+            match upstream_change(existing, shasum, reference) {
+                None => report.unchanged += 1,
+                Some(reason) => report
+                    .conflicts
+                    .push((format!("{package} {version}"), reason.to_owned())),
+            }
             continue;
         }
 
@@ -526,20 +557,35 @@ async fn mirror_one_composer_package_inner(
             .set_package_upstream(package_id, up.id)
             .await
             .map_err(|e| Error::Catalog(Box::new(e)))?;
-        catalog
-            .upsert_package_version(
+        let outcome = catalog
+            .insert_mirrored_version(
                 package_id,
                 version,
                 normalized,
                 &stability,
                 obj, // the p2 object is the package metadata; serving injects dist
-                Some(blob.as_bytes()),
-                Some(&actual_shasum),
-                None,
-                None,
+                blob.as_bytes(),
+                &actual_shasum,
+                reference,
             )
             .await
             .map_err(|e| Error::Catalog(Box::new(e)))?;
+        // A concurrent sync can insert the version between the lookup above and
+        // this insert; the insert itself decides, so the race stays immutable.
+        match outcome {
+            sconce_catalog::PublishOutcome::Created => {}
+            sconce_catalog::PublishOutcome::AlreadyPublished => {
+                report.unchanged += 1;
+                continue;
+            }
+            sconce_catalog::PublishOutcome::Conflict => {
+                report.conflicts.push((
+                    format!("{package} {version}"),
+                    "dist bytes differ from the stored version".to_owned(),
+                ));
+                continue;
+            }
+        }
 
         report.mirrored.push(Mirrored {
             tag: version.to_owned(),
@@ -549,6 +595,27 @@ async fn mirror_one_composer_package_inner(
         });
     }
     Ok(report)
+}
+
+/// Why the upstream's current dist for a version no longer matches what is
+/// stored, or `None` when it is unchanged. The shasum decides when the upstream
+/// publishes one; otherwise the `dist.reference` (Packagist's commit sha). With
+/// neither there is nothing to compare, and the stored version stands.
+fn upstream_change(
+    stored: &sconce_catalog::StoredDist,
+    shasum: Option<&str>,
+    reference: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(shasum) = shasum {
+        return (stored.shasum.as_deref() != Some(shasum))
+            .then_some("upstream dist shasum changed since it was mirrored");
+    }
+    match (stored.reference.as_deref(), reference) {
+        (Some(stored), Some(upstream)) if stored != upstream => {
+            Some("upstream dist reference changed since it was mirrored")
+        }
+        _ => None,
+    }
 }
 
 /// Cap on the dependency closure size (safety against a runaway graph).
@@ -1973,6 +2040,192 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// Re-syncing an unchanged upstream downloads nothing: stored versions are
+    /// compared by shasum and counted as unchanged.
+    #[tokio::test]
+    async fn composer_resync_skips_unchanged_versions_without_downloading() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        let (_repo_id, up) = composer_fixture_repo(&catalog, &server, "resync").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/stable";
+        let zip = b"PK\x03\x04stable-1.0.0".to_vec();
+        server.set("/dist/acme/stable-1.0.0.zip", zip.clone());
+        server.set(
+            "/p2/acme/stable.json",
+            p2_document(
+                name,
+                &[p2_version(
+                    &server,
+                    name,
+                    "1.0.0",
+                    "/dist/acme/stable-1.0.0.zip",
+                    &sha1_hex(&zip),
+                )],
+            ),
+        );
+
+        let first = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(first.mirrored.len(), 1);
+        let second = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert!(second.mirrored.is_empty());
+        assert_eq!(second.unchanged, 1);
+        assert!(second.conflicts.is_empty());
+        assert_eq!(
+            server.hits("/dist/acme/stable-1.0.0.zip"),
+            1,
+            "the unchanged dist is not downloaded again"
+        );
+
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// Once mirrored, a version's bytes never change: an upstream that later
+    /// serves different bytes for it is reported as a conflict and the stored
+    /// version is kept, while genuinely new versions still mirror.
+    #[tokio::test]
+    async fn composer_upstream_changing_a_version_is_a_conflict() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        let (repo_id, up) = composer_fixture_repo(&catalog, &server, "frozen").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/frozen";
+        let original = b"PK\x03\x04frozen-1.0.0".to_vec();
+        server.set("/dist/acme/frozen-1.0.0.zip", original.clone());
+        server.set(
+            "/p2/acme/frozen.json",
+            p2_document(
+                name,
+                &[p2_version(
+                    &server,
+                    name,
+                    "1.0.0",
+                    "/dist/acme/frozen-1.0.0.zip",
+                    &sha1_hex(&original),
+                )],
+            ),
+        );
+        mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+
+        // Upstream rebuilds 1.0.0 with different bytes, and releases 1.1.0.
+        let rebuilt = b"PK\x03\x04frozen-1.0.0-rebuilt".to_vec();
+        let newer = b"PK\x03\x04frozen-1.1.0".to_vec();
+        server.set("/dist/acme/frozen-1.0.0.zip", rebuilt.clone());
+        server.set("/dist/acme/frozen-1.1.0.zip", newer.clone());
+        server.set(
+            "/p2/acme/frozen.json",
+            p2_document(
+                name,
+                &[
+                    p2_version(
+                        &server,
+                        name,
+                        "1.0.0",
+                        "/dist/acme/frozen-1.0.0.zip",
+                        &sha1_hex(&rebuilt),
+                    ),
+                    p2_version(
+                        &server,
+                        name,
+                        "1.1.0",
+                        "/dist/acme/frozen-1.1.0.zip",
+                        &sha1_hex(&newer),
+                    ),
+                ],
+            ),
+        );
+        let report = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        assert_eq!(report.conflicts[0].0, "acme/frozen 1.0.0");
+        assert_eq!(report.mirrored.len(), 1);
+        assert_eq!(report.mirrored[0].tag, "1.1.0");
+        assert_eq!(
+            server.hits("/dist/acme/frozen-1.0.0.zip"),
+            1,
+            "a changed version is detected from metadata, without downloading it"
+        );
+
+        let versions = catalog.package_versions(repo_id, name).await.unwrap();
+        let v1 = versions.iter().find(|v| v.version == "1.0.0").unwrap();
+        assert_eq!(
+            v1.dist_shasum.as_deref(),
+            Some(sha1_hex(&original).as_str())
+        );
+        let id = sconce_cas::BlobId::from_bytes(v1.dist_blob_sha256.unwrap());
+        assert_eq!(
+            store.get(&id).unwrap().unwrap(),
+            original,
+            "stored bytes kept"
+        );
+
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// Without a published shasum (Packagist), the `dist.reference` decides: the
+    /// same commit is unchanged, a moved tag is a conflict.
+    #[tokio::test]
+    async fn composer_without_shasum_compares_dist_reference() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        let (_repo_id, up) = composer_fixture_repo(&catalog, &server, "ref").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/zipref";
+        let path = "/dist/acme/zipref-1.0.0.zip";
+        server.set(path, b"PK\x03\x04zipref".to_vec());
+        let document = |reference: &str| {
+            let mut v = p2_version(&server, name, "1.0.0", path, "");
+            v["dist"]["reference"] = serde_json::json!(reference);
+            p2_document(name, &[v])
+        };
+
+        server.set("/p2/acme/zipref.json", document("aaaa"));
+        let first = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(first.mirrored.len(), 1);
+
+        let same = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(same.unchanged, 1);
+        assert!(same.conflicts.is_empty());
+
+        server.set("/p2/acme/zipref.json", document("bbbb"));
+        let moved = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(moved.conflicts.len(), 1, "{moved:?}");
+        assert_eq!(server.hits(path), 1);
 
         std::fs::remove_dir_all(&cas).ok();
     }

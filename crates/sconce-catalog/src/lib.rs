@@ -710,7 +710,8 @@ pub struct CiPolicy {
     pub token_scope: String,
 }
 
-/// The result of an immutable publish insert ([`Catalog::insert_pushed_version`]).
+/// The result of an immutable version insert ([`Catalog::insert_pushed_version`],
+/// [`Catalog::insert_mirrored_version`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
     /// A new `(package, version)` row was created.
@@ -721,6 +722,15 @@ pub enum PublishOutcome {
     /// The version already exists with **different** dist bytes — rejected, so
     /// published versions stay immutable.
     Conflict,
+}
+
+/// The dist identity already stored for one version ([`Catalog::stored_dists`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDist {
+    /// sha1 hex of the stored dist — Composer's `dist.shasum`.
+    pub shasum: Option<String>,
+    /// The upstream's `dist.reference` (usually a commit sha), when recorded.
+    pub reference: Option<String>,
 }
 
 /// The result of a self-service password change ([`Catalog::change_password`]).
@@ -4240,12 +4250,11 @@ impl Catalog {
     }
 
     /// Insert a **published** (pushed) version *immutably*. Unlike
-    /// [`Self::upsert_package_version`] — which overwrites on conflict, correct for
-    /// re-mirroring where the upstream is the source of truth — a published version
-    /// cannot be silently replaced: re-publishing identical dist bytes is an
-    /// idempotent no-op, and publishing *different* bytes for an existing version is
-    /// rejected. Returns which of the three happened; the caller maps it to
-    /// 201 / 200 / 409.
+    /// [`Self::upsert_package_version`] — which overwrites on conflict, still used
+    /// by the git mirror — a published version cannot be silently replaced:
+    /// re-publishing identical dist bytes is an idempotent no-op, and publishing
+    /// *different* bytes for an existing version is rejected. Returns which of the
+    /// three happened; the caller maps it to 201 / 200 / 409.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_pushed_version(
         &self,
@@ -4258,11 +4267,71 @@ impl Catalog {
         dist_shasum: &str,
         released_at_unix: i64,
     ) -> Result<PublishOutcome, sqlx::Error> {
+        self.insert_version_once(
+            package_id,
+            version,
+            normalized_version,
+            stability,
+            composer_json,
+            dist_blob_sha256,
+            dist_shasum,
+            None,
+            Some(released_at_unix),
+        )
+        .await
+    }
+
+    /// Insert a version mirrored from a **composer upstream**, with the same
+    /// immutability as [`Self::insert_pushed_version`]: the first bytes seen for a
+    /// version are kept, and an upstream that later serves different bytes for it
+    /// gets [`PublishOutcome::Conflict`] instead of replacing what Composer
+    /// clients have already locked. `source_reference` is the upstream's
+    /// `dist.reference`, which lets a later sync tell an unchanged version from a
+    /// re-tag when the upstream publishes no shasum.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_mirrored_version(
+        &self,
+        package_id: Uuid,
+        version: &str,
+        normalized_version: &str,
+        stability: &str,
+        composer_json: &Value,
+        dist_blob_sha256: &[u8; 32],
+        dist_shasum: &str,
+        source_reference: Option<&str>,
+    ) -> Result<PublishOutcome, sqlx::Error> {
+        self.insert_version_once(
+            package_id,
+            version,
+            normalized_version,
+            stability,
+            composer_json,
+            dist_blob_sha256,
+            dist_shasum,
+            source_reference,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_version_once(
+        &self,
+        package_id: Uuid,
+        version: &str,
+        normalized_version: &str,
+        stability: &str,
+        composer_json: &Value,
+        dist_blob_sha256: &[u8; 32],
+        dist_shasum: &str,
+        source_reference: Option<&str>,
+        released_at_unix: Option<i64>,
+    ) -> Result<PublishOutcome, sqlx::Error> {
         let inserted: Option<Uuid> = sqlx::query_scalar(
             "insert into package_versions \
                  (package_id, version, normalized_version, stability, composer_json, \
-                  dist_blob_sha256, dist_shasum, released_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::double precision)) \
+                  dist_blob_sha256, dist_shasum, source_reference, released_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::double precision)) \
              on conflict (package_id, normalized_version) do nothing \
              returning id",
         )
@@ -4273,6 +4342,7 @@ impl Catalog {
         .bind(composer_json)
         .bind(&dist_blob_sha256[..])
         .bind(dist_shasum)
+        .bind(source_reference)
         .bind(released_at_unix)
         .fetch_optional(&self.pool)
         .await?;
@@ -4295,6 +4365,31 @@ impl Catalog {
             }
             _ => Ok(PublishOutcome::Conflict),
         }
+    }
+
+    /// What is already stored for each version of `name` in `repo_id`, keyed by
+    /// normalized version — including yanked ones, which are still occupied
+    /// versions. A mirror sync compares these against the upstream to skip
+    /// unchanged versions without downloading them.
+    pub async fn stored_dists(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+    ) -> Result<std::collections::HashMap<String, StoredDist>, sqlx::Error> {
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "select pv.normalized_version, pv.dist_shasum, pv.source_reference \
+             from package_versions pv \
+             join packages p on p.id = pv.package_id \
+             where p.repo_id = $1 and p.name = $2",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(normalized, shasum, reference)| (normalized, StoredDist { shasum, reference }))
+            .collect())
     }
 
     /// Create a new read token for a repository: generate a high-entropy secret,
