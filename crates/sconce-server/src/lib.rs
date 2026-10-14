@@ -76,6 +76,9 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
         .route("/{org}/{repo}/dist/{*rest}", get(dist))
+        // Dist paths of an imported upstream, for existing composer.lock URLs.
+        // Registered as a catch-all: every more specific route wins.
+        .route("/{org}/{repo}/{*path}", get(upstream_dist))
         .route("/oauth/ci", post(oauth_ci))
         .route("/oauth/ci-publish", post(oauth_ci_publish))
         // Device authorization grant (RFC 8628) for `bougie login`: the CLI starts
@@ -412,14 +415,61 @@ async fn dist(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let _ = authorize(&s, loc.repo_id, &headers).await?;
+    let (access, _) = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
+    // Anything else under `dist/` may be an imported registry's own dist path
+    // (Satis archives to `dist/` by default).
     let file = rest.rsplit('/').next().ok_or(AppError::NotFound)?;
-    let hex = file.strip_suffix(".zip").ok_or(AppError::NotFound)?;
-    let sha = parse_hex32(hex).ok_or(AppError::NotFound)?;
-    let id = BlobId::from_bytes(sha);
+    let Some(sha) = file.strip_suffix(".zip").and_then(parse_hex32) else {
+        return serve_upstream_path(&s, loc.repo_id, &access, &format!("dist/{rest}")).await;
+    };
+    serve_blob(&s, BlobId::from_bytes(sha)).await
+}
 
+/// `GET /{org}/{repo}/{*path}` — a dist path as the repository's upstream served
+/// it (see [`sconce_catalog::Catalog::dist_by_upstream_path`]). `composer.lock`
+/// pins full dist URLs, so once an imported registry's domain points at this
+/// repository, existing lock files request the upstream's paths, e.g.
+/// `packages/mage-os/module-catalog-1.0.0.zip`. Paths that also match a more
+/// specific route (such as the 4-segment `packages/{vendor}/{name}/{version}`
+/// publish route) are taken by that route first.
+async fn upstream_dist(
+    State(s): State<AppState>,
+    Path((org, repo, path)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let loc = match locate(&s, &org, &repo, &path).await? {
+        Ok(loc) => loc,
+        Err(redirect) => return Ok(redirect),
+    };
+    let (access, _) = authorize(&s, loc.repo_id, &headers).await?;
+    serve_upstream_path(&s, loc.repo_id, &access, &path).await
+}
+
+/// Serve the dist recorded under an upstream path. The path is guessable, unlike
+/// a content address, so the package must be readable under `access`; an
+/// unreadable one is indistinguishable from a missing one.
+async fn serve_upstream_path(
+    s: &AppState,
+    repo_id: Uuid,
+    access: &Access,
+    path: &str,
+) -> Result<Response, AppError> {
+    let (name, sha) = s
+        .catalog
+        .dist_by_upstream_path(repo_id, path)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !access.allows(&name) {
+        return Err(AppError::NotFound);
+    }
+    serve_blob(s, BlobId::from_bytes(sha)).await
+}
+
+/// Answer with one dist blob: a presigned redirect on an object-store backend,
+/// the bytes themselves otherwise.
+async fn serve_blob(s: &AppState, id: BlobId) -> Result<Response, AppError> {
     // Object-store backend: authorize (above), then hand the client a
     // freshly-minted, short-lived presigned URL and let it pull bytes straight
     // from the store. The stable sconce URL is what `composer.lock` pins; the
@@ -1013,5 +1063,139 @@ mod tests {
         let hit = secret_digest("new");
         assert!(set.iter().any(|e| ct_eq(&hit, e)));
         assert!(!set.iter().any(|e| ct_eq(&secret_digest("other"), e)));
+    }
+
+    /// An imported upstream's own dist paths serve the verbatim bytes, so
+    /// `composer.lock` URLs written against the upstream keep installing; access
+    /// still follows the credential, and unknown paths are 404.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn serves_dists_under_their_upstream_paths() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let slug = format!("legacy{}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("sconce-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AnyBlobStore::open(Some(&dir)).unwrap();
+
+        // Two mirrored versions, each recorded under the path its upstream used:
+        // a Mage-OS style `packages/…` one and a Satis-default `dist/…` one.
+        let mut stored = Vec::new();
+        for (name, path) in [
+            (
+                "mage-os/module-catalog",
+                "packages/mage-os/module-catalog-1.0.0.zip",
+            ),
+            ("acme/satis", "dist/acme/satis/acme-satis-1.0.0-abc.zip"),
+        ] {
+            let bytes = format!("PK\x03\x04{name}").into_bytes();
+            let blob = store.put(&bytes).unwrap();
+            cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+            let pid = cat
+                .upsert_package(
+                    repo_id,
+                    name,
+                    "composer",
+                    None,
+                    sconce_catalog::Visibility::Public,
+                )
+                .await
+                .unwrap();
+            cat.insert_mirrored_version(
+                pid,
+                "1.0.0",
+                "1.0.0.0",
+                "stable",
+                &json!({ "name": name }),
+                blob.as_bytes(),
+                "unused",
+                None,
+                Some(path),
+            )
+            .await
+            .unwrap();
+            stored.push((name, path, bytes));
+        }
+
+        let read = cat.create_token(repo_id, Some("r"), None).await.unwrap();
+        // A license key entitled to the satis package only.
+        let (license, license_id) = cat.create_license_key(repo_id, None).await.unwrap();
+        cat.entitle_package(license_id, repo_id, "acme/satis")
+            .await
+            .unwrap();
+
+        let app = router(cat.clone(), store, "http://localhost".to_owned());
+        let get = |path: String, cred: &str| {
+            Request::builder()
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {cred}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        for (_, path, bytes) in &stored {
+            let r = app
+                .clone()
+                .oneshot(get(format!("/{slug}/r/{path}"), &read))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], &bytes[..], "{path} serves the verbatim bytes");
+        }
+
+        // No credential → 401, before anything about the path is revealed.
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{slug}/r/{}", stored[0].1))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        // The license key reads its entitled package, but the other path is 404.
+        let r = app
+            .clone()
+            .oneshot(get(format!("/{slug}/r/{}", stored[1].1), &license))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app
+            .clone()
+            .oneshot(get(format!("/{slug}/r/{}", stored[0].1), &license))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // Unknown paths are 404, and the regular routes still win.
+        let r = app
+            .clone()
+            .oneshot(get(format!("/{slug}/r/packages/nope-1.0.0.zip"), &read))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = app
+            .clone()
+            .oneshot(get(format!("/{slug}/r/packages.json"), &read))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

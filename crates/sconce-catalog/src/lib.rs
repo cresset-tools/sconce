@@ -425,6 +425,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0054_ci_policy_scope",
         include_str!("../migrations/0054_ci_policy_scope.sql"),
     ),
+    (
+        "0055_upstream_dist_path",
+        include_str!("../migrations/0055_upstream_dist_path.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -731,6 +735,8 @@ pub struct StoredDist {
     pub shasum: Option<String>,
     /// The upstream's `dist.reference` (usually a commit sha), when recorded.
     pub reference: Option<String>,
+    /// The dist's path on the upstream, relative to its base, when recorded.
+    pub upstream_dist_path: Option<String>,
 }
 
 /// The result of a self-service password change ([`Catalog::change_password`]).
@@ -4276,6 +4282,7 @@ impl Catalog {
             dist_blob_sha256,
             dist_shasum,
             None,
+            None,
             Some(released_at_unix),
         )
         .await
@@ -4287,7 +4294,9 @@ impl Catalog {
     /// gets [`PublishOutcome::Conflict`] instead of replacing what Composer
     /// clients have already locked. `source_reference` is the upstream's
     /// `dist.reference`, which lets a later sync tell an unchanged version from a
-    /// re-tag when the upstream publishes no shasum.
+    /// re-tag when the upstream publishes no shasum. `upstream_dist_path` is
+    /// where the dist lived on the upstream, relative to its base (see
+    /// [`Self::dist_by_upstream_path`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_mirrored_version(
         &self,
@@ -4299,6 +4308,7 @@ impl Catalog {
         dist_blob_sha256: &[u8; 32],
         dist_shasum: &str,
         source_reference: Option<&str>,
+        upstream_dist_path: Option<&str>,
     ) -> Result<PublishOutcome, sqlx::Error> {
         self.insert_version_once(
             package_id,
@@ -4309,9 +4319,62 @@ impl Catalog {
             dist_blob_sha256,
             dist_shasum,
             source_reference,
+            upstream_dist_path,
             None,
         )
         .await
+    }
+
+    /// Record the upstream dist path of an already-stored version that has none
+    /// yet — a version mirrored before the path was tracked. Never overwrites a
+    /// recorded path, so a version keeps answering at its first-seen path.
+    pub async fn backfill_upstream_dist_path(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+        normalized_version: &str,
+        upstream_dist_path: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update package_versions pv set upstream_dist_path = $4 \
+             from packages p \
+             where p.id = pv.package_id and p.repo_id = $1 and p.name = $2 \
+               and pv.normalized_version = $3 and pv.upstream_dist_path is null",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .bind(normalized_version)
+        .bind(upstream_dist_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve a dist path as the repository's upstream served it to the package
+    /// name and blob stored for it, so `composer.lock` files written against the
+    /// upstream keep installing once its domain points at this repository. Only
+    /// packages the repository itself owns are considered.
+    pub async fn dist_by_upstream_path(
+        &self,
+        repo_id: Uuid,
+        upstream_dist_path: &str,
+    ) -> Result<Option<(String, [u8; 32])>, sqlx::Error> {
+        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+            "select p.name, pv.dist_blob_sha256 \
+             from package_versions pv \
+             join packages p on p.id = pv.package_id \
+             where p.repo_id = $1 and pv.upstream_dist_path = $2 \
+             order by pv.id \
+             limit 1",
+        )
+        .bind(repo_id)
+        .bind(upstream_dist_path)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(name, blob)| {
+            let blob: [u8; 32] = blob?.try_into().ok()?;
+            Some((name, blob))
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4325,13 +4388,15 @@ impl Catalog {
         dist_blob_sha256: &[u8; 32],
         dist_shasum: &str,
         source_reference: Option<&str>,
+        upstream_dist_path: Option<&str>,
         released_at_unix: Option<i64>,
     ) -> Result<PublishOutcome, sqlx::Error> {
         let inserted: Option<Uuid> = sqlx::query_scalar(
             "insert into package_versions \
                  (package_id, version, normalized_version, stability, composer_json, \
-                  dist_blob_sha256, dist_shasum, source_reference, released_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::double precision)) \
+                  dist_blob_sha256, dist_shasum, source_reference, upstream_dist_path, \
+                  released_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10::double precision)) \
              on conflict (package_id, normalized_version) do nothing \
              returning id",
         )
@@ -4343,6 +4408,7 @@ impl Catalog {
         .bind(&dist_blob_sha256[..])
         .bind(dist_shasum)
         .bind(source_reference)
+        .bind(upstream_dist_path)
         .bind(released_at_unix)
         .fetch_optional(&self.pool)
         .await?;
@@ -4376,8 +4442,9 @@ impl Catalog {
         repo_id: Uuid,
         name: &str,
     ) -> Result<std::collections::HashMap<String, StoredDist>, sqlx::Error> {
-        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "select pv.normalized_version, pv.dist_shasum, pv.source_reference \
+        let rows = sqlx::query(
+            "select pv.normalized_version, pv.dist_shasum, pv.source_reference, \
+                    pv.upstream_dist_path \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
              where p.repo_id = $1 and p.name = $2",
@@ -4386,10 +4453,18 @@ impl Catalog {
         .bind(name)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(normalized, shasum, reference)| (normalized, StoredDist { shasum, reference }))
-            .collect())
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("normalized_version")?,
+                    StoredDist {
+                        shasum: row.try_get("dist_shasum")?,
+                        reference: row.try_get("source_reference")?,
+                        upstream_dist_path: row.try_get("upstream_dist_path")?,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Create a new read token for a repository: generate a high-entropy secret,

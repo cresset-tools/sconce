@@ -514,9 +514,21 @@ async fn mirror_one_composer_package_inner(
             continue;
         }
 
+        let upstream_dist_path = upstream_relative_path(base, dist_url);
+
         if let Some(existing) = stored.get(normalized) {
             match upstream_change(existing, shasum, reference) {
-                None => report.unchanged += 1,
+                None => {
+                    report.unchanged += 1;
+                    if let (None, Some(path)) =
+                        (&existing.upstream_dist_path, upstream_dist_path.as_deref())
+                    {
+                        catalog
+                            .backfill_upstream_dist_path(up.repo_id, package, normalized, path)
+                            .await
+                            .map_err(|e| Error::Catalog(Box::new(e)))?;
+                    }
+                }
                 Some(reason) => report
                     .conflicts
                     .push((format!("{package} {version}"), reason.to_owned())),
@@ -567,6 +579,7 @@ async fn mirror_one_composer_package_inner(
                 blob.as_bytes(),
                 &actual_shasum,
                 reference,
+                upstream_dist_path.as_deref(),
             )
             .await
             .map_err(|e| Error::Catalog(Box::new(e)))?;
@@ -595,6 +608,15 @@ async fn mirror_one_composer_package_inner(
         });
     }
     Ok(report)
+}
+
+/// `dist_url`'s path relative to the upstream `base` (no trailing slash), or
+/// `None` when the dist is hosted elsewhere — e.g. Packagist's GitHub zipballs.
+/// The query string is dropped: lock files are matched on the request path.
+fn upstream_relative_path(base: &str, dist_url: &str) -> Option<String> {
+    let rest = dist_url.strip_prefix(base)?.strip_prefix('/')?;
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    (!path.is_empty()).then(|| path.to_owned())
 }
 
 /// Why the upstream's current dist for a version no longer matches what is
@@ -2228,5 +2250,123 @@ mod tests {
         assert_eq!(server.hits(path), 1);
 
         std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// A mirrored version records its dist path on the upstream, so it can be
+    /// served there for existing lock files — including versions stored before
+    /// the path was tracked, which a re-sync backfills without downloading.
+    #[tokio::test]
+    async fn composer_mirror_records_and_backfills_upstream_dist_path() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        let (repo_id, up) = composer_fixture_repo(&catalog, &server, "path").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/paths";
+        let new_zip = b"PK\x03\x04paths-1.1.0".to_vec();
+        let old_zip = b"PK\x03\x04paths-1.0.0".to_vec();
+        server.set("/packages/acme/paths-1.1.0.zip", new_zip.clone());
+        server.set(
+            "/p2/acme/paths.json",
+            p2_document(
+                name,
+                &[
+                    p2_version(
+                        &server,
+                        name,
+                        "1.0.0",
+                        "/packages/acme/paths-1.0.0.zip",
+                        &sha1_hex(&old_zip),
+                    ),
+                    p2_version(
+                        &server,
+                        name,
+                        "1.1.0",
+                        "/packages/acme/paths-1.1.0.zip",
+                        &sha1_hex(&new_zip),
+                    ),
+                ],
+            ),
+        );
+
+        // 1.0.0 was mirrored before paths were tracked: stored, but no path.
+        let blob = store.put(&old_zip).unwrap();
+        catalog.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+        let pid = catalog
+            .upsert_package(repo_id, name, "composer", None, Visibility::Public)
+            .await
+            .unwrap();
+        catalog
+            .upsert_package_version(
+                pid,
+                "1.0.0",
+                "1.0.0.0",
+                "stable",
+                &serde_json::json!({ "name": name }),
+                Some(blob.as_bytes()),
+                Some(&sha1_hex(&old_zip)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let report = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.mirrored.len(), 1);
+        assert_eq!(server.hits("/packages/acme/paths-1.0.0.zip"), 0);
+
+        for (path, zip) in [
+            ("packages/acme/paths-1.0.0.zip", &old_zip),
+            ("packages/acme/paths-1.1.0.zip", &new_zip),
+        ] {
+            let (found, sha) = catalog
+                .dist_by_upstream_path(repo_id, path)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{path} recorded"));
+            assert_eq!(found, name);
+            assert_eq!(sha, *sconce_cas::BlobId::of(zip).as_bytes());
+        }
+
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    #[test]
+    fn upstream_relative_path_only_for_dists_on_the_upstream() {
+        let base = "https://repo.mage-os.org";
+        assert_eq!(
+            upstream_relative_path(
+                base,
+                "https://repo.mage-os.org/packages/mage-os/module-catalog-1.0.0.zip"
+            )
+            .as_deref(),
+            Some("packages/mage-os/module-catalog-1.0.0.zip")
+        );
+        assert_eq!(
+            upstream_relative_path(base, "https://repo.mage-os.org/dist/a/b.zip?token=x")
+                .as_deref(),
+            Some("dist/a/b.zip")
+        );
+        // Another host, or a host that merely starts with the base, is not ours.
+        assert_eq!(
+            upstream_relative_path(base, "https://api.github.com/repos/a/b/zipball/c"),
+            None
+        );
+        assert_eq!(
+            upstream_relative_path(base, "https://repo.mage-os.org.evil/x.zip"),
+            None
+        );
+        assert_eq!(
+            upstream_relative_path(base, "https://repo.mage-os.org/"),
+            None
+        );
     }
 }
