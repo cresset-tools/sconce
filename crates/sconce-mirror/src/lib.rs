@@ -469,11 +469,14 @@ async fn mirror_one_composer_package_inner(
         let dist_url = dist
             .and_then(|d| d.get("url"))
             .and_then(serde_json::Value::as_str);
+        // Packagist (and any registry serving VCS zipballs) publishes
+        // `"shasum": ""` — the zip is generated on demand, so there is no checksum
+        // to verify against. Treat empty the same as absent.
         let shasum = dist
             .and_then(|d| d.get("shasum"))
-            .and_then(serde_json::Value::as_str);
-        let (Some(version), Some(normalized), Some(dist_url), Some(shasum)) =
-            (version, normalized, dist_url, shasum)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
+        let (Some(version), Some(normalized), Some(dist_url)) = (version, normalized, dist_url)
         else {
             // No dist (e.g. some metapackages) → nothing to store.
             let v = version.unwrap_or("?").to_owned();
@@ -490,9 +493,12 @@ async fn mirror_one_composer_package_inner(
             continue;
         }
 
-        // Download verbatim and verify the upstream's sha1.
+        // Download verbatim and verify the upstream's sha1 when it publishes one.
+        // Without one, record the sha1 of the bytes we stored: that is what
+        // Composer verifies against from here on.
         let bytes = http_get_bytes(dist_url)?;
-        if sha1_hex(&bytes) != shasum {
+        let actual_shasum = sha1_hex(&bytes);
+        if shasum.is_some_and(|expected| expected != actual_shasum) {
             return Err(Error::ShasumMismatch {
                 package: package.to_owned(),
                 version: version.to_owned(),
@@ -528,7 +534,7 @@ async fn mirror_one_composer_package_inner(
                 &stability,
                 obj, // the p2 object is the package metadata; serving injects dist
                 Some(blob.as_bytes()),
-                Some(shasum),
+                Some(&actual_shasum),
                 None,
                 None,
             )
@@ -1743,6 +1749,231 @@ mod tests {
         assert_eq!(u.job_status.as_deref(), Some("ready"));
 
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// A minimal HTTP/1.1 server over a mutable `path → body` map, so the
+    /// composer-upstream path can be tested without the network. Counts requests
+    /// per path, so a test can assert whether a dist was downloaded.
+    struct FixtureServer {
+        base: String,
+        routes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+        hits: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    }
+
+    impl FixtureServer {
+        fn start() -> Self {
+            use std::io::{BufRead as _, BufReader, Write as _};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let routes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                Vec<u8>,
+            >::new()));
+            let hits = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                usize,
+            >::new()));
+            let (r, h) = (routes.clone(), hits.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    // Drain the headers; fixture requests never carry a body.
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        line.clear();
+                    }
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_owned();
+                    *h.lock().unwrap().entry(path.clone()).or_default() += 1;
+                    let body = r.lock().unwrap().get(&path).cloned();
+                    let head = match &body {
+                        Some(b) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            b.len()
+                        ),
+                        None => {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_owned()
+                        }
+                    };
+                    let _ = stream.write_all(head.as_bytes());
+                    if let Some(b) = body {
+                        let _ = stream.write_all(&b);
+                    }
+                }
+            });
+            Self { base, routes, hits }
+        }
+
+        fn set(&self, path: &str, body: impl Into<Vec<u8>>) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), body.into());
+        }
+
+        fn hits(&self, path: &str) -> usize {
+            self.hits.lock().unwrap().get(path).copied().unwrap_or(0)
+        }
+    }
+
+    /// A p2 version entry whose dist lives on the fixture server at `dist_path`.
+    fn p2_version(
+        server: &FixtureServer,
+        name: &str,
+        version: &str,
+        dist_path: &str,
+        shasum: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "version": version,
+            "version_normalized": format!("{version}.0"),
+            "type": "library",
+            "dist": {
+                "type": "zip",
+                "url": format!("{}{dist_path}", server.base),
+                "shasum": shasum,
+            },
+        })
+    }
+
+    fn p2_document(name: &str, versions: &[serde_json::Value]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "packages": { name: versions } })).unwrap()
+    }
+
+    /// A fresh org + repo + public composer upstream pointing at `server`.
+    async fn composer_fixture_repo(
+        catalog: &Catalog,
+        server: &FixtureServer,
+        stem: &str,
+    ) -> (Uuid, Uuid) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let slug = format!(
+            "{stem}{}x{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        );
+        catalog.create_org(&slug, None).await.unwrap();
+        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
+        let up = catalog
+            .create_upstream(
+                repo_id,
+                "composer",
+                &server.base,
+                Visibility::Public,
+                None,
+                None,
+                "basic",
+            )
+            .await
+            .unwrap();
+        (repo_id, up)
+    }
+
+    /// Packagist publishes `"shasum": ""` for every VCS zipball. There is nothing
+    /// to verify, so the version mirrors and records the sha1 of the stored bytes
+    /// (which is what Composer then checks against our metadata).
+    #[tokio::test]
+    async fn composer_dist_with_empty_shasum_records_computed_sha1() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        let (repo_id, up) = composer_fixture_repo(&catalog, &server, "nosha").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/zipball";
+        let zip = b"PK\x03\x04zipball-1.0.0".to_vec();
+        server.set("/dist/acme/zipball-1.0.0.zip", zip.clone());
+        server.set(
+            "/p2/acme/zipball.json",
+            p2_document(
+                name,
+                &[p2_version(
+                    &server,
+                    name,
+                    "1.0.0",
+                    "/dist/acme/zipball-1.0.0.zip",
+                    "",
+                )],
+            ),
+        );
+
+        let report = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(report.mirrored.len(), 1, "skipped: {:?}", report.skipped);
+        assert_eq!(server.hits("/dist/acme/zipball-1.0.0.zip"), 1);
+
+        let versions = catalog.package_versions(repo_id, name).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].dist_shasum.as_deref(),
+            Some(sha1_hex(&zip).as_str())
+        );
+
+        std::fs::remove_dir_all(&cas).ok();
+    }
+
+    /// A published shasum is still enforced: bytes that don't match it are refused.
+    #[tokio::test]
+    async fn composer_dist_with_wrong_shasum_is_refused() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        let (repo_id, up) = composer_fixture_repo(&catalog, &server, "badsha").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/tampered";
+        server.set(
+            "/dist/acme/tampered-1.0.0.zip",
+            b"PK\x03\x04tampered".to_vec(),
+        );
+        server.set(
+            "/p2/acme/tampered.json",
+            p2_document(
+                name,
+                &[p2_version(
+                    &server,
+                    name,
+                    "1.0.0",
+                    "/dist/acme/tampered-1.0.0.zip",
+                    &sha1_hex(b"something else"),
+                )],
+            ),
+        );
+
+        let err = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ShasumMismatch { .. }), "{err:?}");
+        assert!(
+            catalog
+                .package_versions(repo_id, name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
         std::fs::remove_dir_all(&cas).ok();
     }
 }
