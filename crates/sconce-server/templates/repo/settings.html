@@ -15,6 +15,13 @@
     <span class=muted>When off, this repo is public-only — private packages can't be
     added and any already present aren't served.</span>
   </p>
+  <p>
+    <label><input type=checkbox name=anonymous_access value=1{% if anonymous %} checked{% endif %}>
+    Anonymous access</label><br>
+    <span class=muted>When on, anyone can install this repository's <em>public</em>
+    packages (those that may be redistributed) without credentials. Private packages
+    still need a token or license key.</span>
+  </p>
   <button>Save settings</button>
 </form>
 <p><strong>Effective now:</strong> raw tokens {{ eff_raw }}, max TTL {{ eff_ttl }}.</p>

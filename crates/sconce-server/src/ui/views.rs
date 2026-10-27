@@ -127,6 +127,8 @@ pub struct RepoSettings {
     pub raw_mode: &'static str,
     pub repo_ttl: String,
     pub private: bool,
+    /// Anonymous access on (public packages readable without a credential).
+    pub anonymous: bool,
     pub org_raw: &'static str,
     pub org_ttl: String,
     pub eff_raw: &'static str,

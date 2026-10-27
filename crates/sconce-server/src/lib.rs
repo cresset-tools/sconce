@@ -208,15 +208,23 @@ enum Access {
     /// under its own perpetual-fallback bound (per-entitlement bounds, 0047 —
     /// one accumulated key can carry a perpetual tool beside an annual one).
     Licensed(std::collections::HashMap<String, sconce_catalog::LicenseBound>),
+    /// No credential, in a repository with anonymous access on: only its public
+    /// packages (those that may be redistributed), unbounded.
+    Anonymous,
 }
 
 impl Access {
-    /// Whether `package` is readable under this access.
-    fn allows(&self, package: &str) -> bool {
-        match self {
+    /// Whether `package` is readable in `repo_id` under this access.
+    async fn allows(&self, s: &AppState, repo_id: Uuid, package: &str) -> Result<bool, AppError> {
+        Ok(match self {
             Access::Full => true,
             Access::Licensed(entitled) => entitled.contains_key(package),
-        }
+            Access::Anonymous => !s
+                .catalog
+                .anonymous_package_names(repo_id, Some(package))
+                .await?
+                .is_empty(),
+        })
     }
 
     /// The update bound `package` is served under (unbounded for a repo token
@@ -224,7 +232,7 @@ impl Access {
     /// [`Self::allows`] gates it first).
     fn bound_for(&self, package: &str) -> sconce_catalog::LicenseBound {
         match self {
-            Access::Full => sconce_catalog::LicenseBound::default(),
+            Access::Full | Access::Anonymous => sconce_catalog::LicenseBound::default(),
             Access::Licensed(entitled) => entitled.get(package).cloned().unwrap_or_default(),
         }
     }
@@ -252,15 +260,28 @@ async fn locate(
     Ok(Ok(loc))
 }
 
-/// The access a credential grants to an already-resolved repo. 401 if the
-/// credential is missing/invalid. A repo **token** grants [`Access::Full`]; a
-/// seller **license key** grants [`Access::Licensed`] to its entitled packages,
-/// each under its own effective update bound (per-entitlement bounds, 0047).
+/// The access a credential grants to an already-resolved repo. A repo
+/// **token** grants [`Access::Full`]; a seller **license key** grants
+/// [`Access::Licensed`] to its entitled packages, each under its own effective
+/// update bound (per-entitlement bounds, 0047). A request with **no**
+/// `Authorization` header at all gets [`Access::Anonymous`] when the repository
+/// has anonymous access on, under the repository's own policy; otherwise 401.
+/// A credential that is present but malformed or invalid is always a 401, never
+/// quietly anonymous, so a broken `auth.json` is noticed.
+///
+/// Only the Composer read routes call this; publishing, uploads, snapshots and
+/// the management API authenticate on their own and never admit anonymous.
 async fn authorize(
     s: &AppState,
     repo_id: Uuid,
     headers: &HeaderMap,
 ) -> Result<(Access, sconce_catalog::PolicyOverride), AppError> {
+    if !headers.contains_key(header::AUTHORIZATION) {
+        if s.catalog.repo_settings(repo_id).await?.anonymous_access {
+            return Ok((Access::Anonymous, sconce_catalog::PolicyOverride::default()));
+        }
+        return Err(AppError::Unauthorized);
+    }
     let cred = extract_token(headers).ok_or(AppError::Unauthorized)?;
 
     if let Some(policy) = s.catalog.resolve_token_policy(repo_id, &cred).await? {
@@ -339,6 +360,7 @@ async fn packages_json(
             v.sort();
             v
         }
+        Access::Anonymous => s.catalog.anonymous_package_names(loc.repo_id, None).await?,
     };
     Ok(Json(sconce_metadata::render_root(
         &names,
@@ -367,7 +389,7 @@ async fn p2(
 
     // A license key only unlocks its entitled packages; everything else (and the
     // dev variant) is an empty document.
-    if is_dev || !access.allows(package) {
+    if is_dev || !access.allows(&s, loc.repo_id, package).await? {
         return Ok(Json(json!({ "packages": { package: [] } })).into_response());
     }
 
@@ -429,7 +451,7 @@ async fn dist(
     // The sha256 is public (every composer.lock carries it), so it only opens a
     // blob this repository serves for that package, to a credential that can
     // read the package. Anything else is indistinguishable from a missing blob.
-    if !access.allows(package)
+    if !access.allows(&s, loc.repo_id, package).await?
         || !s
             .catalog
             .repo_serves_dist(loc.repo_id, package, &sha)
@@ -474,7 +496,7 @@ async fn serve_upstream_path(
         .dist_by_upstream_path(repo_id, path)
         .await?
         .ok_or(AppError::NotFound)?;
-    if !access.allows(&name) {
+    if !access.allows(s, repo_id, &name).await? {
         return Err(AppError::NotFound);
     }
     serve_blob(s, BlobId::from_bytes(sha)).await
@@ -1336,6 +1358,167 @@ mod tests {
             status(format!("acme/own/{own}.zip"), &license).await,
             StatusCode::NOT_FOUND,
             "an unentitled package"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Anonymous access: off by default; when on, a request with no credential
+    /// reads only the public packages (own or granted), under the repository's
+    /// policy, on the Composer routes only. A present-but-bad credential is still
+    /// a 401, and snapshots never open up.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn anonymous_access_serves_only_public_packages() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use sconce_catalog::Visibility::{Private, Public};
+        use tower::ServiceExt;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let slug = format!("anon{}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
+        let shared = cat.create_repo(&slug, "shared").await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("sconce-anon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AnyBlobStore::open(Some(&dir)).unwrap();
+
+        // `name` at 1.0.0 (and optionally 1.1.0) in `repo` with `visibility`;
+        // returns the 1.0.0 dist path.
+        let add = async |repo: Uuid, name: &str, visibility, versions: &[&str]| {
+            let pid = cat
+                .upsert_package(repo, name, "composer", None, visibility)
+                .await
+                .unwrap();
+            let mut first = String::new();
+            for v in versions {
+                let bytes = format!("PK\x03\x04{name}-{v}").into_bytes();
+                let blob = store.put(&bytes).unwrap();
+                cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+                let path = format!("packages/{name}-{v}.zip");
+                cat.insert_mirrored_version(
+                    pid,
+                    v,
+                    &format!("{v}.0"),
+                    "stable",
+                    &json!({ "name": name }),
+                    blob.as_bytes(),
+                    "unused",
+                    None,
+                    Some(&path),
+                )
+                .await
+                .unwrap();
+                if first.is_empty() {
+                    first = format!("dist/{name}/{}.zip", blob.to_hex());
+                }
+            }
+            first
+        };
+        let public_dist = add(repo_id, "open/lib", Public, &["1.0.0", "1.1.0"]).await;
+        let private_dist = add(repo_id, "acme/secret", Private, &["1.0.0"]).await;
+        add(shared, "shared/free", Public, &["1.0.0"]).await;
+        add(shared, "shared/paid", Private, &["1.0.0"]).await;
+        cat.grant_package(repo_id, shared, "shared/free")
+            .await
+            .unwrap();
+        cat.grant_package(repo_id, shared, "shared/paid")
+            .await
+            .unwrap();
+        // A security hold applies to anonymous readers too.
+        cat.hold_version(repo_id, "open/lib", "1.1.0.0")
+            .await
+            .unwrap();
+
+        let app = router(cat.clone(), store, "http://localhost".to_owned());
+        let get = async |path: &str, auth: Option<&str>| {
+            let mut req = Request::builder().uri(format!("/{slug}/r/{path}"));
+            if let Some(a) = auth {
+                req = req.header(header::AUTHORIZATION, a);
+            }
+            let r = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = r.status();
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        // Off by default: no credential is a 401.
+        assert_eq!(get("packages.json", None).await.0, StatusCode::UNAUTHORIZED);
+
+        let mut settings = cat.repo_settings(repo_id).await.unwrap();
+        settings.anonymous_access = true;
+        cat.set_repo_settings(repo_id, settings).await.unwrap();
+
+        // The root lists only public packages, own and granted.
+        let (status, root) = get("packages.json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let root: serde_json::Value = serde_json::from_str(&root).unwrap();
+        assert_eq!(
+            root["available-packages"],
+            json!(["open/lib", "shared/free"])
+        );
+
+        // Public metadata serves (minus the held version); private is empty.
+        let (status, doc) = get("p2/open/lib.json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let versions: Vec<&str> = doc["packages"]["open/lib"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(versions, ["1.0.0"], "held 1.1.0 stays hidden");
+        for private in ["p2/acme/secret.json", "p2/shared/paid.json"] {
+            let (status, doc) = get(private, None).await;
+            assert_eq!(status, StatusCode::OK);
+            let doc: serde_json::Value = serde_json::from_str(&doc).unwrap();
+            let name = private.trim_start_matches("p2/").trim_end_matches(".json");
+            assert_eq!(doc["packages"][name], json!([]), "{private}");
+        }
+
+        // Dists: public by content address and by upstream path; private neither.
+        assert_eq!(get(&public_dist, None).await.0, StatusCode::OK);
+        assert_eq!(
+            get("packages/open/lib-1.0.0.zip", None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(get(&private_dist, None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get("packages/acme/secret-1.0.0.zip", None).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        // A credential that is present but bad is a 401, not anonymous.
+        assert_eq!(
+            get("packages.json", Some("Bearer not-a-token")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get("packages.json", Some("Garbage")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        // A real token still reads everything.
+        let token = cat.create_token(repo_id, Some("r"), None).await.unwrap();
+        let (_, root) = get("packages.json", Some(&format!("Bearer {token}"))).await;
+        let root: serde_json::Value = serde_json::from_str(&root).unwrap();
+        assert_eq!(root["available-packages"].as_array().unwrap().len(), 4);
+
+        // Snapshots (database dumps) never open up.
+        assert_eq!(
+            get("snapshots/prod/latest", None).await.0,
+            StatusCode::UNAUTHORIZED
         );
 
         std::fs::remove_dir_all(&dir).ok();

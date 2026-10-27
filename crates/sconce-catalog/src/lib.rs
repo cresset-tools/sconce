@@ -437,6 +437,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0057_upload_session_visibility",
         include_str!("../migrations/0057_upload_session_visibility.sql"),
     ),
+    (
+        "0058_repo_anonymous_access",
+        include_str!("../migrations/0058_repo_anonymous_access.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -867,6 +871,9 @@ pub struct RepoSettings {
     /// When false, the repo is public-only: private packages can't be added and
     /// any already present aren't served.
     pub allow_private_packages: bool,
+    /// When true, requests with no credential may read the repository's public
+    /// packages (see [`Catalog::anonymous_package_names`]).
+    pub anonymous_access: bool,
 }
 
 impl Default for RepoSettings {
@@ -875,6 +882,7 @@ impl Default for RepoSettings {
             allow_raw_tokens: None,
             max_token_ttl_days: None,
             allow_private_packages: true,
+            anonymous_access: false,
         }
     }
 }
@@ -4674,7 +4682,8 @@ impl Catalog {
     /// repo does not exist.
     pub async fn repo_settings(&self, repo_id: Uuid) -> Result<RepoSettings, sqlx::Error> {
         let row = sqlx::query(
-            "select allow_raw_tokens, max_token_ttl_days, allow_private_packages \
+            "select allow_raw_tokens, max_token_ttl_days, allow_private_packages, \
+                    anonymous_access \
              from repositories where id = $1",
         )
         .bind(repo_id)
@@ -4685,12 +4694,14 @@ impl Catalog {
                 allow_raw_tokens: r.try_get("allow_raw_tokens")?,
                 max_token_ttl_days: r.try_get("max_token_ttl_days")?,
                 allow_private_packages: r.try_get("allow_private_packages")?,
+                anonymous_access: r.try_get("anonymous_access")?,
             }),
             None => Err(sqlx::Error::RowNotFound),
         }
     }
 
-    /// Set a repo's settings (token overrides + private-package policy).
+    /// Set a repo's settings (token overrides, private-package policy,
+    /// anonymous access).
     pub async fn set_repo_settings(
         &self,
         repo_id: Uuid,
@@ -4698,12 +4709,13 @@ impl Catalog {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "update repositories set allow_raw_tokens = $2, max_token_ttl_days = $3, \
-                 allow_private_packages = $4 where id = $1",
+                 allow_private_packages = $4, anonymous_access = $5 where id = $1",
         )
         .bind(repo_id)
         .bind(settings.allow_raw_tokens)
         .bind(settings.max_token_ttl_days)
         .bind(settings.allow_private_packages)
+        .bind(settings.anonymous_access)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -7294,6 +7306,36 @@ impl Catalog {
              order by p.name"
         ))
         .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| r.try_get("name")).collect()
+    }
+
+    /// The packages an **anonymous** request may read in `repo_id` (one name when
+    /// `only` is given): those it serves whose every package row under that name
+    /// is public — owned or granted, may be redistributed. A name that is private
+    /// anywhere in the repository (e.g. an own private package beside a granted
+    /// public one) is withheld entirely, since serving it would merge their
+    /// versions. Whether anonymous access is on at all is the caller's check
+    /// ([`RepoSettings::anonymous_access`]).
+    pub async fn anonymous_package_names(
+        &self,
+        repo_id: Uuid,
+        only: Option<&str>,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "select p.name from packages p \
+             where ( p.repo_id = $1 \
+                     or exists (select 1 from repository_grants g \
+                                where g.repo_id = $1 and g.package_id = p.id) \
+                     or {GRANT_RULE_EXISTS} ) \
+               and ($2::text is null or p.name = $2) \
+             group by p.name \
+             having bool_and(p.visibility = 'public') \
+             order by p.name"
+        ))
+        .bind(repo_id)
+        .bind(only)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(|r| r.try_get("name")).collect()
@@ -11754,5 +11796,42 @@ mod tests {
                 .await,
             Err(UpsertPackageError::Policy(_))
         ));
+    }
+
+    /// Anonymous readers get a name only when every package under it is public:
+    /// an own private package beside a granted public one of the same name is
+    /// withheld, since serving the name would merge their versions.
+    #[tokio::test]
+    async fn anonymous_names_withhold_a_name_that_is_private_anywhere() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let (_, shared) = repo().await.unwrap();
+        cat.upsert_package(repo_id, "vendor/clash", "upload", None, Visibility::Private)
+            .await
+            .unwrap();
+        cat.upsert_package(shared, "vendor/clash", "composer", None, Visibility::Public)
+            .await
+            .unwrap();
+        cat.upsert_package(shared, "vendor/free", "composer", None, Visibility::Public)
+            .await
+            .unwrap();
+        cat.grant_package(repo_id, shared, "vendor/clash")
+            .await
+            .unwrap();
+        cat.grant_package(repo_id, shared, "vendor/free")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cat.anonymous_package_names(repo_id, None).await.unwrap(),
+            ["vendor/free"]
+        );
+        assert!(
+            cat.anonymous_package_names(repo_id, Some("vendor/clash"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

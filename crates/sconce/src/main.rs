@@ -448,6 +448,11 @@ enum Command {
         /// false the repo is public-only. Omit to leave unchanged.
         #[arg(long)]
         allow_private_packages: Option<bool>,
+        /// Whether requests with no credential may install the repo's public
+        /// packages (those that may be redistributed) — `true`/`false`. Private
+        /// packages always need a credential. Omit to leave unchanged.
+        #[arg(long)]
+        anonymous_access: Option<bool>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
@@ -1369,12 +1374,14 @@ fn main() -> Result<()> {
             allow_raw_tokens,
             max_token_ttl_days,
             allow_private_packages,
+            anonymous_access,
             database_url,
         } => repo_settings(
             &repo,
             allow_raw_tokens,
             max_token_ttl_days,
             allow_private_packages,
+            anonymous_access,
             &database_url,
         ),
         Command::RepoCreate {
@@ -2629,11 +2636,13 @@ fn org_settings(
     })
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn repo_settings(
     repo: &str,
     allow_raw_tokens: Option<RawTokenOverride>,
     max_token_ttl_days: Option<i64>,
     allow_private_packages: Option<bool>,
+    anonymous_access: Option<bool>,
     database_url: &str,
 ) -> Result<()> {
     with_catalog(database_url, async |catalog| {
@@ -2644,7 +2653,8 @@ fn repo_settings(
             .context("loading repo settings")?;
         let changed = allow_raw_tokens.is_some()
             || max_token_ttl_days.is_some()
-            || allow_private_packages.is_some();
+            || allow_private_packages.is_some()
+            || anonymous_access.is_some();
         if let Some(ov) = allow_raw_tokens {
             cfg.allow_raw_tokens = match ov {
                 RawTokenOverride::Inherit => None,
@@ -2658,6 +2668,9 @@ fn repo_settings(
         }
         if let Some(v) = allow_private_packages {
             cfg.allow_private_packages = v;
+        }
+        if let Some(v) = anonymous_access {
+            cfg.anonymous_access = v;
         }
         if changed {
             catalog
@@ -2689,6 +2702,15 @@ fn repo_settings(
             show_ttl(cfg.max_token_ttl_days)
         );
         println!("  allow_private_packages = {}", cfg.allow_private_packages);
+        println!(
+            "  anonymous_access       = {}{}",
+            cfg.anonymous_access,
+            if cfg.anonymous_access {
+                " (public packages installable without credentials)"
+            } else {
+                ""
+            }
+        );
         println!("effective policy:");
         println!("  allow_raw_tokens   = {}", effective.allow_raw_tokens);
         println!("  max_token_ttl_days = {eff_ttl}");

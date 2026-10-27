@@ -1129,6 +1129,7 @@ async fn repo_settings_page(
             .map(|d| d.to_string())
             .unwrap_or_default(),
         private: repo_cfg.allow_private_packages,
+        anonymous: repo_cfg.anonymous_access,
         org_raw: if org_cfg.allow_raw_tokens {
             "allowed"
         } else {
@@ -1228,6 +1229,8 @@ struct RepoSettingsForm {
     max_token_ttl_days: Option<String>,
     /// Present (="1") only when the checkbox is ticked.
     allow_private_packages: Option<String>,
+    /// Present (="1") only when the checkbox is ticked.
+    anonymous_access: Option<String>,
 }
 
 async fn save_repo_settings(
@@ -1255,6 +1258,7 @@ async fn save_repo_settings(
         allow_raw_tokens,
         max_token_ttl_days,
         allow_private_packages: f.allow_private_packages.is_some(),
+        anonymous_access: f.anonymous_access.is_some(),
     };
     s.catalog
         .set_repo_settings(summary.id, settings)
