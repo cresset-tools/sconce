@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::Component;
 
 use axum::body::Bytes;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Json, Response};
@@ -108,16 +108,43 @@ pub(crate) async fn publish_single(
     PublishAuthedRepo(repo_id): PublishAuthedRepo,
     State(s): State<AppState>,
     Path((_org, _repo, vendor, name, version)): Path<(String, String, String, String, String)>,
+    Query(q): Query<PublishQuery>,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    let requested = q.visibility()?;
     let expected_name = format!("{vendor}/{name}");
     let store = s.store.clone();
     let input = body.to_vec();
     let cap = max_package_bytes();
     let prepared =
         spawn_prepare(move || archive_targz(&input, &expected_name, &store, cap)).await?;
-    let outcome = persist(&s, repo_id, &vendor, &name, &version, prepared).await?;
+    let outcome = persist(&s, repo_id, &vendor, &name, &version, requested, prepared).await?;
     Ok(publish_response(outcome))
+}
+
+/// `?visibility=public|private` on the requests that start a publish: the
+/// visibility (licensing) of a package the publish **creates**. Omitted, a new
+/// package follows the repository — public in a public-only repository, private
+/// otherwise. An existing package keeps its visibility; publishing never changes
+/// it (`sconce package visibility` does).
+#[derive(Deserialize, Default)]
+pub(crate) struct PublishQuery {
+    visibility: Option<String>,
+}
+
+impl PublishQuery {
+    fn visibility(&self) -> Result<Option<Visibility>, AppError> {
+        self.visibility
+            .as_deref()
+            .map(|v| {
+                Visibility::parse(v).ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "visibility must be `public` or `private`, not `{v}`"
+                    ))
+                })
+            })
+            .transpose()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +156,19 @@ pub(crate) async fn upload_init(
     PublishAuthedRepo(repo_id): PublishAuthedRepo,
     State(s): State<AppState>,
     Path((_org, _repo, vendor, name, version)): Path<(String, String, String, String, String)>,
+    Query(q): Query<PublishQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let requested = q.visibility()?;
     let id = s
         .catalog
-        .create_upload_session(repo_id, &vendor, &name, &version, UPLOAD_TTL_SECS)
+        .create_upload_session(
+            repo_id,
+            &vendor,
+            &name,
+            &version,
+            requested,
+            UPLOAD_TTL_SECS,
+        )
         .await?;
     Ok(Json(json!({
         "upload_id": id,
@@ -260,7 +296,8 @@ pub(crate) async fn upload_complete(
             assemble_and_archive(&store, &ids, expected_sha, &expected_name, cap)
         })
         .await?;
-        let outcome = persist(&s, repo_id, &vendor, &name, &version, prepared).await?;
+        let requested = session.visibility.as_deref().and_then(Visibility::parse);
+        let outcome = persist(&s, repo_id, &vendor, &name, &version, requested, prepared).await?;
         publish_response(outcome)
     };
     s.catalog.set_upload_status(upload_id, "completed").await?;
@@ -491,6 +528,7 @@ async fn persist(
     vendor: &str,
     name: &str,
     version: &str,
+    requested: Option<Visibility>,
     prepared: Prepared,
 ) -> Result<PublishOutcome, AppError> {
     let (normalized, stability) = normalize_version(version).ok_or_else(|| {
@@ -499,22 +537,49 @@ async fn persist(
         ))
     })?;
     let pkg_name = format!("{vendor}/{name}");
+    let policy_error = |e| match e {
+        sconce_catalog::UpsertPackageError::Policy(m) => AppError::BadRequest(m),
+        sconce_catalog::UpsertPackageError::Db(e) => AppError::Catalog(e),
+    };
+    // Visibility is a licensing statement about the package, made when it is
+    // created; a version publish never changes it.
+    let existing = s.catalog.package_visibility(repo_id, &pkg_name).await?;
+    let visibility = match (existing, requested) {
+        (Some(current), Some(asked)) if current.visibility != asked => {
+            return Err(AppError::Conflict(format!(
+                "{pkg_name} is {}; publishing does not change a package's visibility \
+                 (use `sconce package visibility`)",
+                current.visibility.as_str()
+            )));
+        }
+        (Some(current), _) => current.visibility,
+        (None, Some(asked)) => asked,
+        (None, None) => {
+            if s.catalog
+                .repo_settings(repo_id)
+                .await?
+                .allow_private_packages
+            {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            }
+        }
+    };
     s.catalog.upsert_blob(&prepared.blob, prepared.size).await?;
     let source = json!({ "kind": "upload" });
     let package_id = s
         .catalog
-        .upsert_package(
-            repo_id,
-            &pkg_name,
-            "upload",
-            Some(&source),
-            Visibility::Private,
-        )
+        .upsert_package(repo_id, &pkg_name, "upload", Some(&source), visibility)
         .await
-        .map_err(|e| match e {
-            sconce_catalog::UpsertPackageError::Policy(m) => AppError::BadRequest(m),
-            sconce_catalog::UpsertPackageError::Db(e) => AppError::Catalog(e),
-        })?;
+        .map_err(policy_error)?;
+    // Asking for a visibility when creating the package is a declaration.
+    if existing.is_none() && requested.is_some() {
+        s.catalog
+            .set_package_visibility(repo_id, &pkg_name, visibility)
+            .await
+            .map_err(policy_error)?;
+    }
     let outcome = s
         .catalog
         .insert_pushed_version(
@@ -880,5 +945,204 @@ mod tests {
         let versions = cat.package_versions(repo_id, "acme/tool").await.unwrap();
         let v2 = versions.iter().find(|v| v.version == "2.0.0").unwrap();
         assert_eq!(v2.dist_blob_sha256, Some(expected.blob));
+    }
+
+    /// A publish sets a package's visibility (licensing) only when it creates the
+    /// package: the requested one, else the repository's default. It never
+    /// changes an existing package's visibility.
+    #[tokio::test]
+    async fn publish_visibility_is_set_on_creation_only() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.expect("connect");
+        cat.migrate().await.expect("migrate");
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let slug = format!("pubvis{}-{n}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let mixed = cat.create_repo(&slug, "mixed").await.unwrap();
+        let open = cat.create_repo(&slug, "open").await.unwrap();
+        let mut settings = cat.repo_settings(open).await.unwrap();
+        settings.allow_private_packages = false;
+        cat.set_repo_settings(open, settings).await.unwrap();
+        let mixed_token = cat.create_publish_token(mixed, "t", 900).await.unwrap();
+        let open_token = cat.create_publish_token(open, "t", 900).await.unwrap();
+        let app = crate::router(cat.clone(), tmp_store(), "http://localhost".to_owned());
+
+        let publish = async |repo: &str, token: &str, name: &str, version: &str, query: &str| {
+            let cj = format!(r#"{{"name":"{name}"}}"#);
+            let tar = targz(&[("composer.json", cj.as_bytes(), 0o644)]);
+            app.clone()
+                .oneshot(put_pkg(
+                    &format!("/{slug}/{repo}/packages/{name}/{version}{query}"),
+                    token,
+                    tar,
+                ))
+                .await
+                .unwrap()
+                .status()
+        };
+        let visibility = async |repo: Uuid, name: &str| {
+            cat.package_visibility(repo, name).await.unwrap().unwrap()
+        };
+
+        // Defaults follow the repository.
+        assert_eq!(
+            publish("mixed", &mixed_token, "acme/a", "1.0.0", "").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            visibility(mixed, "acme/a").await.visibility,
+            Visibility::Private
+        );
+        assert_eq!(
+            publish("open", &open_token, "acme/b", "1.0.0", "").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            visibility(open, "acme/b").await.visibility,
+            Visibility::Public
+        );
+
+        // Asking for one on creation is a declaration.
+        assert_eq!(
+            publish(
+                "mixed",
+                &mixed_token,
+                "acme/c",
+                "1.0.0",
+                "?visibility=public"
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let c = visibility(mixed, "acme/c").await;
+        assert_eq!(c.visibility, Visibility::Public);
+        assert!(c.declared);
+
+        // An existing package keeps its visibility: a matching or absent request
+        // publishes, a different one is refused.
+        assert_eq!(
+            publish(
+                "mixed",
+                &mixed_token,
+                "acme/a",
+                "1.1.0",
+                "?visibility=public"
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            publish("mixed", &mixed_token, "acme/a", "1.1.0", "").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            publish(
+                "mixed",
+                &mixed_token,
+                "acme/c",
+                "1.1.0",
+                "?visibility=public"
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            visibility(mixed, "acme/a").await.visibility,
+            Visibility::Private
+        );
+
+        // A public-only repository refuses a private package, and junk is a 400.
+        assert_eq!(
+            publish(
+                "open",
+                &open_token,
+                "acme/d",
+                "1.0.0",
+                "?visibility=private"
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            publish(
+                "mixed",
+                &mixed_token,
+                "acme/e",
+                "1.0.0",
+                "?visibility=secret"
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// A chunked upload carries the visibility asked for when its session opened
+    /// through to the package it creates.
+    #[tokio::test]
+    async fn chunked_publish_carries_the_requested_visibility() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.expect("connect");
+        cat.migrate().await.expect("migrate");
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let slug = format!("chunkvis{}-{n}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
+        let token = cat.create_publish_token(repo_id, "t", 900).await.unwrap();
+        let app = crate::router(cat.clone(), tmp_store(), "http://localhost".to_owned());
+        let tar = targz(&[("composer.json", br#"{"name":"acme/chunked"}"#, 0o644)]);
+
+        let send = async |method: &str, uri: String, body: Vec<u8>| {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let init = send(
+            "POST",
+            format!("/{slug}/r/packages/acme/chunked/1.0.0/uploads?visibility=public"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(init.status(), StatusCode::OK);
+        let init: serde_json::Value = serde_json::from_str(&body_text(init).await).unwrap();
+        let upload_id = init["upload_id"].as_str().unwrap().to_owned();
+        let part = send(
+            "PUT",
+            format!("/{slug}/r/uploads/{upload_id}/parts/1"),
+            tar.clone(),
+        )
+        .await;
+        assert_eq!(part.status(), StatusCode::NO_CONTENT);
+        let sha = {
+            use sha2::{Digest, Sha256};
+            hex(&Sha256::digest(&tar))
+        };
+        let complete = send(
+            "POST",
+            format!("/{slug}/r/uploads/{upload_id}/complete"),
+            serde_json::to_vec(&json!({ "parts": 1, "sha256": sha })).unwrap(),
+        )
+        .await;
+        assert_eq!(complete.status(), StatusCode::CREATED);
+
+        let v = cat
+            .package_visibility(repo_id, "acme/chunked")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.visibility, Visibility::Public);
+        assert!(v.declared);
     }
 }

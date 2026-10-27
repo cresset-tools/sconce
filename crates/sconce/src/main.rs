@@ -29,18 +29,19 @@ enum RawTokenOverride {
     Deny,
 }
 
-/// Upstream visibility (drives package visibility + dependency classification).
+/// Whether packages may be redistributed (licensing): `private` means they may
+/// not be shared publicly. Drives package visibility + dependency classification.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum Visib {
+enum Visibility {
     Public,
     Private,
 }
 
-impl From<Visib> for sconce_catalog::Visibility {
-    fn from(v: Visib) -> Self {
+impl From<Visibility> for sconce_catalog::Visibility {
+    fn from(v: Visibility) -> Self {
         match v {
-            Visib::Public => sconce_catalog::Visibility::Public,
-            Visib::Private => sconce_catalog::Visibility::Private,
+            Visibility::Public => sconce_catalog::Visibility::Public,
+            Visibility::Private => sconce_catalog::Visibility::Private,
         }
     }
 }
@@ -516,6 +517,12 @@ enum Command {
         /// threshold). Defaults to 32 MiB.
         #[arg(long)]
         part_size: Option<u64>,
+        /// Visibility (licensing) of the package if this publish creates it:
+        /// `public` states that it may be redistributed. Omit to follow the
+        /// repository (public in a public-only repository, private otherwise).
+        /// An existing package keeps its visibility.
+        #[arg(long)]
+        visibility: Option<Visibility>,
     },
 
     /// Create (or replace) an org's SCIM bearer token for identity-provider
@@ -766,13 +773,14 @@ enum UpstreamAction {
         base: String,
         /// `public` or `private` — drives mirrored package visibility.
         #[arg(long)]
-        visibility: Visib,
+        visibility: Visibility,
         /// Optional human label.
         #[arg(long)]
         label: Option<String>,
         /// Credential secret to use when cloning (a token, or `user:pass` for
-        /// `--credential-type basic`). Ignored for public upstreams. Stored
-        /// encrypted; needs `SCONCE_SECRET_KEY`.
+        /// `--credential-type basic`). Independent of `--visibility`: a source
+        /// that needs a credential can still hold code you may redistribute.
+        /// Stored encrypted; needs `SCONCE_SECRET_KEY`.
         #[arg(long)]
         credential: Option<String>,
         /// How to present the credential: basic | github | gitlab | bearer.
@@ -1118,6 +1126,21 @@ enum PackageAction {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+    /// Show a package's visibility, or declare it. Visibility is about licensing,
+    /// not access: declaring a package `public` states that you may redistribute
+    /// it. A declared visibility survives syncs from the package's source. Only
+    /// the repository that owns the package can declare it.
+    Visibility {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Package name.
+        package: String,
+        /// The visibility to declare. Omit to show the current one.
+        visibility: Option<Visibility>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1325,6 +1348,12 @@ fn main() -> Result<()> {
                 package,
                 database_url,
             } => package_set_archived(&repo, &package, false, &database_url),
+            PackageAction::Visibility {
+                repo,
+                package,
+                visibility,
+                database_url,
+            } => package_visibility(&repo, &package, visibility.map(Into::into), &database_url),
         },
         Command::Worker { cas, database_url } => worker(cas.as_deref(), &database_url),
         Command::Gc {
@@ -1470,6 +1499,7 @@ fn main() -> Result<()> {
             audience,
             token,
             part_size,
+            visibility,
         } => publish(
             &dir,
             &repo,
@@ -1478,6 +1508,7 @@ fn main() -> Result<()> {
             &audience,
             token.as_deref(),
             part_size,
+            visibility.map(Into::into),
         ),
         Command::ScimToken { org, database_url } => scim_token(&org, &database_url),
         Command::OidcConfig {
@@ -1678,12 +1709,6 @@ fn upstream_add(
              (e.g. --require 'mage-os/*'; use --require '*' to mirror everything)"
         );
     }
-    // Public upstreams are unauthenticated — drop any credential rather than
-    // encrypting (and needlessly requiring the key) for one.
-    let credential = match visibility {
-        sconce_catalog::Visibility::Public => None,
-        sconce_catalog::Visibility::Private => credential,
-    };
     // Encrypt the credential (if any) before it touches the catalog.
     let ciphertext = match credential {
         None => None,
@@ -1959,6 +1984,50 @@ fn package_set_archived(
                 "un-archived (syncing resumes)"
             }
         );
+        Ok(())
+    })
+}
+
+fn package_visibility(
+    repo: &str,
+    package: &str,
+    declare: Option<sconce_catalog::Visibility>,
+    database_url: &str,
+) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        if let Some(visibility) = declare
+            && !catalog
+                .set_package_visibility(repo_id, package, visibility)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            anyhow::bail!(
+                "no such package `{package}` owned by {repo} \
+                 (a granted package's visibility belongs to the repository that owns it)"
+            );
+        }
+        let current = catalog
+            .package_visibility(repo_id, package)
+            .await
+            .context("reading package visibility")?
+            .with_context(|| format!("no such package `{package}` owned by {repo}"))?;
+        let meaning = match current.visibility {
+            sconce_catalog::Visibility::Public => "may be redistributed",
+            sconce_catalog::Visibility::Private => "may not be shared publicly",
+        };
+        let how = if current.declared {
+            "declared"
+        } else {
+            "derived from its source"
+        };
+        println!(
+            "{package}: {} ({meaning}; {how})",
+            current.visibility.as_str()
+        );
+        if declare == Some(sconce_catalog::Visibility::Public) {
+            println!("  you have stated that you may redistribute {package}");
+        }
         Ok(())
     })
 }
@@ -2867,6 +2936,7 @@ fn user_create(email: &str, password: &str, superadmin: bool, database_url: &str
 /// Default chunk size (and single-shot threshold) for `sconce publish`.
 const DEFAULT_PART_SIZE: u64 = 32 * 1024 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn publish(
     dir: &Path,
     repo_path: &str,
@@ -2875,6 +2945,7 @@ fn publish(
     audience: &str,
     token: Option<&str>,
     part_size: Option<u64>,
+    visibility: Option<sconce_catalog::Visibility>,
 ) -> Result<()> {
     let base = url.trim_end_matches('/');
     let (org, repo) = repo_path
@@ -2925,11 +2996,13 @@ fn publish(
     );
 
     let pkg_path = format!("packages/{vendor}/{pkg}/{version}");
+    // Off the URL unless asked for, so it keeps working against an older server.
+    let query = visibility.map_or_else(String::new, |v| format!("?visibility={}", v.as_str()));
     if u64::try_from(tarball.len()).unwrap_or(u64::MAX) <= part_size {
-        let single_url = format!("{base}/{org}/{repo}/{pkg_path}");
+        let single_url = format!("{base}/{org}/{repo}/{pkg_path}{query}");
         upload_single(&single_url, "application/tar+gzip", &token, &tarball)
     } else {
-        let init_url = format!("{base}/{org}/{repo}/{pkg_path}/uploads");
+        let init_url = format!("{base}/{org}/{repo}/{pkg_path}/uploads{query}");
         upload_chunked(base, org, repo, &init_url, &token, &tarball, part_size)
     }
 }

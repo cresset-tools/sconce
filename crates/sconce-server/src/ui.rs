@@ -217,6 +217,10 @@ pub fn router(
         .route("/r/{org}/{repo}/deps/resolve", post(resolve_deps))
         .route("/r/{org}/{repo}/deps/add", post(add_dep))
         .route("/r/{org}/{repo}/package/archive", post(package_archive))
+        .route(
+            "/r/{org}/{repo}/package/visibility",
+            post(package_visibility),
+        )
         .route("/r/{org}/{repo}/p/{*pkg}", get(package_detail_page))
         .route("/r/{org}/{repo}/ci", post(add_ci))
         .route("/r/{org}/{repo}/ci/remove", post(remove_ci))
@@ -3634,6 +3638,42 @@ struct PackageActionForm {
     action: String,
 }
 
+#[derive(Deserialize)]
+struct PackageVisibilityForm {
+    package: String,
+    visibility: String,
+}
+
+/// Declare a package's visibility (licensing). Declaring it public is the
+/// owner's statement that it may be redistributed; the page asks for that
+/// confirmation before submitting.
+async fn package_visibility(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Path((org, repo)): Path<(String, String)>,
+    Form(f): Form<PackageVisibilityForm>,
+) -> Result<Response, StatusCode> {
+    let id = lookup_admin(&s, &user, &org, &repo).await?.id;
+    let visibility =
+        sconce_catalog::Visibility::parse(&f.visibility).ok_or(StatusCode::BAD_REQUEST)?;
+    match s
+        .catalog
+        .set_package_visibility(id, &f.package, visibility)
+        .await
+    {
+        Ok(true) => Ok(Redirect::to(&format!("/r/{org}/{repo}/p/{}", f.package)).into_response()),
+        Ok(false) => Ok(status_page(
+            "Package not found",
+            "No such package owned by this repository.",
+        )
+        .into_response()),
+        Err(sconce_catalog::UpsertPackageError::Policy(reason)) => {
+            Ok(status_page("Not allowed", &reason).into_response())
+        }
+        Err(sconce_catalog::UpsertPackageError::Db(e)) => Err(e500(e)),
+    }
+}
+
 /// D11 — per-package detail: lifecycle header + version provenance + actions.
 #[allow(clippy::too_many_lines)] // page builder; clearer kept together
 async fn package_detail_page(
@@ -3718,6 +3758,13 @@ async fn package_detail_page(
         })
         .collect();
 
+    let visibility_declared = s
+        .catalog
+        .package_visibility(summary.id, &pkg)
+        .await
+        .map_err(e500)?
+        .is_some_and(|v| v.declared);
+
     let view = views::PackageDetail {
         org: org.clone(),
         repo: repo.clone(),
@@ -3728,6 +3775,13 @@ async fn package_detail_page(
         action_value,
         action_label,
         visibility: ps.visibility.clone(),
+        visibility_declared,
+        allow_private: s
+            .catalog
+            .repo_settings(summary.id)
+            .await
+            .map_err(e500)?
+            .allow_private_packages,
         nver: versions.len(),
         last: ps
             .last_success_at
@@ -3736,7 +3790,14 @@ async fn package_detail_page(
         sync_error: ps.upstream_error.clone().filter(|_| stale),
         versions: rows,
     };
-    Ok(shell(&s, &user, &pkg, &view.render().map_err(e500)?))
+    // repo.js carries the confirm guard the visibility declaration relies on.
+    Ok(shell_js(
+        &s,
+        &user,
+        &pkg,
+        &view.render().map_err(e500)?,
+        "/assets/repo.js",
+    ))
 }
 
 async fn package_archive(
@@ -4023,13 +4084,9 @@ async fn create_upstream(
         ("basic", Some(user), Some(tok)) if !tok.contains(':') => Some(format!("{user}:{tok}")),
         _ => token.map(str::to_owned),
     };
-    // Public upstreams carry no credential — ignore any submitted one (so no key
-    // is needed for a public upstream even if the field leaked a value).
-    let credential = if matches!(visibility, sconce_catalog::Visibility::Public) {
-        None
-    } else {
-        combined.as_deref()
-    };
+    // Whether a source needs a credential is independent of its visibility
+    // (licensing): a credentialed source can hold code you may redistribute.
+    let credential = combined.as_deref();
 
     // Encrypt the credential if one was given; needs the key.
     let ciphertext = if let Some(c) = credential {

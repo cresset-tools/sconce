@@ -190,18 +190,19 @@ for (const head of document.querySelectorAll('.pkglist .pkghead')) {
   }
 }
 
-// Upstreams add-form: reveal the credential fields only for a private source.
+// Upstreams add-form: reveal the credential fields only when the source needs
+// one. That is independent of visibility (licensing): a source behind a
+// credential can still hold code you may redistribute.
 {
-  const vis = document.getElementById('upvis');
-  if (vis) {
+  const needsCredential = document.getElementById('upcred');
+  if (needsCredential) {
     const credRow = document.getElementById('credrow');
     const addRow = document.getElementById('addrow');
     const sync = () => {
-      const isPrivate = vis.value === 'private';
-      credRow.style.display = isPrivate ? 'grid' : 'none';
-      addRow.style.display = isPrivate ? 'none' : 'grid';
+      credRow.style.display = needsCredential.checked ? 'grid' : 'none';
+      addRow.style.display = needsCredential.checked ? 'none' : 'grid';
     };
-    vis.addEventListener('change', sync);
+    needsCredential.addEventListener('change', sync);
     sync();
   }
 }

@@ -429,6 +429,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0055_upstream_dist_path",
         include_str!("../migrations/0055_upstream_dist_path.sql"),
     ),
+    (
+        "0056_package_visibility_declared",
+        include_str!("../migrations/0056_package_visibility_declared.sql"),
+    ),
+    (
+        "0057_upload_session_visibility",
+        include_str!("../migrations/0057_upload_session_visibility.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -521,12 +529,16 @@ impl Default for OrgSettings {
     }
 }
 
-/// A package's visibility, derived from the upstream it was mirrored from.
+/// Whether a package may be redistributed — a licensing property, not an access
+/// one (whether a credential is needed is the repository's business). Derived
+/// from where the package comes from unless an operator declared it
+/// ([`Catalog::set_package_visibility`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
-    /// Operator-controlled / paid source — only this catalog can serve it.
+    /// May not be shared publicly: your own code, a paid or credentialed source.
     Private,
-    /// Mirrored from a public registry (Packagist, …).
+    /// May be redistributed: from a public registry (Packagist, …), or declared so
+    /// by its owner.
     Public,
 }
 
@@ -764,6 +776,9 @@ pub struct UploadSession {
     /// Snapshot sessions only: the data profile the dump belongs to (`None` =
     /// `full`).
     pub profile: Option<String>,
+    /// Package sessions only: the visibility requested for a package the upload
+    /// creates (`None` = the repository's default).
+    pub visibility: Option<String>,
     pub status: String,
 }
 
@@ -862,6 +877,15 @@ impl Default for RepoSettings {
             allow_private_packages: true,
         }
     }
+}
+
+/// A package's visibility and whether it was declared by an operator
+/// ([`Catalog::package_visibility`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageVisibility {
+    pub visibility: Visibility,
+    /// `true` when set deliberately, so syncs from its source leave it alone.
+    pub declared: bool,
 }
 
 /// Why upserting a package failed — a database error, or a repo policy that
@@ -3882,22 +3906,24 @@ impl Catalog {
         source: Option<&Value>,
         visibility: Visibility,
     ) -> Result<Uuid, UpsertPackageError> {
-        if visibility == Visibility::Private {
-            let allows: bool =
-                sqlx::query_scalar("select allow_private_packages from repositories where id = $1")
-                    .bind(repo_id)
-                    .fetch_one(&self.pool)
-                    .await?;
-            if !allows {
-                return Err(UpsertPackageError::Policy(
-                    "this repository is public-only and does not allow private packages".to_owned(),
-                ));
-            }
+        // A declared visibility outlives syncs, so it — not the derived one passed
+        // in — is what the repo policy has to accept.
+        let effective = match self.package_visibility(repo_id, name).await? {
+            Some(PackageVisibility {
+                visibility: declared,
+                declared: true,
+            }) => declared,
+            _ => visibility,
+        };
+        if effective == Visibility::Private {
+            self.ensure_private_allowed(repo_id).await?;
         }
         let id = sqlx::query_scalar(
             "insert into packages (repo_id, name, kind, source, visibility) values ($1, $2, $3, $4, $5) \
              on conflict (repo_id, name) do update set \
-                 kind = excluded.kind, source = excluded.source, visibility = excluded.visibility \
+                 kind = excluded.kind, source = excluded.source, \
+                 visibility = case when packages.visibility_declared_at is null \
+                                   then excluded.visibility else packages.visibility end \
              returning id",
         )
         .bind(repo_id)
@@ -3908,6 +3934,72 @@ impl Catalog {
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// Refuse a private package in a public-only repository.
+    async fn ensure_private_allowed(&self, repo_id: Uuid) -> Result<(), UpsertPackageError> {
+        let allows: bool =
+            sqlx::query_scalar("select allow_private_packages from repositories where id = $1")
+                .bind(repo_id)
+                .fetch_one(&self.pool)
+                .await?;
+        if allows {
+            Ok(())
+        } else {
+            Err(UpsertPackageError::Policy(
+                "this repository is public-only and does not allow private packages".to_owned(),
+            ))
+        }
+    }
+
+    /// The visibility of a package `repo_id` owns, and whether it was declared
+    /// rather than derived. `None` when the repository has no such package.
+    pub async fn package_visibility(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+    ) -> Result<Option<PackageVisibility>, sqlx::Error> {
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "select visibility, visibility_declared_at is not null \
+             from packages where repo_id = $1 and name = $2",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(visibility, declared)| PackageVisibility {
+            // The column's check constraint admits only these two values.
+            visibility: Visibility::parse(&visibility).unwrap_or(Visibility::Private),
+            declared,
+        }))
+    }
+
+    /// **Declare** the visibility of a package `repo_id` owns. Declaring it
+    /// public is the owner's statement that it may be redistributed; it then
+    /// survives syncs from its source, which would otherwise re-derive it. Only
+    /// the owning repository can do this, so a repository that was *granted* a
+    /// package (say, a paid one from an agency's shared repo) cannot make it
+    /// public. Returns `false` when the repository owns no such package.
+    pub async fn set_package_visibility(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+        visibility: Visibility,
+    ) -> Result<bool, UpsertPackageError> {
+        if visibility == Visibility::Private {
+            self.ensure_private_allowed(repo_id).await?;
+        }
+        let updated = sqlx::query(
+            "update packages set visibility = $3, visibility_declared_at = now() \
+             where repo_id = $1 and name = $2",
+        )
+        .bind(repo_id)
+        .bind(name)
+        .bind(visibility.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
     }
 
     /// Packages in a repo with their lifecycle state, newest-broken first then by
@@ -6794,24 +6886,27 @@ impl Catalog {
     }
 
     /// Open a chunked-upload session for `(vendor/name, version)` in a repo,
-    /// expiring `ttl_secs` from now. Returns the new session id.
+    /// expiring `ttl_secs` from now. `visibility` is the one requested for a
+    /// package the upload creates. Returns the new session id.
     pub async fn create_upload_session(
         &self,
         repo_id: Uuid,
         vendor: &str,
         name: &str,
         version: &str,
+        visibility: Option<Visibility>,
         ttl_secs: i64,
     ) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
-            "insert into upload_sessions (repo_id, vendor, name, version, expires_at) \
-             values ($1, $2, $3, $4, now() + make_interval(secs => $5::double precision)) \
+            "insert into upload_sessions (repo_id, vendor, name, version, visibility, expires_at) \
+             values ($1, $2, $3, $4, $5, now() + make_interval(secs => $6::double precision)) \
              returning id",
         )
         .bind(repo_id)
         .bind(vendor)
         .bind(name)
         .bind(version)
+        .bind(visibility.map(Visibility::as_str))
         .bind(ttl_secs)
         .fetch_one(&self.pool)
         .await
@@ -6820,7 +6915,8 @@ impl Catalog {
     /// Fetch a session by id (any status). `None` if unknown.
     pub async fn upload_session(&self, id: Uuid) -> Result<Option<UploadSession>, sqlx::Error> {
         let row = sqlx::query(
-            "select id, repo_id, kind, vendor, name, version, environment, profile, status \
+            "select id, repo_id, kind, vendor, name, version, environment, profile, visibility, \
+                    status \
              from upload_sessions where id = $1",
         )
         .bind(id)
@@ -6836,6 +6932,7 @@ impl Catalog {
                 version: r.try_get("version")?,
                 environment: r.try_get("environment")?,
                 profile: r.try_get("profile")?,
+                visibility: r.try_get("visibility")?,
                 status: r.try_get("status")?,
             })
         })
@@ -11544,5 +11641,118 @@ mod tests {
         assert_eq!(after.total_bytes, before.total_bytes + 200);
         assert_eq!(after.orphan_count, before.orphan_count + 1);
         assert_eq!(after.orphan_bytes, before.orphan_bytes + 100);
+    }
+
+    /// A declared visibility is a licensing statement: a sync from the package's
+    /// source re-derives the visibility only while nobody has declared it.
+    #[tokio::test]
+    async fn declared_visibility_survives_syncs() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let name = "acme/own";
+        cat.upsert_package(repo_id, name, "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        // Not declared yet: a sync re-derives it.
+        cat.upsert_package(repo_id, name, "git", None, Visibility::Public)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.package_visibility(repo_id, name).await.unwrap(),
+            Some(PackageVisibility {
+                visibility: Visibility::Public,
+                declared: false
+            })
+        );
+
+        assert!(
+            cat.set_package_visibility(repo_id, name, Visibility::Private)
+                .await
+                .unwrap()
+        );
+        // Declared private: a sync deriving public leaves it private.
+        cat.upsert_package(repo_id, name, "git", None, Visibility::Public)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.package_visibility(repo_id, name).await.unwrap(),
+            Some(PackageVisibility {
+                visibility: Visibility::Private,
+                declared: true
+            })
+        );
+
+        assert!(
+            !cat.set_package_visibility(repo_id, "acme/missing", Visibility::Public)
+                .await
+                .unwrap(),
+            "no such package"
+        );
+    }
+
+    /// Only the repository that owns a package can declare its visibility: a
+    /// repository it was granted to (an agency client) cannot make it public.
+    #[tokio::test]
+    async fn granted_package_visibility_cannot_be_declared_by_the_grantee() {
+        let Some((cat, shared)) = repo().await else {
+            return;
+        };
+        let (_, client) = repo().await.unwrap();
+        cat.upsert_package(shared, "vendor/paid", "composer", None, Visibility::Private)
+            .await
+            .unwrap();
+        assert!(
+            cat.grant_package(client, shared, "vendor/paid")
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            !cat.set_package_visibility(client, "vendor/paid", Visibility::Public)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cat.package_visibility(shared, "vendor/paid")
+                .await
+                .unwrap()
+                .map(|v| v.visibility),
+            Some(Visibility::Private)
+        );
+    }
+
+    /// A public-only repository refuses a private declaration, but accepts a
+    /// package declared public even when its source would derive private.
+    #[tokio::test]
+    async fn public_only_repo_follows_the_declared_visibility() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let name = "acme/shared-code";
+        cat.upsert_package(repo_id, name, "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        cat.set_package_visibility(repo_id, name, Visibility::Public)
+            .await
+            .unwrap();
+        let mut settings = cat.repo_settings(repo_id).await.unwrap();
+        settings.allow_private_packages = false;
+        cat.set_repo_settings(repo_id, settings).await.unwrap();
+
+        // The sync derives private, but the declaration is what counts.
+        cat.upsert_package(repo_id, name, "git", None, Visibility::Private)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cat.set_package_visibility(repo_id, name, Visibility::Private)
+                .await,
+            Err(UpsertPackageError::Policy(_))
+        ));
+        assert!(matches!(
+            cat.upsert_package(repo_id, "acme/other", "git", None, Visibility::Private)
+                .await,
+            Err(UpsertPackageError::Policy(_))
+        ));
     }
 }

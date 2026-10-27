@@ -354,8 +354,11 @@
         <div><label class=fl>Kind</label><select name=kind id=upkind>
           <option value=git>git</option><option value=composer>composer</option></select></div>
         <div><label class=fl>URL</label><input name=base placeholder="git@host:org/repo.git" required></div>
-        <div><label class=fl>Visibility</label><select name=visibility id=upvis>
-          <option value=public>public</option><option value=private>private</option></select></div>
+        <div><label class=fl>Visibility <span class=hint>licensing</span></label><select name=visibility id=upvis>
+          <option value=public>public (may be redistributed)</option><option value=private>private (may not be shared)</option></select></div>
+      </div>
+      <div class=g1>
+        <div style=grid-column:span_3><label><input type=checkbox id=upcred> Needs a credential to fetch</label></div>
       </div>
       <div class=g1>
         <div><label class=fl>Label <span class=hint>· optional</span></label><input name=label style=font-family:inherit></div>
@@ -378,7 +381,7 @@
       </div>
       <div class=g2 id=addrow><div></div><div style="display:flex;justify-content:flex-end"><button class=primary>Add upstream</button></div></div>
     </form>
-    <p class=muted style="margin:.7rem 0 0">{% if has_secret_key %}Credential is stored encrypted (write-only).{% else %}Set SCONCE_SECRET_KEY to store a credential; without it only public/unauthed upstreams work.{% endif %} Credentials apply to private upstreams only.</p>
+    <p class=muted style="margin:.7rem 0 0">{% if has_secret_key %}Credential is stored encrypted (write-only).{% else %}Set SCONCE_SECRET_KEY to store a credential; without it only upstreams that need none work.{% endif %} Whether a source needs a credential is separate from its visibility: a private source can hold code you may redistribute.</p>
   </div>
 </div>
 

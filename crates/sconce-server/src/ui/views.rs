@@ -448,6 +448,11 @@ pub struct PackageDetail {
     pub action_value: Option<&'static str>,
     pub action_label: &'static str,
     pub visibility: String,
+    /// Whether the visibility was declared by an operator (vs derived from the
+    /// package's source).
+    pub visibility_declared: bool,
+    /// Whether the repository allows private packages (so "declare private" applies).
+    pub allow_private: bool,
     pub nver: usize,
     pub last: String,
     /// "Last sync error" detail, shown when the package is stale.

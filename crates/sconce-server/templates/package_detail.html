@@ -3,7 +3,12 @@
   <span class="badge {{ life_tone }}">{{ life_label }}</span>{% if let Some(r) = life_reason %} <span class=muted>{{ r }}</span>{% endif %}
   <a class=muted style="font-size:.85rem" href="/r/{{ org }}/{{ repo }}">← {{ org }}/{{ repo }}</a>
 </div>
-<p class=summary>{{ visibility }} · {{ nver }} version(s) · last sync {{ last }}</p>
+<p class=summary>{{ visibility }} ({% if visibility == "public" %}may be redistributed{% else %}may not be shared publicly{% endif %}; {% if visibility_declared %}declared{% else %}from its source{% endif %}) · {{ nver }} version(s) · last sync {{ last }}</p>
+<form class=inline method=post action="/r/{{ org }}/{{ repo }}/package/visibility"{% if visibility == "private" %} data-confirm="Declare {{ pkg }} public? You are stating that you may redistribute it."{% endif %}>
+  <input type=hidden name=package value="{{ pkg }}">
+  {% if visibility == "private" %}<button name=visibility value=public>Declare public</button>
+  {% else if allow_private %}<button name=visibility value=private>Declare private</button>{% endif %}
+</form>
 {% if let Some(av) = action_value %}
   <form class=inline method=post action="/r/{{ org }}/{{ repo }}/package/archive">
     <input type=hidden name=package value="{{ pkg }}"><button name=action value={{ av }}>{{ action_label }}</button></form>
