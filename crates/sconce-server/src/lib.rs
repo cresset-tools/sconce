@@ -420,10 +420,23 @@ async fn dist(
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
     // Anything else under `dist/` may be an imported registry's own dist path
     // (Satis archives to `dist/` by default).
-    let file = rest.rsplit('/').next().ok_or(AppError::NotFound)?;
-    let Some(sha) = file.strip_suffix(".zip").and_then(parse_hex32) else {
+    let Some((package, sha)) = rest
+        .rsplit_once('/')
+        .and_then(|(package, file)| Some((package, parse_hex32(file.strip_suffix(".zip")?)?)))
+    else {
         return serve_upstream_path(&s, loc.repo_id, &access, &format!("dist/{rest}")).await;
     };
+    // The sha256 is public (every composer.lock carries it), so it only opens a
+    // blob this repository serves for that package, to a credential that can
+    // read the package. Anything else is indistinguishable from a missing blob.
+    if !access.allows(package)
+        || !s
+            .catalog
+            .repo_serves_dist(loc.repo_id, package, &sha)
+            .await?
+    {
+        return Err(AppError::NotFound);
+    }
     serve_blob(&s, BlobId::from_bytes(sha)).await
 }
 
@@ -1195,6 +1208,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A content-addressed dist URL only opens a blob the repository serves for
+    /// the package named in the URL, to a credential that can read it. The
+    /// sha256 is public (it is in every composer.lock), so it must not reach
+    /// another tenant's blob, another package's blob, or a yanked version.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn dist_only_serves_blobs_of_the_repos_own_packages() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let slug = format!("distscope{}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let mine = cat.create_repo(&slug, "mine").await.unwrap();
+        let theirs = cat.create_repo(&slug, "theirs").await.unwrap();
+        let shared = cat.create_repo(&slug, "shared").await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("sconce-distscope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AnyBlobStore::open(Some(&dir)).unwrap();
+
+        // One 1.0.0 version of `name` in `repo`; returns its blob's sha256 hex.
+        let add = async |repo: Uuid, name: &str| {
+            let bytes = format!("PK\x03\x04{name}").into_bytes();
+            let blob = store.put(&bytes).unwrap();
+            cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+            let pid = cat
+                .upsert_package(
+                    repo,
+                    name,
+                    "upload",
+                    None,
+                    sconce_catalog::Visibility::Private,
+                )
+                .await
+                .unwrap();
+            cat.insert_pushed_version(
+                pid,
+                "1.0.0",
+                "1.0.0.0",
+                "stable",
+                &json!({ "name": name }),
+                blob.as_bytes(),
+                "unused",
+                0,
+            )
+            .await
+            .unwrap();
+            blob.to_hex()
+        };
+        let own = add(mine, "acme/own").await;
+        let other = add(mine, "acme/other").await;
+        let foreign = add(theirs, "rival/secret").await;
+        let granted = add(shared, "shared/lib").await;
+        let yanked = add(mine, "acme/yanked").await;
+        cat.grant_package(mine, shared, "shared/lib").await.unwrap();
+        cat.yank_version(mine, "acme/yanked", "1.0.0.0")
+            .await
+            .unwrap();
+
+        let read = cat.create_token(mine, Some("r"), None).await.unwrap();
+        let (license, license_id) = cat.create_license_key(mine, None).await.unwrap();
+        cat.entitle_package(license_id, mine, "acme/other")
+            .await
+            .unwrap();
+
+        let app = router(cat.clone(), store, "http://localhost".to_owned());
+        let status = async |path: String, cred: &str| {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/{slug}/mine/dist/{path}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {cred}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+
+        assert_eq!(
+            status(format!("acme/own/{own}.zip"), &read).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(format!("shared/lib/{granted}.zip"), &read).await,
+            StatusCode::OK,
+            "a granted package is served"
+        );
+        assert_eq!(
+            status(format!("rival/secret/{foreign}.zip"), &read).await,
+            StatusCode::NOT_FOUND,
+            "another repository's blob"
+        );
+        assert_eq!(
+            status(format!("acme/own/{foreign}.zip"), &read).await,
+            StatusCode::NOT_FOUND,
+            "another repository's blob under an own package's name"
+        );
+        assert_eq!(
+            status(format!("acme/own/{other}.zip"), &read).await,
+            StatusCode::NOT_FOUND,
+            "another package's blob"
+        );
+        assert_eq!(
+            status(format!("acme/yanked/{yanked}.zip"), &read).await,
+            StatusCode::NOT_FOUND,
+            "a yanked version"
+        );
+        // A license key reads only its entitled package.
+        assert_eq!(
+            status(format!("acme/other/{other}.zip"), &license).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(format!("acme/own/{own}.zip"), &license).await,
+            StatusCode::NOT_FOUND,
+            "an unentitled package"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

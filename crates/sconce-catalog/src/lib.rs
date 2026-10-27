@@ -4353,7 +4353,8 @@ impl Catalog {
     /// Resolve a dist path as the repository's upstream served it to the package
     /// name and blob stored for it, so `composer.lock` files written against the
     /// upstream keep installing once its domain points at this repository. Only
-    /// packages the repository itself owns are considered.
+    /// packages the repository itself owns are considered, under the same rules
+    /// as [`Self::repo_serves_dist`] (public-only policy, not yanked).
     pub async fn dist_by_upstream_path(
         &self,
         repo_id: Uuid,
@@ -4363,7 +4364,10 @@ impl Catalog {
             "select p.name, pv.dist_blob_sha256 \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
+             join repositories r on r.id = p.repo_id \
              where p.repo_id = $1 and pv.upstream_dist_path = $2 \
+               and (r.allow_private_packages or p.visibility = 'public') \
+               and pv.yanked_at is null \
              order by pv.id \
              limit 1",
         )
@@ -7221,6 +7225,43 @@ impl Catalog {
             rows.iter().map(row_to_version).collect::<Result<_, _>>()?;
         sort_versions_ascending(&mut versions);
         Ok(versions)
+    }
+
+    /// Whether `blob` is the dist of a version of `name` that `repo_id` serves:
+    /// a package it owns or was granted, not hidden by the repo's public-only
+    /// policy, and not yanked. This is what a content-addressed download is
+    /// checked against: the sha256 in a dist URL is no secret (every
+    /// `composer.lock` carries it), so it must not open a blob from another
+    /// package or tenant.
+    ///
+    /// Deliberately ignores holds and the update policy: those gate which
+    /// versions are *resolved*, and a lock file that already pins a version must
+    /// keep installing when, say, a repo switches to manual approval.
+    pub async fn repo_serves_dist(
+        &self,
+        repo_id: Uuid,
+        name: &str,
+        blob: &[u8; 32],
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(&format!(
+            "select exists ( \
+                 select 1 from package_versions pv \
+                 join packages p on p.id = pv.package_id \
+                 join repositories r on r.id = $1 \
+                 where p.name = $2 \
+                   and pv.dist_blob_sha256 = $3 \
+                   and ( p.repo_id = $1 \
+                         or exists (select 1 from repository_grants g \
+                                    where g.repo_id = $1 and g.package_id = p.id) \
+                         or {GRANT_RULE_EXISTS} ) \
+                   and (r.allow_private_packages or p.visibility = 'public') \
+                   and pv.yanked_at is null )"
+        ))
+        .bind(repo_id)
+        .bind(name)
+        .bind(&blob[..])
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// The versions of a package **visible** under an explicit update policy —
