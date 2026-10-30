@@ -129,6 +129,8 @@ pub struct RepoSettings {
     pub private: bool,
     /// Anonymous access on (public packages readable without a credential).
     pub anonymous: bool,
+    /// The custom domain the repository is served at (operator-set, shown only).
+    pub custom_domain: Option<String>,
     pub org_raw: &'static str,
     pub org_ttl: String,
     pub eff_raw: &'static str,
@@ -726,6 +728,10 @@ pub struct RepoPage {
     pub approvals_count: i64,
     // Overview
     pub base: String,
+    /// The URL to configure in Composer: the custom domain when there is one,
+    /// else `<base>/<org>/<repo>`.
+    pub repo_url: String,
+    /// The hostname Composer keys the credential on (that of `repo_url`).
     pub host: String,
     pub example_pkg: String,
     pub pending_count: i64,
@@ -882,6 +888,7 @@ mod tests {
             filtering: false,
             approvals_count: 0,
             base: "https://x".to_owned(),
+            repo_url: "https://x/o/r".to_owned(),
             host: "x".to_owned(),
             example_pkg: "acme/widget".to_owned(),
             pending_count: 0,

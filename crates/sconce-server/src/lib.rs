@@ -16,6 +16,10 @@
 //! **license key** unlocks only its entitled (purchased) packages — unentitled
 //! packages serve an empty document. A credential from one repo can't read
 //! another. Unknown repo → 404; missing/invalid credential → 401.
+//!
+//! A repository can also have a **custom domain**: requests whose Host is that
+//! domain reach the same read routes at its root (`/packages.json`, `/p2/…`,
+//! `/dist/…`), with every metadata URL on the domain. See `by_host`.
 
 #![forbid(unsafe_code)]
 
@@ -30,14 +34,16 @@ mod snapshots;
 pub mod ui;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
 use sconce_cas::{AnyBlobStore, BlobId, BlobStore};
-use sconce_catalog::Catalog;
+use sconce_catalog::{Catalog, RepoLocation};
 use serde_json::json;
+use tower::ServiceExt as _;
 use uuid::Uuid;
 
 /// Shared handler state.
@@ -57,12 +63,9 @@ struct AppState {
 }
 
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
-/// gated by a token valid *for that repository*.
+/// gated by a token valid *for that repository*, and a repository with a
+/// custom domain also at that domain's root (see `by_host`).
 pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router {
-    // Uploads carry package bytes, so they need a much larger body cap than axum's
-    // 2 MiB default — applied per-route so the read/serving routes keep the default.
-    let max_upload = publish::max_upload_bytes();
-    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
     // Relay-introspection secrets, loaded once at startup. Accept a *set*
     // (comma- or whitespace-separated) so a secret can be rotated with zero
     // downtime: add the new one here and restart, roll the relay onto it, then
@@ -72,6 +75,33 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .ok()
         .map(|raw| parse_introspect_secrets(&raw))
         .unwrap_or_default();
+    let (scheme, main_host) = base_scheme_and_host(&base_url);
+    let state = AppState {
+        catalog,
+        store,
+        base_url,
+        introspect_secrets,
+    };
+    let routing = HostRouting {
+        state: state.clone(),
+        domains: domain_router(state.clone()),
+        main_host,
+        scheme,
+    };
+    // The host decides before any route matches: `Router::layer` would run
+    // after matching, leaking the main routes' path parameters into a
+    // domain's request. A router with only a fallback has no routes to match.
+    Router::new()
+        .fallback_service(main_router(state))
+        .layer(middleware::from_fn_with_state(routing, by_host))
+}
+
+/// Every route of the main host, addressed by `/{org}/{repo}/…`.
+fn main_router(state: AppState) -> Router {
+    // Uploads carry package bytes, so they need a much larger body cap than axum's
+    // 2 MiB default — applied per-route so the read/serving routes keep the default.
+    let max_upload = publish::max_upload_bytes();
+    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
     Router::new()
         .route("/{org}/{repo}/packages.json", get(packages_json))
         .route("/{org}/{repo}/p2/{*rest}", get(p2))
@@ -180,12 +210,7 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
             post(api::merge_license),
         )
         .route("/healthz", get(healthz))
-        .with_state(AppState {
-            catalog,
-            store,
-            base_url,
-            introspect_secrets,
-        })
+        .with_state(state)
 }
 
 /// Unauthenticated health probe for load balancers / orchestrators: `200 ok`
@@ -352,7 +377,18 @@ async fn packages_json(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, _policy) = authorize(&s, loc.repo_id, &headers).await?;
+    let base = repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug);
+    serve_root(&s, &loc, &base, &headers).await
+}
+
+/// The root document of `loc`, with every URL under `base`.
+async fn serve_root(
+    s: &AppState,
+    loc: &RepoLocation,
+    base: &str,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let (access, _policy) = authorize(s, loc.repo_id, headers).await?;
     let names = match access {
         Access::Full => s.catalog.all_package_names(loc.repo_id).await?,
         Access::Licensed(entitled) => {
@@ -362,11 +398,7 @@ async fn packages_json(
         }
         Access::Anonymous => s.catalog.anonymous_package_names(loc.repo_id, None).await?,
     };
-    Ok(Json(sconce_metadata::render_root(
-        &names,
-        &repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug),
-    ))
-    .into_response())
+    Ok(Json(sconce_metadata::render_root(&names, base)).into_response())
 }
 
 async fn p2(
@@ -378,7 +410,20 @@ async fn p2(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, policy) = authorize(&s, loc.repo_id, &headers).await?;
+    let base = repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug);
+    serve_p2(&s, &loc, &base, &rest, &headers).await
+}
+
+/// One package's metadata document (`rest` is `vendor/name[~dev].json`), with
+/// its dist URLs under `base`.
+async fn serve_p2(
+    s: &AppState,
+    loc: &RepoLocation,
+    base: &str,
+    rest: &str,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let (access, policy) = authorize(s, loc.repo_id, headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -389,7 +434,7 @@ async fn p2(
 
     // A license key only unlocks its entitled packages; everything else (and the
     // dev variant) is an empty document.
-    if is_dev || !access.allows(&s, loc.repo_id, package).await? {
+    if is_dev || !access.allows(s, loc.repo_id, package).await? {
         return Ok(Json(json!({ "packages": { package: [] } })).into_response());
     }
 
@@ -420,12 +465,7 @@ async fn p2(
             bound.major,
         )
         .await?;
-    Ok(Json(sconce_metadata::render_package(
-        package,
-        &versions,
-        &repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug),
-    ))
-    .into_response())
+    Ok(Json(sconce_metadata::render_package(package, &versions, base)).into_response())
 }
 
 async fn dist(
@@ -437,7 +477,17 @@ async fn dist(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let (access, _) = authorize(&s, loc.repo_id, &headers).await?;
+    serve_dist(&s, &loc, &rest, &headers).await
+}
+
+/// A download under `dist/` (`rest` is what follows it).
+async fn serve_dist(
+    s: &AppState,
+    loc: &RepoLocation,
+    rest: &str,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let (access, _) = authorize(s, loc.repo_id, headers).await?;
 
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
     // Anything else under `dist/` may be an imported registry's own dist path
@@ -446,12 +496,12 @@ async fn dist(
         .rsplit_once('/')
         .and_then(|(package, file)| Some((package, parse_hex32(file.strip_suffix(".zip")?)?)))
     else {
-        return serve_upstream_path(&s, loc.repo_id, &access, &format!("dist/{rest}")).await;
+        return serve_upstream_path(s, loc.repo_id, &access, &format!("dist/{rest}")).await;
     };
     // The sha256 is public (every composer.lock carries it), so it only opens a
     // blob this repository serves for that package, to a credential that can
     // read the package. Anything else is indistinguishable from a missing blob.
-    if !access.allows(&s, loc.repo_id, package).await?
+    if !access.allows(s, loc.repo_id, package).await?
         || !s
             .catalog
             .repo_serves_dist(loc.repo_id, package, &sha)
@@ -459,7 +509,7 @@ async fn dist(
     {
         return Err(AppError::NotFound);
     }
-    serve_blob(&s, BlobId::from_bytes(sha)).await
+    serve_blob(s, BlobId::from_bytes(sha)).await
 }
 
 /// `GET /{org}/{repo}/{*path}` — a dist path as the repository's upstream served
@@ -480,6 +530,141 @@ async fn upstream_dist(
     };
     let (access, _) = authorize(&s, loc.repo_id, &headers).await?;
     serve_upstream_path(&s, loc.repo_id, &access, &path).await
+}
+
+/// A repository served at the root of its custom domain. [`by_host`] attaches
+/// it to a request whose Host is one, before routing it to [`domain_router`].
+#[derive(Clone)]
+struct DomainRepo {
+    loc: RepoLocation,
+    /// `<scheme>://<host as requested>`: the base of every URL in its metadata.
+    base: String,
+}
+
+/// The routes a custom domain serves: the Composer read routes, at the root.
+/// Publishing, uploads, snapshots and the APIs stay on the main host, so a
+/// domain pointed here exposes nothing a Composer client does not need.
+fn domain_router(state: AppState) -> Router {
+    Router::new()
+        .route("/packages.json", get(domain_packages_json))
+        .route("/p2/{*rest}", get(domain_p2))
+        .route("/dist/{*rest}", get(domain_dist))
+        .route("/healthz", get(healthz))
+        .route("/{*path}", get(domain_upstream_dist))
+        .with_state(state)
+}
+
+async fn domain_packages_json(
+    State(s): State<AppState>,
+    Extension(d): Extension<DomainRepo>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    serve_root(&s, &d.loc, &d.base, &headers).await
+}
+
+async fn domain_p2(
+    State(s): State<AppState>,
+    Extension(d): Extension<DomainRepo>,
+    Path(rest): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    serve_p2(&s, &d.loc, &d.base, &rest, &headers).await
+}
+
+async fn domain_dist(
+    State(s): State<AppState>,
+    Extension(d): Extension<DomainRepo>,
+    Path(rest): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    serve_dist(&s, &d.loc, &rest, &headers).await
+}
+
+async fn domain_upstream_dist(
+    State(s): State<AppState>,
+    Extension(d): Extension<DomainRepo>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (access, _) = authorize(&s, d.loc.repo_id, &headers).await?;
+    serve_upstream_path(&s, d.loc.repo_id, &access, &path).await
+}
+
+/// State for [`by_host`].
+#[derive(Clone)]
+struct HostRouting {
+    state: AppState,
+    domains: Router,
+    /// The main host (from the base URL), which never needs a lookup.
+    main_host: Option<String>,
+    /// `http` or `https`, as the base URL says, for a domain's URLs.
+    scheme: &'static str,
+}
+
+/// Send a request whose Host is a repository's custom domain to that
+/// repository's [`domain_router`]; everything else routes as usual. Only the
+/// Host the request arrived with counts, never `X-Forwarded-Host`, so a reverse
+/// proxy in front must pass it through.
+async fn by_host(State(h): State<HostRouting>, mut req: Request, next: Next) -> Response {
+    let Some(authority) = request_authority(&req) else {
+        return next.run(req).await;
+    };
+    let Some(host) = domain_part(&authority) else {
+        return next.run(req).await;
+    };
+    if h.main_host.as_deref() == Some(host.as_str()) {
+        return next.run(req).await;
+    }
+    match h.state.catalog.repo_by_custom_domain(&host).await {
+        Ok(Some(loc)) => {
+            let base = format!("{}://{authority}", h.scheme);
+            req.extensions_mut().insert(DomainRepo { loc, base });
+            match h.domains.oneshot(req).await {
+                Ok(resp) => resp,
+                Err(never) => match never {},
+            }
+        }
+        Ok(None) => next.run(req).await,
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// The authority a request was made to: the URI's (HTTP/2, absolute-form) or
+/// the Host header (HTTP/1.1).
+fn request_authority(req: &Request) -> Option<String> {
+    if let Some(a) = req.uri().authority() {
+        return Some(a.as_str().to_owned());
+    }
+    req.headers()
+        .get(header::HOST)?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+/// The hostname of an authority, lowercased and without port, when it could be
+/// a custom domain (an IPv6 literal cannot).
+fn domain_part(authority: &str) -> Option<String> {
+    if authority.starts_with('[') {
+        return None;
+    }
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// The scheme and hostname of the base URL.
+fn base_scheme_and_host(base_url: &str) -> (&'static str, Option<String>) {
+    let (scheme, rest) = match base_url.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("https", base_url),
+    };
+    let scheme = if scheme.eq_ignore_ascii_case("http") {
+        "http"
+    } else {
+        "https"
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    (scheme, domain_part(authority))
 }
 
 /// Serve the dist recorded under an upstream path. The path is guessable, unlike
@@ -1361,6 +1546,162 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A custom domain serves its repository's Composer routes at the root, with
+    /// every metadata URL on that domain, and nothing else; other hosts route
+    /// as before.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn custom_domain_serves_the_repo_at_its_root() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let slug = format!("dom{}", std::process::id());
+        let domain = format!("repo-{slug}.example.org");
+        cat.create_org(&slug, None).await.unwrap();
+        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
+        let other = cat.create_repo(&slug, "other").await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("sconce-dom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AnyBlobStore::open(Some(&dir)).unwrap();
+        let pid = cat
+            .upsert_package(
+                repo_id,
+                "open/lib",
+                "composer",
+                None,
+                sconce_catalog::Visibility::Public,
+            )
+            .await
+            .unwrap();
+        let bytes = b"PK\x03\x04open-lib".to_vec();
+        let blob = store.put(&bytes).unwrap();
+        cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+        cat.insert_mirrored_version(
+            pid,
+            "1.0.0",
+            "1.0.0.0",
+            "stable",
+            &json!({ "name": "open/lib" }),
+            blob.as_bytes(),
+            "unused",
+            None,
+            Some("dist/open/lib/open-lib-1.0.0-abc.zip"),
+        )
+        .await
+        .unwrap();
+        let mut settings = cat.repo_settings(repo_id).await.unwrap();
+        settings.anonymous_access = true;
+        cat.set_repo_settings(repo_id, settings).await.unwrap();
+
+        // Normalised on the way in, and one repository per hostname.
+        let stored = cat
+            .set_custom_domain(repo_id, Some(&format!(" {}. ", domain.to_uppercase())))
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(domain.as_str()));
+        assert!(matches!(
+            cat.set_custom_domain(other, Some(&domain)).await,
+            Err(sconce_catalog::CustomDomainError::Taken)
+        ));
+        for bad in [
+            "https://x.org",
+            "x.org:443",
+            "x.org/p",
+            "localhost",
+            "10.0.0.1",
+            "*.x.org",
+        ] {
+            assert!(
+                matches!(
+                    cat.set_custom_domain(other, Some(bad)).await,
+                    Err(sconce_catalog::CustomDomainError::Invalid)
+                ),
+                "{bad}"
+            );
+        }
+
+        let app = router(cat.clone(), store, "https://sconce.example".to_owned());
+        let send = async |method: Method, host: &str, path: &str| {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            let r = app.clone().oneshot(req).await.unwrap();
+            let status = r.status();
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let get = async |host: &str, path: &str| send(Method::GET, host, path).await;
+
+        // The root document, with its URLs on the domain (port kept).
+        let host = format!("{domain}:8443");
+        let (status, root) = get(&host, "/packages.json").await;
+        assert_eq!(status, StatusCode::OK, "{root}");
+        let root: serde_json::Value = serde_json::from_str(&root).unwrap();
+        assert_eq!(root["available-packages"], json!(["open/lib"]));
+        assert_eq!(
+            root["metadata-url"],
+            json!(format!("https://{host}/p2/%package%.json"))
+        );
+
+        // Package metadata: its dist URL is on the domain too, and serves.
+        let (status, doc) = get(&host, "/p2/open/lib.json").await;
+        assert_eq!(status, StatusCode::OK, "{doc}");
+        let doc: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let dist = doc["packages"]["open/lib"][0]["dist"]["url"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let prefix = format!("https://{host}/");
+        let dist_path = dist.strip_prefix(&prefix).expect("dist on the domain");
+        assert_eq!(get(&host, &format!("/{dist_path}")).await.0, StatusCode::OK);
+        // And the upstream's own dist path, for existing lock files.
+        let (status, body) = get(&domain, "/dist/open/lib/open-lib-1.0.0-abc.zip").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_bytes(), bytes.as_slice());
+
+        // Only the Composer read routes exist there: no publish, no slug paths.
+        let publish = "/packages/open/lib/2.0.0";
+        assert_eq!(
+            send(Method::PUT, &domain, publish).await.0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            get(&domain, &format!("/{slug}/r/packages.json")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(get(&domain, "/healthz").await.0, StatusCode::OK);
+
+        // The main host and unknown hosts route by slug, as before.
+        for host in ["sconce.example", "other.example.org", "127.0.0.1:8080"] {
+            let (status, root) = get(host, &format!("/{slug}/r/packages.json")).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+            let root: serde_json::Value = serde_json::from_str(&root).unwrap();
+            assert_eq!(
+                root["metadata-url"],
+                json!(format!("https://sconce.example/{slug}/r/p2/%package%.json")),
+                "{host}"
+            );
+        }
+
+        // Cleared, the domain is just another unknown host.
+        assert_eq!(cat.set_custom_domain(repo_id, None).await.unwrap(), None);
+        assert_eq!(
+            get(&domain, "/packages.json").await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// Anonymous access: off by default; when on, a request with no credential

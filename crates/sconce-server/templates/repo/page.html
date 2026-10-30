@@ -46,7 +46,7 @@
     <div>
       <h3 style="margin:0 0 11px;font-size:15px;font-weight:600">Install in &lt;5 minutes</h3>
       <div class=term>
-        <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config repositories.{{ repo }} composer <span class=url>{{ base }}/{{ org }}/{{ repo }}</span></code></div>
+        <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config repositories.{{ repo }} composer <span class=url>{{ repo_url }}</span></code></div>
         <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> config --auth http-basic.{{ host }} token <span class=tok>&lt;YOUR_TOKEN&gt;</span></code></div>
         <div class=ln><span class=pr>$</span><code><span class=cmd>composer</span> require {{ example_pkg }}</code></div>
       </div>

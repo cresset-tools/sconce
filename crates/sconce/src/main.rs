@@ -457,6 +457,25 @@ enum Command {
         database_url: String,
     },
 
+    /// Show, set or clear the custom domain a repo is served at.
+    ///
+    /// Its Composer routes then answer at that hostname's root, with no
+    /// `/<org>/<repo>` prefix, so an existing registry's users keep their URLs. Point the
+    /// domain's DNS (or CDN) at this server, passing the Host header through.
+    /// Nothing proves you control the domain, which is why this is an operator
+    /// command and not a dashboard setting.
+    RepoDomain {
+        /// Repository, as `<org>/<repo>`.
+        repo: String,
+        /// Hostname, like `repo.example.org`. Omit to show the current one.
+        domain: Option<String>,
+        /// Stop serving the repo at its custom domain.
+        #[arg(long, conflicts_with = "domain")]
+        clear: bool,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
+
     /// Create (or update) an admin-UI user. Use `--superadmin` for the first,
     /// all-tenant account.
     UserCreate {
@@ -1384,6 +1403,12 @@ fn main() -> Result<()> {
             anonymous_access,
             &database_url,
         ),
+        Command::RepoDomain {
+            repo,
+            domain,
+            clear,
+            database_url,
+        } => repo_domain(&repo, domain.as_deref(), clear, &database_url),
         Command::RepoCreate {
             org,
             repo,
@@ -2714,6 +2739,28 @@ fn repo_settings(
         println!("effective policy:");
         println!("  allow_raw_tokens   = {}", effective.allow_raw_tokens);
         println!("  max_token_ttl_days = {eff_ttl}");
+        Ok(())
+    })
+}
+
+fn repo_domain(repo: &str, domain: Option<&str>, clear: bool, database_url: &str) -> Result<()> {
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let current = if clear || domain.is_some() {
+            catalog
+                .set_custom_domain(repo_id, domain)
+                .await
+                .context("setting the custom domain")?
+        } else {
+            catalog
+                .custom_domain(repo_id)
+                .await
+                .context("loading the custom domain")?
+        };
+        match current {
+            Some(d) => println!("repo {repo} is served at https://{d}/packages.json"),
+            None => println!("repo {repo} has no custom domain"),
+        }
         Ok(())
     })
 }

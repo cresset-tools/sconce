@@ -441,6 +441,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0058_repo_anonymous_access",
         include_str!("../migrations/0058_repo_anonymous_access.sql"),
     ),
+    (
+        "0059_repo_custom_domain",
+        include_str!("../migrations/0059_repo_custom_domain.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -933,6 +937,41 @@ pub enum RenameError {
     /// Invalid (empty/malformed) slug.
     #[error("invalid name")]
     Invalid,
+}
+
+/// Why a custom domain could not be set.
+#[derive(Debug, thiserror::Error)]
+pub enum CustomDomainError {
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    /// Another repository already serves this hostname.
+    #[error("another repository already uses that domain")]
+    Taken,
+    /// Not a bare hostname (no scheme, port, path or wildcard).
+    #[error("not a valid hostname: give it bare, like repo.example.org")]
+    Invalid,
+}
+
+/// Normalise a custom domain to how it is stored: lowercase, no trailing dot.
+/// `None` if it is not a bare, fully qualified DNS hostname (at least two
+/// labels of letters, digits and inner hyphens, no scheme, port or path).
+#[must_use]
+pub fn normalize_custom_domain(raw: &str) -> Option<String> {
+    let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |l: &&str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    // A numeric top label means an IP address, not a name.
+    let tld_alpha = labels
+        .last()
+        .is_some_and(|l| l.bytes().any(|b| b.is_ascii_alphabetic()));
+    (host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label_ok) && tld_alpha)
+        .then_some(host)
 }
 
 /// Where an `(org, repo)` slug pair currently resolves: the repo id, its
@@ -4719,6 +4758,68 @@ impl Catalog {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The custom domain a repository is served at, if any (see
+    /// [`Self::set_custom_domain`]).
+    pub async fn custom_domain(&self, repo_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("select custom_domain from repositories where id = $1")
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(Option::flatten)
+    }
+
+    /// Serve a repository at the root of `domain`, or stop (`None`). The
+    /// hostname is normalised (see [`normalize_custom_domain`]) and may belong
+    /// to one repository only.
+    ///
+    /// Nothing here proves the caller controls the domain, so this is for the
+    /// operator: on a shared deployment a tenant able to claim any hostname
+    /// could take over a domain that its owner later points here.
+    pub async fn set_custom_domain(
+        &self,
+        repo_id: Uuid,
+        domain: Option<&str>,
+    ) -> Result<Option<String>, CustomDomainError> {
+        let domain = match domain {
+            Some(raw) => Some(normalize_custom_domain(raw).ok_or(CustomDomainError::Invalid)?),
+            None => None,
+        };
+        let res = sqlx::query("update repositories set custom_domain = $2 where id = $1")
+            .bind(repo_id)
+            .bind(&domain)
+            .execute(&self.pool)
+            .await;
+        match res {
+            Ok(r) if r.rows_affected() == 0 => Err(sqlx::Error::RowNotFound.into()),
+            Ok(_) => Ok(domain),
+            Err(e) if is_unique_violation(&e) => Err(CustomDomainError::Taken),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The repository served at the root of `host` (a request's Host, any port
+    /// already removed), with its current slugs. Never `moved`: a domain names
+    /// the repository itself, not a slug that might have been renamed.
+    pub async fn repo_by_custom_domain(
+        &self,
+        host: &str,
+    ) -> Result<Option<RepoLocation>, sqlx::Error> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let row: Option<(Uuid, String, String)> = sqlx::query_as(
+            "select r.id, o.slug, r.slug from repositories r \
+             join organizations o on o.id = r.org_id where r.custom_domain = $1",
+        )
+        .bind(host)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(repo_id, org_slug, repo_slug)| RepoLocation {
+            repo_id,
+            org_slug,
+            repo_slug,
+            moved: false,
+        }))
     }
 
     /// Register an upstream for a repo. `credential` is the already-encrypted

@@ -1130,6 +1130,7 @@ async fn repo_settings_page(
             .unwrap_or_default(),
         private: repo_cfg.allow_private_packages,
         anonymous: repo_cfg.anonymous_access,
+        custom_domain: s.catalog.custom_domain(summary.id).await.map_err(e500)?,
         org_raw: if org_cfg.allow_raw_tokens {
             "allowed"
         } else {
@@ -3420,6 +3421,12 @@ async fn repo_page(
         .next()
         .unwrap_or(&base)
         .to_owned();
+    // A custom domain replaces the `/<org>/<repo>` URL in what we tell users.
+    let scheme = base.split_once("://").map_or("https", |(scheme, _)| scheme);
+    let (repo_url, host) = match s.catalog.custom_domain(summary.id).await.map_err(e500)? {
+        Some(domain) => (format!("{scheme}://{domain}"), domain),
+        None => (format!("{base}/{org}/{repo}"), host),
+    };
     let example_pkg = packages
         .first()
         .map_or_else(|| "<package>".to_owned(), |p| p.name.clone());
@@ -3462,6 +3469,7 @@ async fn repo_page(
         filtering,
         approvals_count: pending_count + held_count,
         base,
+        repo_url,
         host,
         example_pkg,
         pending_count,
