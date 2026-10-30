@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.1...sconce-v0.8.0) (2026-10-30)
+
+
+### Features
+
+* anonymous access to a repository's public packages ([e4cd1e1](https://github.com/cresset-tools/sconce/commit/e4cd1e152db1579ed86318871f02377e4cefece7))
+* let a package's owner declare its visibility ([570eeeb](https://github.com/cresset-tools/sconce/commit/570eeebbf1b157c30a9cddd84672752e7e743f30))
+* **mirror:** never change a version once it is mirrored from a composer upstream ([3542666](https://github.com/cresset-tools/sconce/commit/35426669ec653050f5ce782d7b61596978324686))
+* **server:** serve imported registries' dists under their original paths ([2cf0037](https://github.com/cresset-tools/sconce/commit/2cf00372a5a68cf17837cbf96f2355deebbbb5f4))
+
+
+### Bug Fixes
+
+* **mirror:** accept composer dists published without a shasum ([d2d6008](https://github.com/cresset-tools/sconce/commit/d2d600808ac74f26b79242f17893af91756659ab))
+* **server:** only serve a dist blob that the repository serves for that package ([275555e](https://github.com/cresset-tools/sconce/commit/275555ef04a0241a5e7f4e722a71d7476cb4d1f9))
+
 ## [0.7.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.0...sconce-v0.7.1) (2026-08-11)
 
 
