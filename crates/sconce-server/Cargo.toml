@@ -18,7 +18,7 @@ sconce-archive = { workspace = true }
 # Composer version normalization for a published version string.
 composer-semver = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "signal"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
 base64 = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
@@ -42,11 +42,10 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-# Hand a custom domain's requests to its own router (`ServiceExt::oneshot`);
-# the tests drive the router in-process the same way.
-tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
+# Drive the router in-process (oneshot) for the publish integration test.
+tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [lints]
