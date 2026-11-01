@@ -442,12 +442,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0058_repo_anonymous_access.sql"),
     ),
     (
-        "0059_repo_custom_domain",
-        include_str!("../migrations/0059_repo_custom_domain.sql"),
-    ),
-    (
-        "0060_repo_members",
-        include_str!("../migrations/0060_repo_members.sql"),
+        "0059_authorization_codes",
+        include_str!("../migrations/0059_authorization_codes.sql"),
     ),
 ];
 
@@ -914,16 +910,6 @@ pub enum UpsertPackageError {
     Policy(String),
 }
 
-/// Why setting a repository's members failed.
-#[derive(Debug, thiserror::Error)]
-pub enum RepoMembersError {
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
-    /// The members break a rule; the string says which.
-    #[error("{0}")]
-    Invalid(String),
-}
-
 /// Why creating a token failed — a database error, or an org policy that forbids
 /// it (so callers can show the user a clear reason instead of a 500).
 #[derive(Debug, thiserror::Error)]
@@ -951,41 +937,6 @@ pub enum RenameError {
     /// Invalid (empty/malformed) slug.
     #[error("invalid name")]
     Invalid,
-}
-
-/// Why a custom domain could not be set.
-#[derive(Debug, thiserror::Error)]
-pub enum CustomDomainError {
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
-    /// Another repository already serves this hostname.
-    #[error("another repository already uses that domain")]
-    Taken,
-    /// Not a bare hostname (no scheme, port, path or wildcard).
-    #[error("not a valid hostname: give it bare, like repo.example.org")]
-    Invalid,
-}
-
-/// Normalise a custom domain to how it is stored: lowercase, no trailing dot.
-/// `None` if it is not a bare, fully qualified DNS hostname (at least two
-/// labels of letters, digits and inner hyphens, no scheme, port or path).
-#[must_use]
-pub fn normalize_custom_domain(raw: &str) -> Option<String> {
-    let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
-    let labels: Vec<&str> = host.split('.').collect();
-    let label_ok = |l: &&str| {
-        !l.is_empty()
-            && l.len() <= 63
-            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-    };
-    // A numeric top label means an IP address, not a name.
-    let tld_alpha = labels
-        .last()
-        .is_some_and(|l| l.bytes().any(|b| b.is_ascii_alphabetic()));
-    (host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label_ok) && tld_alpha)
-        .then_some(host)
 }
 
 /// Where an `(org, repo)` slug pair currently resolves: the repo id, its
@@ -1077,6 +1028,19 @@ pub enum DeviceFlowPoll {
     Denied,
     /// Unknown `device_code`, or the flow expired.
     Expired,
+}
+
+/// What a member approved on the `/authorize` page, for
+/// [`Catalog::create_authorization_code`].
+#[derive(Debug)]
+pub struct AuthorizationGrant<'a> {
+    pub org_id: Uuid,
+    /// The approving user; `None` in single-tenant mode (no accounts).
+    pub approved_by: Option<Uuid>,
+    pub client_id: &'a str,
+    pub redirect_uri: &'a str,
+    /// `BASE64URL(SHA256(code_verifier))`, unpadded (RFC 7636 S256).
+    pub code_challenge: &'a str,
 }
 
 /// An org-scoped session token resolved for relay introspection: the org it
@@ -1477,16 +1441,6 @@ pub struct PackageVersion {
     pub source_reference: Option<String>,
 }
 
-/// One version a repository serves, as its human index lists it.
-#[derive(Debug, Clone)]
-pub struct VersionSummary {
-    pub name: String,
-    pub version: String,
-    pub normalized_version: String,
-    pub stability: String,
-    pub description: Option<String>,
-}
-
 /// Shared WHERE fragment for the admin package-version list/count: `$2` = name
 /// (`ilike`, null = any), `$3` = state (`held`|`yanked`|`approved`|`pending`,
 /// null = any). `pending` = gated by the repo policy (the approval queue):
@@ -1516,18 +1470,6 @@ const GRANT_RULE_EXISTS: &str = "exists ( \
             or ( p.repo_id in (select rr.id from repositories rr where rr.org_id = ps.org_id) \
                  and exists (select 1 from package_set_rules sr \
                              where sr.set_id = gr.set_id and p.name like replace(sr.glob, '*', '%')) ) ) )";
-
-/// SQL `exists(...)` testing whether package `p` reaches repo `$1` as one of its
-/// **member repositories'** own packages, and is not shadowed: an earlier
-/// member owning a package of the same name serves that name instead.
-/// References `p.repo_id`/`p.name`.
-const MEMBER_EXISTS: &str = "exists ( \
-    select 1 from repository_members m \
-    where m.repo_id = $1 and m.member_repo_id = p.repo_id \
-      and not exists ( \
-          select 1 from repository_members m2 \
-          join packages p2 on p2.repo_id = m2.member_repo_id and p2.name = p.name \
-          where m2.repo_id = $1 and m2.position < m.position ) )";
 
 impl Catalog {
     /// Connect to Postgres at `database_url` (e.g.
@@ -3674,6 +3616,75 @@ impl Catalog {
         })
     }
 
+    /// Issue a one-time authorization code (RFC 6749 §4.1) for a signed-in
+    /// member's approval: bound to `org_id`, the client, the exact
+    /// `redirect_uri` and the PKCE `code_challenge` (S256), stored only as its
+    /// sha256. Also clears out codes that expired unredeemed. TTL in seconds.
+    pub async fn create_authorization_code(
+        &self,
+        grant: &AuthorizationGrant<'_>,
+        ttl_secs: i64,
+    ) -> Result<String, sqlx::Error> {
+        sqlx::query("delete from authorization_codes where expires_at <= now()")
+            .execute(&self.pool)
+            .await?;
+        let code = generate_secret("scac_");
+        sqlx::query(
+            "insert into authorization_codes \
+             (code_hash, org_id, approved_by, client_id, redirect_uri, code_challenge, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
+        )
+        .bind(token_hash(&code))
+        .bind(grant.org_id)
+        .bind(grant.approved_by)
+        .bind(grant.client_id)
+        .bind(grant.redirect_uri)
+        .bind(grant.code_challenge)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(code)
+    }
+
+    /// Redeem an authorization code: returns the org to mint a token for when
+    /// the code is fresh and the request repeats the same `client_id` and
+    /// `redirect_uri` and presents the PKCE verifier for its challenge.
+    ///
+    /// The code is consumed by the attempt whether or not it succeeds, so a
+    /// code that leaked can't be retried against with guessed verifiers.
+    pub async fn redeem_authorization_code(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let row = sqlx::query(
+            "delete from authorization_codes where code_hash = $1 \
+             returning org_id, client_id, redirect_uri, code_challenge, \
+             expires_at > now() as fresh",
+        )
+        .bind(token_hash(code))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let fresh: bool = row.try_get("fresh")?;
+        let bound_client: String = row.try_get("client_id")?;
+        let bound_redirect: String = row.try_get("redirect_uri")?;
+        let challenge: String = row.try_get("code_challenge")?;
+        let ok = fresh
+            && bound_client == client_id
+            && bound_redirect == redirect_uri
+            && pkce_s256_matches(code_verifier, &challenge);
+        Ok(if ok {
+            Some(row.try_get("org_id")?)
+        } else {
+            None
+        })
+    }
+
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
     ///
     /// Concurrent migrators (multiple app instances starting at once, or
@@ -4000,13 +4011,6 @@ impl Catalog {
         };
         if effective == Visibility::Private {
             self.ensure_private_allowed(repo_id).await?;
-        }
-        if self.has_members(repo_id).await? {
-            return Err(UpsertPackageError::Policy(
-                "this repository is made of member repositories and holds no packages \
-                 of its own: publish or mirror into one of its members"
-                    .to_owned(),
-            ));
         }
         let id = sqlx::query_scalar(
             "insert into packages (repo_id, name, kind, source, visibility) values ($1, $2, $3, $4, $5) \
@@ -4534,26 +4538,25 @@ impl Catalog {
 
     /// Resolve a dist path as the repository's upstream served it to the package
     /// name and blob stored for it, so `composer.lock` files written against the
-    /// upstream keep installing once its domain points at this repository. The
-    /// packages the repository owns are considered, and its member repositories'
-    /// (unless shadowed, as on every read path), under the same rules as
-    /// [`Self::repo_serves_dist`] (public-only policy, not yanked).
+    /// upstream keep installing once its domain points at this repository. Only
+    /// packages the repository itself owns are considered, under the same rules
+    /// as [`Self::repo_serves_dist`] (public-only policy, not yanked).
     pub async fn dist_by_upstream_path(
         &self,
         repo_id: Uuid,
         upstream_dist_path: &str,
     ) -> Result<Option<(String, [u8; 32])>, sqlx::Error> {
-        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(&format!(
+        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
             "select p.name, pv.dist_blob_sha256 \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             join repositories r on r.id = $1 \
-             where (p.repo_id = $1 or {MEMBER_EXISTS}) and pv.upstream_dist_path = $2 \
+             join repositories r on r.id = p.repo_id \
+             where p.repo_id = $1 and pv.upstream_dist_path = $2 \
                and (r.allow_private_packages or p.visibility = 'public') \
                and pv.yanked_at is null \
              order by pv.id \
-             limit 1"
-        ))
+             limit 1",
+        )
         .bind(repo_id)
         .bind(upstream_dist_path)
         .fetch_optional(&self.pool)
@@ -4802,171 +4805,6 @@ impl Catalog {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Whether `repo_id` is made of member repositories.
-    pub async fn has_members(&self, repo_id: Uuid) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("select exists (select 1 from repository_members where repo_id = $1)")
-            .bind(repo_id)
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    /// The member repositories of `repo_id`, in order, as `(id, "org/repo")`.
-    pub async fn repo_members(&self, repo_id: Uuid) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-        sqlx::query_as(
-            "select r.id, o.slug || '/' || r.slug from repository_members m \
-             join repositories r on r.id = m.member_repo_id \
-             join organizations o on o.id = r.org_id \
-             where m.repo_id = $1 order by m.position",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await
-    }
-
-    /// Replace the member repositories of `repo_id` with `members`, in that
-    /// order (empty clears them, making it an ordinary repository again).
-    /// Members must be other repositories of the same org, none of them made
-    /// of members itself; and a repository with members owns no packages and
-    /// is no other repository's member.
-    pub async fn set_repo_members(
-        &self,
-        repo_id: Uuid,
-        members: &[Uuid],
-    ) -> Result<(), RepoMembersError> {
-        let mut tx = self.pool.begin().await?;
-        if !members.is_empty() {
-            let mut seen = std::collections::HashSet::new();
-            for m in members {
-                if *m == repo_id {
-                    return Err(RepoMembersError::Invalid(
-                        "a repository cannot be its own member".into(),
-                    ));
-                }
-                if !seen.insert(*m) {
-                    return Err(RepoMembersError::Invalid("a member is listed twice".into()));
-                }
-            }
-            let other_org: bool = sqlx::query_scalar(
-                "select exists (select 1 from repositories m, repositories r \
-                                where r.id = $1 and m.id = any($2) and m.org_id <> r.org_id) \
-                    or (select count(*) from repositories where id = any($2)) <> cardinality($2)",
-            )
-            .bind(repo_id)
-            .bind(members)
-            .fetch_one(&mut *tx)
-            .await?;
-            if other_org {
-                return Err(RepoMembersError::Invalid(
-                    "members must be repositories of the same organization".into(),
-                ));
-            }
-            let nested: bool = sqlx::query_scalar(
-                "select exists (select 1 from repository_members where repo_id = any($1)) \
-                    or exists (select 1 from repository_members where member_repo_id = $2)",
-            )
-            .bind(members)
-            .bind(repo_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if nested {
-                return Err(RepoMembersError::Invalid(
-                    "only one level: a member cannot have members, and a repository with \
-                     members cannot be a member"
-                        .into(),
-                ));
-            }
-            let owns: bool =
-                sqlx::query_scalar("select exists (select 1 from packages where repo_id = $1)")
-                    .bind(repo_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if owns {
-                return Err(RepoMembersError::Invalid(
-                    "the repository owns packages; a repository with members holds none of its own"
-                        .into(),
-                ));
-            }
-        }
-        sqlx::query("delete from repository_members where repo_id = $1")
-            .bind(repo_id)
-            .execute(&mut *tx)
-            .await?;
-        for (position, m) in members.iter().enumerate() {
-            sqlx::query(
-                "insert into repository_members (repo_id, member_repo_id, position) values ($1, $2, $3)",
-            )
-            .bind(repo_id)
-            .bind(m)
-            .bind(i32::try_from(position).unwrap_or(i32::MAX))
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// The custom domain a repository is served at, if any (see
-    /// [`Self::set_custom_domain`]).
-    pub async fn custom_domain(&self, repo_id: Uuid) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("select custom_domain from repositories where id = $1")
-            .bind(repo_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map(Option::flatten)
-    }
-
-    /// Serve a repository at the root of `domain`, or stop (`None`). The
-    /// hostname is normalised (see [`normalize_custom_domain`]) and may belong
-    /// to one repository only.
-    ///
-    /// Nothing here proves the caller controls the domain, so this is for the
-    /// operator: on a shared deployment a tenant able to claim any hostname
-    /// could take over a domain that its owner later points here.
-    pub async fn set_custom_domain(
-        &self,
-        repo_id: Uuid,
-        domain: Option<&str>,
-    ) -> Result<Option<String>, CustomDomainError> {
-        let domain = match domain {
-            Some(raw) => Some(normalize_custom_domain(raw).ok_or(CustomDomainError::Invalid)?),
-            None => None,
-        };
-        let res = sqlx::query("update repositories set custom_domain = $2 where id = $1")
-            .bind(repo_id)
-            .bind(&domain)
-            .execute(&self.pool)
-            .await;
-        match res {
-            Ok(r) if r.rows_affected() == 0 => Err(sqlx::Error::RowNotFound.into()),
-            Ok(_) => Ok(domain),
-            Err(e) if is_unique_violation(&e) => Err(CustomDomainError::Taken),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// The repository served at the root of `host` (a request's Host, any port
-    /// already removed), with its current slugs. Never `moved`: a domain names
-    /// the repository itself, not a slug that might have been renamed.
-    pub async fn repo_by_custom_domain(
-        &self,
-        host: &str,
-    ) -> Result<Option<RepoLocation>, sqlx::Error> {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        let row: Option<(Uuid, String, String)> = sqlx::query_as(
-            "select r.id, o.slug, r.slug from repositories r \
-             join organizations o on o.id = r.org_id where r.custom_domain = $1",
-        )
-        .bind(host)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(repo_id, org_slug, repo_slug)| RepoLocation {
-            repo_id,
-            org_slug,
-            repo_slug,
-            moved: false,
-        }))
     }
 
     /// Register an upstream for a repo. `credential` is the already-encrypted
@@ -7550,8 +7388,7 @@ impl Catalog {
                and ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
                                 where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} \
-                     or {MEMBER_EXISTS} ) \
+                     or {GRANT_RULE_EXISTS} ) \
              order by p.name"
         ))
         .bind(repo_id)
@@ -7577,8 +7414,7 @@ impl Catalog {
              where ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
                                 where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} \
-                     or {MEMBER_EXISTS} ) \
+                     or {GRANT_RULE_EXISTS} ) \
                and ($2::text is null or p.name = $2) \
              group by p.name \
              having bool_and(p.visibility = 'public') \
@@ -7642,8 +7478,7 @@ impl Catalog {
                    and ( p.repo_id = $1 \
                          or exists (select 1 from repository_grants g \
                                     where g.repo_id = $1 and g.package_id = p.id) \
-                         or {GRANT_RULE_EXISTS} \
-                         or {MEMBER_EXISTS} ) \
+                         or {GRANT_RULE_EXISTS} ) \
                    and (r.allow_private_packages or p.visibility = 'public') \
                    and pv.yanked_at is null )"
         ))
@@ -7681,16 +7516,24 @@ impl Catalog {
              join packages p on p.id = pv.package_id \
              join repositories r on r.id = $1 \
              where p.name = $2 \
-               and {scope} \
-               and {gate} \
+               and ( p.repo_id = $1 \
+                     or exists (select 1 from repository_grants g \
+                                where g.repo_id = $1 and g.package_id = p.id) \
+                     or {GRANT_RULE_EXISTS} ) \
+               and (r.allow_private_packages or p.visibility = 'public') \
+               and pv.yanked_at is null \
+               and pv.held_at is null \
+               and ( $3 = 'auto' \
+                     or pv.approved_at is not null \
+                     or ( $3 = 'delayed' \
+                          and pv.released_at is not null \
+                          and pv.released_at + make_interval(days => $4) <= now() ) ) \
                and ( $5::bigint is null \
                      or ( coalesce(pv.entitlement_date, pv.released_at) is not null \
                           and coalesce(pv.entitlement_date, pv.released_at) \
                               - make_interval(days => pv.grace_days) <= to_timestamp($5::double precision) ) ) \
                and ( $6::int is null \
-                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 )",
-            scope = served_scope(),
-            gate = policy_gate("$3", "$4"),
+                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 )"
         ))
         .bind(repo_id)
         .bind(name)
@@ -7704,52 +7547,6 @@ impl Catalog {
             rows.iter().map(row_to_version).collect::<Result<_, _>>()?;
         sort_versions_ascending(&mut versions);
         Ok(versions)
-    }
-
-    /// Every package version `repo_id` serves under `(mode, cooldown_days)`,
-    /// for its human index: one row per version with the package name and its
-    /// description, newest last within each package. The same rules as
-    /// [`Self::visible_versions`] with no license bound; the caller narrows
-    /// the names to what the viewer may read.
-    pub async fn served_version_summaries(
-        &self,
-        repo_id: Uuid,
-        mode: &str,
-        cooldown_days: i32,
-    ) -> Result<Vec<VersionSummary>, sqlx::Error> {
-        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(&format!(
-            "select p.name, pv.version, pv.normalized_version, pv.stability, \
-                        pv.composer_json->>'description' \
-                 from package_versions pv \
-                 join packages p on p.id = pv.package_id \
-                 join repositories r on r.id = $1 \
-                 where {scope} and {gate}",
-            scope = served_scope(),
-            gate = policy_gate("$2", "$3"),
-        ))
-        .bind(repo_id)
-        .bind(mode)
-        .bind(cooldown_days)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out: Vec<VersionSummary> = rows
-            .into_iter()
-            .map(
-                |(name, version, normalized_version, stability, description)| VersionSummary {
-                    name,
-                    version,
-                    normalized_version,
-                    stability,
-                    description,
-                },
-            )
-            .collect();
-        out.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| compare_normalized(&a.normalized_version, &b.normalized_version))
-        });
-        Ok(out)
     }
 
     /// A repository's update policy: `(update_mode, cooldown_days)`.
@@ -7928,6 +7725,30 @@ fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
+/// RFC 7636 S256: whether `BASE64URL(SHA256(verifier))` equals `challenge`.
+/// A verifier outside the RFC's 43–128 unreserved characters never matches.
+fn pkce_s256_matches(verifier: &str, challenge: &str) -> bool {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let well_formed = (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
+    if !well_formed {
+        return false;
+    }
+    let digest = Sha256::digest(verifier.as_bytes());
+    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    // Both sides are public-length base64 of a digest; compare without an
+    // early exit anyway.
+    expected.len() == challenge.len()
+        && expected
+            .bytes()
+            .zip(challenge.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 /// Whether a query error is a Postgres unique-constraint violation (SQLSTATE
 /// 23505) — used to turn a lost idempotency race into a graceful replay.
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -8008,44 +7829,16 @@ async fn run_migrations(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error
 /// A value that fails to parse falls back to a string comparison, keeping the
 /// ordering total.
 fn sort_versions_ascending(versions: &mut [PackageVersion]) {
-    versions.sort_by(|a, b| compare_normalized(&a.normalized_version, &b.normalized_version));
-}
-
-/// Order two normalized versions as Composer does, falling back to text.
-fn compare_normalized(a: &str, b: &str) -> std::cmp::Ordering {
     use composer_semver::Version;
-    match (Version::parse(a), Version::parse(b)) {
-        (Ok(va), Ok(vb)) => va.cmp(&vb),
-        _ => a.cmp(b),
-    }
-}
-
-/// The packages repository `$1` serves (aliased `p`, with `r` its row): its
-/// own, granted ones, and those a grant rule brings in, minus private ones in
-/// a public-only repository.
-fn served_scope() -> String {
-    format!(
-        "( p.repo_id = $1 \
-           or exists (select 1 from repository_grants g \
-                      where g.repo_id = $1 and g.package_id = p.id) \
-           or {GRANT_RULE_EXISTS} \
-           or {MEMBER_EXISTS} ) \
-         and (r.allow_private_packages or p.visibility = 'public')"
-    )
-}
-
-/// The update-policy gate on a version `pv`, given the SQL for the mode and
-/// cooldown: not yanked, not held, and released under the policy.
-fn policy_gate(mode: &str, cooldown_days: &str) -> String {
-    format!(
-        "pv.yanked_at is null \
-         and pv.held_at is null \
-         and ( {mode} = 'auto' \
-               or pv.approved_at is not null \
-               or ( {mode} = 'delayed' \
-                    and pv.released_at is not null \
-                    and pv.released_at + make_interval(days => {cooldown_days}) <= now() ) )"
-    )
+    versions.sort_by(|a, b| {
+        match (
+            Version::parse(&a.normalized_version),
+            Version::parse(&b.normalized_version),
+        ) {
+            (Ok(va), Ok(vb)) => va.cmp(&vb),
+            _ => a.normalized_version.cmp(&b.normalized_version),
+        }
+    });
 }
 
 fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<PackageVersion, sqlx::Error> {
@@ -8925,6 +8718,91 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, ["api", "r", "web"]);
+    }
+
+    #[test]
+    fn pkce_s256_matches_base64url_sha256_of_the_verifier() {
+        // Challenge computed independently:
+        // printf %s "$verifier" | openssl dgst -sha256 -binary | basenc --base64url
+        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
+        let challenge = "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o";
+        assert!(pkce_s256_matches(verifier, challenge));
+        assert!(!pkce_s256_matches(
+            "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Z",
+            challenge
+        ));
+        assert!(
+            !pkce_s256_matches("short", challenge),
+            "too short to be a verifier"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_code_redeems_once_with_matching_pkce_and_redirect() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of(&cat, repo_id).await;
+        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
+        let redirect = "http://127.0.0.1:53682/callback";
+        let grant = AuthorizationGrant {
+            org_id,
+            approved_by: None,
+            client_id: "bougie-cli",
+            redirect_uri: redirect,
+            code_challenge: "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o",
+        };
+
+        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            Some(org_id)
+        );
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            None,
+            "a code works once"
+        );
+
+        // A wrong redirect_uri fails, and burns the code.
+        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
+        let other = "http://127.0.0.1:1/callback";
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", other, verifier)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            None,
+            "a failed attempt consumes the code"
+        );
+
+        // A wrong verifier fails.
+        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
+        let wrong = "x".repeat(43);
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, &wrong)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // An expired code fails.
+        let code = cat.create_authorization_code(&grant, -1).await.unwrap();
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -10031,163 +9909,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    /// A repository made of members serves what they own, in order: the first
-    /// member owning a name serves it, even when a later one has more versions.
-    #[tokio::test]
-    async fn member_repositories_serve_their_packages_first_member_first() {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let Some(cat) = catalog_only().await else {
-            return;
-        };
-        let org = format!(
-            "m{}-{}",
-            std::process::id(),
-            C.fetch_add(1, Ordering::Relaxed)
-        );
-        cat.create_org(&org, None).await.unwrap();
-        let releases = cat.create_repo(&org, "releases").await.unwrap();
-        let mirror = cat.create_repo(&org, "mirror").await.unwrap();
-        let all = cat.create_repo(&org, "all").await.unwrap();
-        let blob = [7u8; 32];
-        cat.upsert_blob(&blob, 1234).await.unwrap();
-        let add = async |repo, name: &str, versions: &[&str]| {
-            let pkg = cat
-                .upsert_package(repo, name, "composer", None, Visibility::Public)
-                .await
-                .unwrap();
-            for v in versions {
-                cat.upsert_package_version(
-                    pkg,
-                    v,
-                    &format!("{v}.0"),
-                    "stable",
-                    &serde_json::json!({"name": name}),
-                    Some(&blob),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            }
-        };
-        add(releases, "mage-os/a", &["1.0.0"]).await;
-        add(releases, "other/shared", &["1.0.0"]).await;
-        add(mirror, "hyva/b", &["2.0.0"]).await;
-        add(mirror, "other/shared", &["1.0.0", "1.1.0"]).await;
-        cat.backfill_upstream_dist_path(mirror, "hyva/b", "2.0.0.0", "/dist/hyva/b-2.0.0.zip")
-            .await
-            .unwrap();
-
-        cat.set_repo_members(all, &[releases, mirror])
-            .await
-            .unwrap();
-        assert_eq!(
-            cat.repo_members(all)
-                .await
-                .unwrap()
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>(),
-            [releases, mirror]
-        );
-        assert_eq!(
-            cat.all_package_names(all).await.unwrap(),
-            ["hyva/b", "mage-os/a", "other/shared"]
-        );
-        assert_eq!(
-            cat.anonymous_package_names(all, None).await.unwrap(),
-            ["hyva/b", "mage-os/a", "other/shared"]
-        );
-        // The first member's copy of the shared name, never a mix of both.
-        let shared = cat
-            .visible_versions(all, "other/shared", "auto", 0, None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            shared
-                .iter()
-                .map(|v| v.version.as_str())
-                .collect::<Vec<_>>(),
-            ["1.0.0"]
-        );
-        assert!(cat.repo_serves_dist(all, "hyva/b", &blob).await.unwrap());
-        assert_eq!(
-            cat.dist_by_upstream_path(all, "/dist/hyva/b-2.0.0.zip")
-                .await
-                .unwrap()
-                .map(|(n, _)| n),
-            Some("hyva/b".to_owned())
-        );
-
-        // Reordering hands the shared name to the mirror.
-        cat.set_repo_members(all, &[mirror, releases])
-            .await
-            .unwrap();
-        assert_eq!(
-            cat.visible_versions(all, "other/shared", "auto", 0, None, None)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-
-        // Clearing the members makes it an empty, ordinary repository again.
-        cat.set_repo_members(all, &[]).await.unwrap();
-        assert!(cat.all_package_names(all).await.unwrap().is_empty());
-        assert!(
-            cat.dist_by_upstream_path(all, "/dist/hyva/b-2.0.0.zip")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn member_repositories_are_one_level_in_one_org() {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let Some(cat) = catalog_only().await else {
-            return;
-        };
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        let org = format!("n{}-{n}", std::process::id());
-        let other = format!("o{}-{n}", std::process::id());
-        cat.create_org(&org, None).await.unwrap();
-        cat.create_org(&other, None).await.unwrap();
-        let a = cat.create_repo(&org, "a").await.unwrap();
-        let b = cat.create_repo(&org, "b").await.unwrap();
-        let all = cat.create_repo(&org, "all").await.unwrap();
-        let elsewhere = cat.create_repo(&other, "x").await.unwrap();
-        let invalid = |r: Result<(), RepoMembersError>| match r {
-            Err(RepoMembersError::Invalid(why)) => why,
-            other => panic!("expected a refusal, got {other:?}"),
-        };
-
-        assert!(
-            invalid(cat.set_repo_members(all, &[a, elsewhere]).await).contains("same organization")
-        );
-        assert!(invalid(cat.set_repo_members(all, &[all]).await).contains("own member"));
-        assert!(invalid(cat.set_repo_members(all, &[a, a]).await).contains("twice"));
-
-        cat.set_repo_members(all, &[a]).await.unwrap();
-        // A repo with members can't be a member, nor take a member that has them.
-        assert!(invalid(cat.set_repo_members(b, &[all]).await).contains("one level"));
-        // It holds no packages of its own...
-        match cat
-            .upsert_package(all, "x/y", "composer", None, Visibility::Public)
-            .await
-        {
-            Err(UpsertPackageError::Policy(why)) => assert!(why.contains("member repositories")),
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-        // ...and a repo that owns packages can't take members.
-        cat.upsert_package(b, "x/y", "composer", None, Visibility::Public)
-            .await
-            .unwrap();
-        cat.set_repo_members(all, &[]).await.unwrap();
-        assert!(invalid(cat.set_repo_members(b, &[a]).await).contains("owns packages"));
     }
 
     /// Seller mode: a license key resolves only for its repo and unlocks only
