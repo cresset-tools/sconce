@@ -309,6 +309,11 @@ pub struct Login {
     pub has_default: bool,
     /// Inline error banner text, or empty.
     pub error: String,
+    /// Where to land after signing in (a same-site path), or empty for `/`.
+    /// Carried as a hidden field through the password form and SSO routing.
+    pub next: String,
+    /// `?next=…` (percent-encoded) for the direct SSO link, or empty.
+    pub next_query: String,
 }
 
 /// `/forgot` — request a password-reset link.
