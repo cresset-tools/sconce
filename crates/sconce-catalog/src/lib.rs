@@ -457,6 +457,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0062_version_conflicts",
         include_str!("../migrations/0062_version_conflicts.sql"),
     ),
+    (
+        "0063_authorization_codes",
+        include_str!("../migrations/0063_authorization_codes.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -1135,6 +1139,19 @@ pub enum DeviceFlowPoll {
     Denied,
     /// Unknown `device_code`, or the flow expired.
     Expired,
+}
+
+/// What a member approved on the `/authorize` page, for
+/// [`Catalog::create_authorization_code`].
+#[derive(Debug)]
+pub struct AuthorizationGrant<'a> {
+    pub org_id: Uuid,
+    /// The approving user; `None` in single-tenant mode (no accounts).
+    pub approved_by: Option<Uuid>,
+    pub client_id: &'a str,
+    pub redirect_uri: &'a str,
+    /// `BASE64URL(SHA256(code_verifier))`, unpadded (RFC 7636 S256).
+    pub code_challenge: &'a str,
 }
 
 /// An org-scoped session token resolved for relay introspection: the org it
@@ -3729,6 +3746,75 @@ impl Catalog {
                     DeviceFlowPoll::Pending
                 }
             }
+        })
+    }
+
+    /// Issue a one-time authorization code (RFC 6749 §4.1) for a signed-in
+    /// member's approval: bound to `org_id`, the client, the exact
+    /// `redirect_uri` and the PKCE `code_challenge` (S256), stored only as its
+    /// sha256. Also clears out codes that expired unredeemed. TTL in seconds.
+    pub async fn create_authorization_code(
+        &self,
+        grant: &AuthorizationGrant<'_>,
+        ttl_secs: i64,
+    ) -> Result<String, sqlx::Error> {
+        sqlx::query("delete from authorization_codes where expires_at <= now()")
+            .execute(&self.pool)
+            .await?;
+        let code = generate_secret("scac_");
+        sqlx::query(
+            "insert into authorization_codes \
+             (code_hash, org_id, approved_by, client_id, redirect_uri, code_challenge, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
+        )
+        .bind(token_hash(&code))
+        .bind(grant.org_id)
+        .bind(grant.approved_by)
+        .bind(grant.client_id)
+        .bind(grant.redirect_uri)
+        .bind(grant.code_challenge)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(code)
+    }
+
+    /// Redeem an authorization code: returns the org to mint a token for when
+    /// the code is fresh and the request repeats the same `client_id` and
+    /// `redirect_uri` and presents the PKCE verifier for its challenge.
+    ///
+    /// The code is consumed by the attempt whether or not it succeeds, so a
+    /// code that leaked can't be retried against with guessed verifiers.
+    pub async fn redeem_authorization_code(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let row = sqlx::query(
+            "delete from authorization_codes where code_hash = $1 \
+             returning org_id, client_id, redirect_uri, code_challenge, \
+             expires_at > now() as fresh",
+        )
+        .bind(token_hash(code))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let fresh: bool = row.try_get("fresh")?;
+        let bound_client: String = row.try_get("client_id")?;
+        let bound_redirect: String = row.try_get("redirect_uri")?;
+        let challenge: String = row.try_get("code_challenge")?;
+        let ok = fresh
+            && bound_client == client_id
+            && bound_redirect == redirect_uri
+            && pkce_s256_matches(code_verifier, &challenge);
+        Ok(if ok {
+            Some(row.try_get("org_id")?)
+        } else {
+            None
         })
     }
 
@@ -8298,6 +8384,30 @@ fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
+/// RFC 7636 S256: whether `BASE64URL(SHA256(verifier))` equals `challenge`.
+/// A verifier outside the RFC's 43–128 unreserved characters never matches.
+fn pkce_s256_matches(verifier: &str, challenge: &str) -> bool {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let well_formed = (43..=128).contains(&verifier.len())
+        && verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
+    if !well_formed {
+        return false;
+    }
+    let digest = Sha256::digest(verifier.as_bytes());
+    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    // Both sides are public-length base64 of a digest; compare without an
+    // early exit anyway.
+    expected.len() == challenge.len()
+        && expected
+            .bytes()
+            .zip(challenge.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 /// Whether a query error is a Postgres unique-constraint violation (SQLSTATE
 /// 23505) — used to turn a lost idempotency race into a graceful replay.
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -9295,6 +9405,91 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, ["api", "r", "web"]);
+    }
+
+    #[test]
+    fn pkce_s256_matches_base64url_sha256_of_the_verifier() {
+        // Challenge computed independently:
+        // printf %s "$verifier" | openssl dgst -sha256 -binary | basenc --base64url
+        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
+        let challenge = "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o";
+        assert!(pkce_s256_matches(verifier, challenge));
+        assert!(!pkce_s256_matches(
+            "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Z",
+            challenge
+        ));
+        assert!(
+            !pkce_s256_matches("short", challenge),
+            "too short to be a verifier"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_code_redeems_once_with_matching_pkce_and_redirect() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let org_id = org_of(&cat, repo_id).await;
+        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
+        let redirect = "http://127.0.0.1:53682/callback";
+        let grant = AuthorizationGrant {
+            org_id,
+            approved_by: None,
+            client_id: "bougie-cli",
+            redirect_uri: redirect,
+            code_challenge: "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o",
+        };
+
+        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            Some(org_id)
+        );
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            None,
+            "a code works once"
+        );
+
+        // A wrong redirect_uri fails, and burns the code.
+        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
+        let other = "http://127.0.0.1:1/callback";
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", other, verifier)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            None,
+            "a failed attempt consumes the code"
+        );
+
+        // A wrong verifier fails.
+        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
+        let wrong = "x".repeat(43);
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, &wrong)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // An expired code fails.
+        let code = cat.create_authorization_code(&grant, -1).await.unwrap();
+        assert_eq!(
+            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
