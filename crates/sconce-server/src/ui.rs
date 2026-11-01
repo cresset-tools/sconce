@@ -129,6 +129,11 @@ pub fn router(
         // Human side of `bougie login` (RFC 8628): a signed-in member confirms
         // the code the CLI printed and picks the org to scope its token to.
         .route("/device", get(device_page).post(device_approve))
+        // Authorization-code + PKCE for `bougie login` (see crate::authcode):
+        // the consent page, and the page that shows a code to paste when the
+        // CLI can't run a loopback listener.
+        .route("/authorize", get(authorize_page).post(authorize_decide))
+        .route(crate::authcode::PASTE_PATH, get(authorize_code_page))
         .route(
             "/scim/v2/Users",
             get(scim_list_users).post(scim_create_user),
@@ -2714,6 +2719,210 @@ async fn device_approve(
         .map_err(e500)?,
     )
     .into_response())
+}
+
+/// `/authorize` parameters: the query string of the CLI's link, and the
+/// consent form's fields on submit.
+#[derive(Deserialize)]
+struct AuthorizeParams {
+    #[serde(default)]
+    response_type: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    redirect_uri: String,
+    #[serde(default)]
+    code_challenge: String,
+    #[serde(default)]
+    code_challenge_method: String,
+    #[serde(default)]
+    state: String,
+    /// Slug of the org to scope the token to (form submit only).
+    #[serde(default)]
+    org: String,
+    /// "approve" or "deny" (form submit only).
+    #[serde(default)]
+    action: String,
+}
+
+/// Whether an authorization request is safe to redirect at all: the client
+/// and its redirect URI (RFC 6749 §4.1.2.1 — never redirect to an unchecked
+/// URI), and the `state` we would echo. A request that fails is answered with
+/// [`authorize_refused`] here, not sent anywhere.
+fn authorize_target_ok(s: &Ui, p: &AuthorizeParams) -> bool {
+    use crate::authcode;
+    p.client_id == authcode::CLIENT_ID
+        && authcode::redirect_uri_allowed(&p.redirect_uri, &s.dashboard_url)
+        && authcode::state_acceptable(&p.state)
+}
+
+fn authorize_refused(s: &Ui, user: &CurrentUser) -> Response {
+    error_card(
+        s,
+        user,
+        "Can't sign in",
+        "This sign-in link isn't valid. Run bougie login again from your terminal.",
+        "/",
+    )
+}
+
+/// Send the browser back to the client's redirect URI with `params` (and the
+/// request's `state`) in the query string.
+fn authorize_redirect(redirect_uri: &str, params: &[(&str, &str)], state: &str) -> Response {
+    let mut url = redirect_uri.to_owned();
+    let mut sep = '?';
+    for (k, v) in params.iter().chain([("state", state)].iter()) {
+        if v.is_empty() {
+            continue;
+        }
+        let _ = write!(url, "{sep}{k}={}", percent_encode(v));
+        sep = '&';
+    }
+    Redirect::to(&url).into_response()
+}
+
+/// `/authorize` — the consent page for `bougie login`'s authorization-code
+/// flow. A signed-out visitor is sent through sign-in and back here first.
+async fn authorize_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Query(p): Query<AuthorizeParams>,
+) -> Result<Response, StatusCode> {
+    if !authorize_target_ok(&s, &p) {
+        return Ok(authorize_refused(&s, &user));
+    }
+    if p.response_type != "code" {
+        return Ok(authorize_redirect(
+            &p.redirect_uri,
+            &[("error", "unsupported_response_type")],
+            &p.state,
+        ));
+    }
+    if p.code_challenge_method != "S256"
+        || !crate::authcode::challenge_well_formed(&p.code_challenge)
+    {
+        return Ok(authorize_redirect(
+            &p.redirect_uri,
+            &[
+                ("error", "invalid_request"),
+                ("error_description", "PKCE with S256 is required"),
+            ],
+            &p.state,
+        ));
+    }
+    let orgs = s.catalog.list_organizations().await.map_err(e500)?;
+    let view = views::Authorize {
+        client_id: p.client_id,
+        loopback: crate::authcode::is_loopback(&p.redirect_uri),
+        redirect_uri: p.redirect_uri,
+        code_challenge: p.code_challenge,
+        state: p.state,
+        orgs: orgs
+            .iter()
+            .filter(|o| user.can(o.id))
+            .map(|o| views::DeviceOrg {
+                slug: o.slug.clone(),
+                name: o.name.clone().unwrap_or_else(|| o.slug.clone()),
+            })
+            .collect(),
+    };
+    Ok(shell(
+        &s,
+        &user,
+        "Sign in to bougie",
+        &view.render().map_err(e500)?,
+    )
+    .into_response())
+}
+
+/// `/authorize` POST — approve (issue a one-time code bound to the chosen org,
+/// the redirect URI and the PKCE challenge) or deny, then redirect back to
+/// the CLI.
+async fn authorize_decide(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Form(p): Form<AuthorizeParams>,
+) -> Result<Response, StatusCode> {
+    if !authorize_target_ok(&s, &p) {
+        return Ok(authorize_refused(&s, &user));
+    }
+    if p.action != "approve" {
+        return Ok(authorize_redirect(
+            &p.redirect_uri,
+            &[("error", "access_denied")],
+            &p.state,
+        ));
+    }
+    if !crate::authcode::challenge_well_formed(&p.code_challenge) {
+        return Ok(authorize_redirect(
+            &p.redirect_uri,
+            &[("error", "invalid_request")],
+            &p.state,
+        ));
+    }
+    let Some(org_id) = s.catalog.org_id_by_slug(p.org.trim()).await.map_err(e500)? else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if !user.can(org_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let grant = sconce_catalog::AuthorizationGrant {
+        org_id,
+        approved_by: user.id,
+        client_id: &p.client_id,
+        redirect_uri: &p.redirect_uri,
+        code_challenge: &p.code_challenge,
+    };
+    let code = s
+        .catalog
+        .create_authorization_code(&grant, crate::authcode::CODE_TTL_SECS)
+        .await
+        .map_err(e500)?;
+    Ok(authorize_redirect(
+        &p.redirect_uri,
+        &[("code", &code)],
+        &p.state,
+    ))
+}
+
+#[derive(Deserialize)]
+struct AuthorizeCodeQuery {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    error: String,
+}
+
+/// The paste page: shows `code#state` for the user to copy into the waiting
+/// `bougie login`. The code alone is useless without the CLI's PKCE verifier.
+async fn authorize_code_page(
+    State(s): State<Ui>,
+    Extension(user): Extension<CurrentUser>,
+    Query(q): Query<AuthorizeCodeQuery>,
+) -> Result<Html<String>, StatusCode> {
+    let view = if q.error.is_empty() && !q.code.is_empty() {
+        views::AuthorizeCode {
+            code: format!("{}#{}", q.code, q.state),
+            error: String::new(),
+        }
+    } else {
+        views::AuthorizeCode {
+            code: String::new(),
+            error: if q.error.is_empty() {
+                "invalid_request".to_owned()
+            } else {
+                q.error
+            },
+        }
+    };
+    Ok(shell(
+        &s,
+        &user,
+        "Sign in to bougie",
+        &view.render().map_err(e500)?,
+    ))
 }
 
 async fn new_repo_page(

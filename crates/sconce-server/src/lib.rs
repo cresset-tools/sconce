@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+pub mod authcode;
 mod cache;
 pub mod ci;
 pub mod csrf;
@@ -35,6 +36,7 @@ pub mod ratelimit;
 mod snapshots;
 pub mod ui;
 
+use axum::Form;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -69,6 +71,7 @@ struct AppState {
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
 /// gated by a token valid *for that repository*, and a repository with a
 /// custom domain also at that domain's root (see `by_host`).
+#[allow(clippy::too_many_lines)]
 pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router {
     // Relay-introspection secrets, loaded once at startup. Accept a *set*
     // (comma- or whitespace-separated) so a secret can be rotated with zero
@@ -145,6 +148,15 @@ fn main_router(state: AppState) -> Router {
         // a flow + polls here; the human approves on the dashboard (see ui.rs).
         .route("/oauth/device", post(oauth_device))
         .route("/oauth/device/token", post(oauth_device_token))
+        // Authorization-code grant with PKCE for `bougie login`: the human
+        // approves on the dashboard's /authorize page; the CLI redeems the code
+        // here. Advertised by the RFC 8414 metadata document, which is how the
+        // CLI tells this server supports it.
+        .route("/oauth/token", post(oauth_token))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_metadata),
+        )
         // Token introspection (RFC 7662 style) for a first-party relay: verify a
         // `bougie login` org-session token. Caller-authenticated by a shared
         // secret; never exposed to end users.
@@ -1002,14 +1014,7 @@ struct DeviceTokenRequest {
 /// auth: the flow is inert until a signed-in org member approves it in the browser.
 async fn oauth_device(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let (device_code, user_code) = s.catalog.start_device_flow(DEVICE_FLOW_TTL_SECS).await?;
-    // The approval page lives on the dashboard (UI router), which may be a
-    // different origin than this wire endpoint; prefer its configured URL, fall
-    // back to this server's base_url for a single-binary deploy.
-    let dashboard = std::env::var("SCONCE_UI_BASE_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| s.base_url.clone());
-    let dashboard = dashboard.trim_end_matches('/');
+    let dashboard = dashboard_url(&s);
     Ok(Json(json!({
         "device_code": device_code,
         "user_code": user_code,
@@ -1055,6 +1060,117 @@ async fn oauth_device_token(
             device_error(StatusCode::BAD_REQUEST, "expired_token")
         }
         Err(_) => device_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+    }
+}
+
+/// The dashboard's base URL, without a trailing slash. Approval pages live on
+/// the dashboard (UI router), which may be a different origin than this wire
+/// server; prefer its configured URL, fall back to this server's `base_url`
+/// for a single-binary deploy.
+fn dashboard_url(s: &AppState) -> String {
+    std::env::var("SCONCE_UI_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| s.base_url.clone())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// RFC 8414 authorization-server metadata. Its presence is how `bougie login`
+/// knows to use the authorization-code flow; an older server answers 404 and
+/// the CLI falls back to the device flow.
+async fn oauth_metadata(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let base = s.base_url.trim_end_matches('/');
+    let dashboard = dashboard_url(&s);
+    Json(json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{dashboard}/authorize"),
+        "token_endpoint": format!("{base}/oauth/token"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        // Not part of RFC 8414: the redirect URI that shows the code for
+        // pasting, for a CLI that can't run a loopback listener.
+        "bougie_paste_redirect_uri": format!("{dashboard}{}", authcode::PASTE_PATH),
+    }))
+}
+
+/// `POST /oauth/token` form body (RFC 6749 §4.1.3 plus the PKCE verifier).
+#[derive(serde::Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    redirect_uri: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    code_verifier: String,
+}
+
+/// The token endpoint for the authorization-code grant: trade a one-time code
+/// and its PKCE verifier for an org-scoped read token — the same credential
+/// the device flow issues. Errors follow RFC 6749 §5.2.
+async fn oauth_token(State(s): State<AppState>, Form(req): Form<TokenRequest>) -> Response {
+    let no_store = || [(header::CACHE_CONTROL, "no-store")];
+    let error = |code: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": code })),
+        )
+            .into_response()
+    };
+    if req.grant_type != "authorization_code" {
+        return error("unsupported_grant_type");
+    }
+    if req.code.is_empty() || req.redirect_uri.is_empty() || req.code_verifier.is_empty() {
+        return error("invalid_request");
+    }
+    if req.client_id != authcode::CLIENT_ID {
+        return error("invalid_client");
+    }
+    let org_id = match s
+        .catalog
+        .redeem_authorization_code(
+            &req.code,
+            &req.client_id,
+            &req.redirect_uri,
+            &req.code_verifier,
+        )
+        .await
+    {
+        Ok(Some(org_id)) => org_id,
+        Ok(None) => return error("invalid_grant"),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "server_error" })),
+            )
+                .into_response();
+        }
+    };
+    match s
+        .catalog
+        .create_session_token(org_id, "bougie login", DEVICE_TOKEN_TTL_SECS)
+        .await
+    {
+        Ok(token) => (
+            no_store(),
+            Json(json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": DEVICE_TOKEN_TTL_SECS,
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "server_error" })),
+        )
+            .into_response(),
     }
 }
 
