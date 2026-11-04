@@ -145,7 +145,7 @@ enum Command {
         #[arg(long)]
         cas: Option<PathBuf>,
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -155,7 +155,7 @@ enum Command {
         slug: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -171,7 +171,7 @@ enum Command {
         /// unchanged.
         #[arg(long)]
         max_token_ttl_days: Option<i64>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -181,7 +181,7 @@ enum Command {
         org: String,
         /// Repository slug.
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -194,7 +194,7 @@ enum Command {
         org: String,
         /// The project's git remote URL.
         remote: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -202,7 +202,7 @@ enum Command {
     RemoteList {
         /// Organization slug.
         org: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -210,7 +210,7 @@ enum Command {
     RemoteRemove {
         /// The project's git remote URL.
         remote: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -232,7 +232,7 @@ enum Command {
         /// Clear the snapshot config instead of setting it.
         #[arg(long, conflicts_with = "repo")]
         clear: bool,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -260,7 +260,7 @@ enum Command {
         /// Remove this named source instead of setting it.
         #[arg(long, conflicts_with = "host")]
         clear: bool,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -290,7 +290,7 @@ enum Command {
         /// Remove this named task instead of setting it.
         #[arg(long, conflicts_with = "run")]
         clear: bool,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -301,7 +301,7 @@ enum Command {
         org: String,
         /// New slug.
         new_slug: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -311,7 +311,7 @@ enum Command {
         repo: String,
         /// New repository slug.
         new_slug: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -329,7 +329,7 @@ enum Command {
         /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
         cas: Option<PathBuf>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -346,7 +346,7 @@ enum Command {
         /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
         cas: Option<PathBuf>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -361,7 +361,7 @@ enum Command {
         /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
         cas: Option<PathBuf>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -384,7 +384,7 @@ enum Command {
         /// configured via the `SCONCE_S3`_* environment variables.
         #[arg(long)]
         cas: Option<PathBuf>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -407,7 +407,7 @@ enum Command {
         /// Report what would be collected without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -421,7 +421,7 @@ enum Command {
         /// Limit to one organization (by slug). Omit for all orgs.
         #[arg(long)]
         org: Option<String>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -453,7 +453,7 @@ enum Command {
         /// packages always need a credential. Omit to leave unchanged.
         #[arg(long)]
         anonymous_access: Option<bool>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -472,7 +472,7 @@ enum Command {
         /// Stop serving the repo at its custom domain.
         #[arg(long, conflicts_with = "domain")]
         clear: bool,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -486,7 +486,7 @@ enum Command {
         /// Grant access to all tenants.
         #[arg(long)]
         superadmin: bool,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -499,7 +499,7 @@ enum Command {
         /// Role in the tenant: `member` (read-only) or `admin` (manage).
         #[arg(long, default_value = "member")]
         role: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -525,7 +525,7 @@ enum Command {
         #[arg(long)]
         repo: String,
         /// Base URL of the sconce wire server, e.g. `https://repo.example.com`.
-        #[arg(long, env = "SCONCE_URL")]
+        #[arg(long, env = "SCONCE_URL", hide_env_values = true)]
         url: String,
         /// Version to publish (e.g. `1.2.0`). Defaults to `$GITHUB_REF_NAME`,
         /// then `$CI_COMMIT_TAG` (GitLab).
@@ -535,7 +535,7 @@ enum Command {
         #[arg(long, default_value = "sconce")]
         audience: String,
         /// A publish token to use directly (otherwise obtained via CI OIDC).
-        #[arg(long, env = "SCONCE_PUBLISH_TOKEN")]
+        #[arg(long, env = "SCONCE_PUBLISH_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Upload as chunks of at most this many bytes (also the single-shot
         /// threshold). Defaults to 32 MiB.
@@ -555,7 +555,7 @@ enum Command {
     ScimToken {
         /// Organization slug.
         org: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -586,7 +586,7 @@ enum Command {
         /// Comma-separated email domains provisioned as superadmins.
         #[arg(long)]
         admin_domains: Option<String>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -603,7 +603,7 @@ enum Command {
         /// Packages the buyer purchased (entitled).
         #[arg(required = true)]
         packages: Vec<String>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -619,7 +619,7 @@ enum Command {
         /// Buyer reference (email / order id).
         #[arg(long)]
         buyer: Option<String>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -657,7 +657,7 @@ enum Command {
         from: String,
         /// Package name, e.g. `monolog/monolog`.
         package: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -668,7 +668,7 @@ enum Command {
         #[arg(long)]
         cas: Option<PathBuf>,
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
         /// Address to listen on (the Composer wire API).
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -687,7 +687,7 @@ enum Command {
         #[arg(long)]
         single_tenant: bool,
         /// Admin UI password for single-tenant mode.
-        #[arg(long, env = "SCONCE_ADMIN_PASSWORD")]
+        #[arg(long, env = "SCONCE_ADMIN_PASSWORD", hide_env_values = true)]
         admin_password: Option<String>,
     },
 
@@ -695,7 +695,7 @@ enum Command {
     /// require HTTP basic auth; otherwise it's open — bind to localhost only.
     Ui {
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
         /// Address to listen on.
         #[arg(long, default_value = "127.0.0.1:8081")]
@@ -707,7 +707,7 @@ enum Command {
         #[arg(long)]
         single_tenant: bool,
         /// Single-tenant only: require HTTP basic auth with this password.
-        #[arg(long, env = "SCONCE_ADMIN_PASSWORD")]
+        #[arg(long, env = "SCONCE_ADMIN_PASSWORD", hide_env_values = true)]
         admin_password: Option<String>,
     },
 
@@ -732,7 +732,7 @@ enum Command {
         package: String,
         /// Version/tag, e.g. `v1.2.0`.
         version: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -742,7 +742,7 @@ enum Command {
         repo: String,
         package: String,
         version: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 
@@ -752,7 +752,7 @@ enum Command {
         repo: String,
         package: String,
         version: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -763,7 +763,7 @@ enum PolicyAction {
     Show {
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Set a repository's update policy.
@@ -777,7 +777,7 @@ enum PolicyAction {
         /// Days a release must age before becoming visible under `delayed`.
         #[arg(long, default_value_t = 0)]
         cooldown_days: i32,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -822,7 +822,7 @@ enum UpstreamAction {
         /// mirror the repo root as a single package.
         #[arg(long = "source-path")]
         source_path: Vec<String>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// List a repository's upstreams (never the secret).
@@ -830,7 +830,7 @@ enum UpstreamAction {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Remove an upstream by id.
@@ -840,7 +840,7 @@ enum UpstreamAction {
         repo: String,
         /// Upstream id to remove.
         id: uuid::Uuid,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -877,7 +877,7 @@ enum CiPolicyAction {
         /// to `bougie sync` an app spanning many private package repos).
         #[arg(long, default_value = "repo")]
         scope: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// List a repo's CI OIDC policies.
@@ -885,7 +885,7 @@ enum CiPolicyAction {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -898,7 +898,7 @@ enum DepsAction {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Show the computed dependency plan (the proposal to review).
@@ -906,7 +906,7 @@ enum DepsAction {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Add a resolvable dependency: enqueue mirroring it from its resolver.
@@ -916,7 +916,7 @@ enum DepsAction {
         repo: String,
         /// Package name from the plan, e.g. `mage-os/framework`.
         package: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -928,7 +928,7 @@ enum EntitlementsAction {
     Show {
         #[arg(long)]
         org: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Set an org's entitlements. `--features` is the *complete* set of enabled
@@ -948,14 +948,14 @@ enum EntitlementsAction {
         /// Advisory storage limit in GB (drives a UI warning; never blocks).
         #[arg(long)]
         storage_soft_gb: Option<i64>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Remove an org's entitlements row → back to the unlimited default.
     Clear {
         #[arg(long)]
         org: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -995,7 +995,7 @@ enum EditionAction {
         /// Optional policy stamped on issued keys: cooldown days.
         #[arg(long)]
         cooldown_days: Option<i32>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// List a repo's editions.
@@ -1003,7 +1003,7 @@ enum EditionAction {
         /// Seller repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Deactivate an edition (stops new sales and frees a SKU slot; already-
@@ -1014,7 +1014,7 @@ enum EditionAction {
         repo: String,
         /// Edition name or slug.
         edition: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -1032,14 +1032,14 @@ enum ServiceTokenAction {
         /// Days until expiry; omit for a non-expiring token.
         #[arg(long)]
         expires_days: Option<i64>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// List a repository's service tokens (never the tokens themselves).
     List {
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Revoke a service token by id.
@@ -1048,7 +1048,7 @@ enum ServiceTokenAction {
         repo: String,
         /// Service-token id (from `service-token list`).
         id: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -1063,7 +1063,7 @@ enum SnapshotAction {
         /// Environment label (e.g. production, staging).
         #[arg(long)]
         env: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Retention: keep the newest `--keep` snapshots in a repo+environment+
@@ -1082,7 +1082,7 @@ enum SnapshotAction {
         /// How many of the newest snapshots to keep.
         #[arg(long)]
         keep: i64,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Upload a database snapshot file as the environment's new `latest`, from CI.
@@ -1097,7 +1097,7 @@ enum SnapshotAction {
         #[arg(long)]
         repo: String,
         /// Base URL of the sconce wire server, e.g. `https://repo.example.com`.
-        #[arg(long, env = "SCONCE_URL")]
+        #[arg(long, env = "SCONCE_URL", hide_env_values = true)]
         url: String,
         /// Environment label the snapshot belongs to (e.g. production, staging).
         #[arg(long)]
@@ -1110,7 +1110,7 @@ enum SnapshotAction {
         #[arg(long, default_value = "sconce")]
         audience: String,
         /// A publish token to use directly (otherwise obtained via CI OIDC).
-        #[arg(long, env = "SCONCE_PUBLISH_TOKEN")]
+        #[arg(long, env = "SCONCE_PUBLISH_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Upload as chunks of at most this many bytes (also the single-shot
         /// threshold). Defaults to 32 MiB.
@@ -1126,7 +1126,7 @@ enum PackageAction {
         /// Repository, as `<org>/<repo>`.
         #[arg(long)]
         repo: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Archive a package: freeze it and silence its broken flag. Its already-
@@ -1137,7 +1137,7 @@ enum PackageAction {
         repo: String,
         /// Package name, e.g. `vendor/abandoned`.
         package: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Un-archive a package: resume syncing (health is re-detected).
@@ -1147,7 +1147,7 @@ enum PackageAction {
         repo: String,
         /// Package name.
         package: String,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Show a package's visibility, or declare it. Visibility is about licensing,
@@ -1162,7 +1162,7 @@ enum PackageAction {
         package: String,
         /// The visibility to declare. Omit to show the current one.
         visibility: Option<Visibility>,
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -1182,7 +1182,7 @@ enum TokenAction {
         #[arg(long)]
         expires_days: Option<i64>,
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// List a repository's tokens (id, label, expiry) — never the secret.
@@ -1191,7 +1191,7 @@ enum TokenAction {
         #[arg(long)]
         repo: String,
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Revoke a token by id (see `token list`).
@@ -1202,7 +1202,7 @@ enum TokenAction {
         /// Token id to revoke.
         id: uuid::Uuid,
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
     /// Set (or clear) a token's per-credential supply-chain policy override. Omit
@@ -1223,7 +1223,7 @@ enum TokenAction {
         #[arg(long)]
         cooldown_days: Option<i32>,
         /// Postgres connection string.
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
 }
@@ -4207,6 +4207,30 @@ fn file_mode(path: &Path) -> Result<Mode> {
 #[cfg(test)]
 mod tests {
     use super::retry_backoff_secs;
+
+    /// `--help` must never print an environment variable's value: they carry
+    /// the database password, the admin password and publish tokens, and help
+    /// is what an operator runs on a production host.
+    #[test]
+    fn help_never_prints_environment_values() {
+        fn check(cmd: &clap::Command, path: &str, leaks: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if arg.get_env().is_some() && !arg.is_hide_env_values_set() {
+                    leaks.push(format!("{path} --{}", arg.get_id()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                check(sub, &format!("{path} {}", sub.get_name()), leaks);
+            }
+        }
+        let mut leaks = Vec::new();
+        check(
+            &<super::Cli as clap::CommandFactory>::command(),
+            "sconce",
+            &mut leaks,
+        );
+        assert!(leaks.is_empty(), "add hide_env_values = true: {leaks:?}");
+    }
 
     #[test]
     fn backoff_grows_then_caps_with_jitter() {
