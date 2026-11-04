@@ -27,6 +27,7 @@ mod api;
 mod cache;
 pub mod ci;
 pub mod csrf;
+mod index;
 pub mod mail;
 pub mod oidc;
 mod publish;
@@ -99,13 +100,18 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .layer(middleware::from_fn_with_state(routing, by_host))
 }
 
-/// Every route of the main host, addressed by `/{org}/{repo}/…`.
-fn main_router(state: AppState) -> Router {
-    // Uploads carry package bytes, so they need a much larger body cap than axum's
-    // 2 MiB default — applied per-route so the read/serving routes keep the default.
-    let max_upload = publish::max_upload_bytes();
-    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
+/// The Composer read routes and the human index, by `/{org}/{repo}/…`.
+fn read_routes() -> Router<AppState> {
     Router::new()
+        // The human index: how to add the repository, and its packages.
+        .route(
+            "/{org}/{repo}",
+            get(repo_index).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
+        .route(
+            "/{org}/{repo}/",
+            get(repo_index).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
         .route(
             "/{org}/{repo}/packages.json",
             get(packages_json).layer(from_fn_with_state(Kind::Metadata, cache)),
@@ -124,6 +130,15 @@ fn main_router(state: AppState) -> Router {
             "/{org}/{repo}/{*path}",
             get(upstream_dist).layer(from_fn_with_state(Kind::Dist, cache)),
         )
+}
+
+/// Every route of the main host, addressed by `/{org}/{repo}/…`.
+fn main_router(state: AppState) -> Router {
+    // Uploads carry package bytes, so they need a much larger body cap than axum's
+    // 2 MiB default — applied per-route so the read/serving routes keep the default.
+    let max_upload = publish::max_upload_bytes();
+    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
+    read_routes()
         .route("/oauth/ci", post(oauth_ci))
         .route("/oauth/ci-publish", post(oauth_ci_publish))
         // Device authorization grant (RFC 8628) for `bougie login`: the CLI starts
@@ -562,6 +577,10 @@ struct DomainRepo {
 fn domain_router(state: AppState) -> Router {
     Router::new()
         .route(
+            "/",
+            get(domain_index).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
+        .route(
             "/packages.json",
             get(domain_packages_json).layer(from_fn_with_state(Kind::Metadata, cache)),
         )
@@ -579,6 +598,38 @@ fn domain_router(state: AppState) -> Router {
             get(domain_upstream_dist).layer(from_fn_with_state(Kind::Dist, cache)),
         )
         .with_state(state)
+}
+
+/// `?q=` on the index: the search to start from.
+#[derive(serde::Deserialize, Default)]
+struct IndexQuery {
+    q: Option<String>,
+}
+
+async fn repo_index(
+    State(s): State<AppState>,
+    Path((org, repo)): Path<(String, String)>,
+    Query(query): Query<IndexQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let loc = match locate(&s, &org, &repo, "").await? {
+        Ok(loc) => loc,
+        Err(redirect) => return Ok(redirect),
+    };
+    let base = repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug);
+    let title = format!("{}/{}", loc.org_slug, loc.repo_slug);
+    index::serve_index(&s, &loc, &base, title, &headers, query.q.as_deref()).await
+}
+
+async fn domain_index(
+    State(s): State<AppState>,
+    Extension(d): Extension<DomainRepo>,
+    Query(query): Query<IndexQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let title = domain_part(d.base.split_once("://").map_or(&*d.base, |(_, rest)| rest))
+        .unwrap_or_else(|| d.loc.repo_slug.clone());
+    index::serve_index(&s, &d.loc, &d.base, title, &headers, query.q.as_deref()).await
 }
 
 async fn domain_packages_json(
@@ -1573,6 +1624,144 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The human index: instructions for everyone, and the packages the viewer
+    /// can install, newest stable version and description, searchable.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn index_lists_what_the_viewer_can_install() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use sconce_catalog::Visibility::{Private, Public};
+        use tower::ServiceExt;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let slug = format!("idx{}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
+        let dir = std::env::temp_dir().join(format!("sconce-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AnyBlobStore::open(Some(&dir)).unwrap();
+        let add = async |name: &str, visibility, versions: &[(&str, &str, &str)]| {
+            let pid = cat
+                .upsert_package(repo_id, name, "composer", None, visibility)
+                .await
+                .unwrap();
+            for (v, stability, desc) in versions {
+                let blob = store.put(format!("PK{name}{v}").as_bytes()).unwrap();
+                cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+                cat.insert_mirrored_version(
+                    pid,
+                    v,
+                    &format!("{}.0", v.split('-').next().unwrap()),
+                    stability,
+                    &json!({ "name": name, "description": desc }),
+                    blob.as_bytes(),
+                    "unused",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        };
+        add(
+            "open/catalog",
+            Public,
+            &[
+                ("1.0.0", "stable", "Old words"),
+                ("1.2.0", "stable", "Browse <the> catalog"),
+                ("2.0.0-beta1", "beta", "Next"),
+            ],
+        )
+        .await;
+        add("open/checkout", Public, &[("3.1.0", "stable", "")]).await;
+        add("acme/secret", Private, &[("1.0.0", "stable", "Paid")]).await;
+        cat.set_custom_domain(repo_id, Some(&format!("{slug}.example.org")))
+            .await
+            .unwrap();
+
+        let app = router(cat.clone(), store, "https://sconce.example".to_owned());
+        let get = async |host: &str, path: &str, auth: Option<&str>| {
+            let mut req = Request::builder().uri(path).header(header::HOST, host);
+            if let Some(t) = auth {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            let r = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = r.status();
+            let ct = r
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_owned());
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            (status, ct, String::from_utf8_lossy(&body).into_owned())
+        };
+        let main = "sconce.example";
+        let page = format!("/{slug}/r/");
+
+        // No anonymous access, no credential: how to add it, but no packages.
+        let (status, ct, html) = get(main, &page, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.unwrap().starts_with("text/html"));
+        assert!(html.contains(&format!("bougie repo add https://sconce.example/{slug}/r")));
+        assert!(html.contains(&format!(
+            "composer config repositories.r composer https://sconce.example/{slug}/r"
+        )));
+        assert!(html.contains("bougie login"), "a token is needed");
+        assert!(!html.contains("open/catalog"));
+        assert!(!html.contains("acme/secret"));
+        // The slash is optional.
+        assert_eq!(
+            get(main, &format!("/{slug}/r"), None).await.0,
+            StatusCode::OK
+        );
+
+        // A token sees everything, private packages included.
+        let token = cat.create_token(repo_id, Some("r"), None).await.unwrap();
+        let (_, _, html) = get(main, &page, Some(&token)).await;
+        assert!(html.contains("acme/secret"));
+
+        let mut settings = cat.repo_settings(repo_id).await.unwrap();
+        settings.anonymous_access = true;
+        cat.set_repo_settings(repo_id, settings).await.unwrap();
+
+        // Anonymous: public packages only, at their newest stable version with
+        // its description (escaped), and no token instructions.
+        let (_, _, html) = get(main, &page, None).await;
+        assert!(html.contains("open/catalog") && html.contains("open/checkout"));
+        assert!(!html.contains("acme/secret"));
+        assert!(html.contains("1.2.0") && !html.contains("2.0.0-beta1"));
+        assert!(
+            html.contains("Browse &#60;the&#62; catalog")
+                || html.contains("Browse &lt;the&gt; catalog"),
+            "{html}"
+        );
+        assert!(!html.contains("bougie login"));
+
+        // ?q= hides what does not match, but keeps it for live search.
+        let (_, _, html) = get(main, &format!("{page}?q=Catalog"), None).await;
+        let row = |name: &str| {
+            let at = html.find(&format!(">{name}<")).unwrap();
+            html[..at].rsplit("<li").next().unwrap().to_owned()
+        };
+        assert!(!row("open/catalog").contains("hidden"));
+        assert!(row("open/checkout").contains("hidden"));
+
+        // At the root of the custom domain, with its URL in the commands.
+        let (status, _, html) = get(&format!("{slug}.example.org"), "/", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(&format!("bougie repo add https://{slug}.example.org<")));
+        assert!(html.contains("open/catalog"));
     }
 
     /// The read routes tell caches what they may keep: anonymous responses are

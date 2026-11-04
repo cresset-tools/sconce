@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang=en>
+<head>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<style>
+:root{--bg:#fbfbfa;--fg:#1d1f23;--muted:#6b7280;--line:#e4e5e8;--card:#fff;--code:#f2f3f5;--accent:#2f5bd3}
+@media (prefers-color-scheme:dark){:root{--bg:#131417;--fg:#e8e9ec;--muted:#9aa0aa;--line:#2a2c31;--card:#1a1b1f;--code:#22242a;--accent:#8aa8ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:40px 16px 64px}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:16px;margin:36px 0 12px}
+.sub{color:var(--muted);margin:0}
+.cmd{display:flex;align-items:center;gap:8px;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0 0 8px}
+.cmd code{flex:1;min-width:0;overflow-x:auto;font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.cmd .tool{color:var(--muted);font-size:12px;min-width:64px;flex-shrink:0}
+.cmd button{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:3px 9px;cursor:pointer;flex-shrink:0}
+.note{color:var(--muted);font-size:13px;margin:8px 0 0}
+form{margin:0 0 12px}
+input[type=search]{width:100%;font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
+ul{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+ul:not(:has(li:not([hidden]))){display:none}
+li{padding:10px 14px;border-top:1px solid var(--line)}
+li:first-child{border-top:0}
+.row{display:flex;gap:12px;align-items:baseline;justify-content:space-between}
+.name{font-weight:600;word-break:break-all}
+.ver{color:var(--muted);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.desc{color:var(--muted);font-size:13px;margin-top:2px}
+.empty{color:var(--muted);padding:14px}
+</style>
+</head>
+<body>
+<main>
+<h1>{{ title }}</h1>
+<p class=sub>A Composer repository.{% if listed %} {{ total }} package{% if total != 1 %}s{% endif %}.{% endif %}</p>
+
+<h2>Use it in your project</h2>
+<div class=cmd><span class=tool>bougie</span><code>bougie repo add {{ url }}</code><button type=button data-copy="bougie repo add {{ url }}">Copy</button></div>
+<div class=cmd><span class=tool>composer</span><code>composer config repositories.{{ key }} composer {{ url }}</code><button type=button data-copy="composer config repositories.{{ key }} composer {{ url }}">Copy</button></div>
+{% if !anonymous %}
+<p class=note>Installing needs a token: run <code>bougie login</code>, or give Composer one with
+<code>composer config --auth http-basic.{{ host }} token &lt;TOKEN&gt;</code>.</p>
+{% endif %}
+
+<h2>Packages</h2>
+{% if listed %}
+<form method=get role=search>
+  <input type=search name=q value="{{ q }}" placeholder="Search packages" aria-label="Search packages" id=q autocomplete=off>
+</form>
+<ul id=pkgs>
+{% for p in packages %}
+  <li data-text="{{ p.search_text }}"{% if p.hidden %} hidden{% endif %}><div class=row><span class=name>{{ p.name }}</span>{% if let Some(v) = p.latest %}<span class=ver>{{ v }}</span>{% endif %}</div>{% if let Some(d) = p.description %}<div class=desc>{{ d }}</div>{% endif %}</li>
+{% endfor %}
+</ul>
+<p class=empty id=none{% if shown > 0 %} hidden{% endif %}>No packages match.</p>
+{% else %}
+<p class=note>This repository lists its packages to those who can install them.</p>
+{% endif %}
+</main>
+<script>
+for (const b of document.querySelectorAll('[data-copy]')) {
+  b.addEventListener('click', () => {
+    navigator.clipboard?.writeText(b.dataset.copy).then(() => {
+      b.textContent = 'Copied';
+      setTimeout(() => { b.textContent = 'Copy'; }, 1500);
+    });
+  });
+}
+const q = document.getElementById('q');
+if (q) {
+  const rows = [...document.querySelectorAll('#pkgs li')];
+  const none = document.getElementById('none');
+  const apply = () => {
+    const terms = q.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    let shown = 0;
+    for (const r of rows) {
+      const ok = terms.every((t) => r.dataset.text.includes(t));
+      r.hidden = !ok;
+      if (ok) shown++;
+    }
+    none.hidden = shown > 0;
+  };
+  q.addEventListener('input', apply);
+}
+</script>
+</body>
+</html>

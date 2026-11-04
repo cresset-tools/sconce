@@ -1463,6 +1463,16 @@ pub struct PackageVersion {
     pub source_reference: Option<String>,
 }
 
+/// One version a repository serves, as its human index lists it.
+#[derive(Debug, Clone)]
+pub struct VersionSummary {
+    pub name: String,
+    pub version: String,
+    pub normalized_version: String,
+    pub stability: String,
+    pub description: Option<String>,
+}
+
 /// Shared WHERE fragment for the admin package-version list/count: `$2` = name
 /// (`ilike`, null = any), `$3` = state (`held`|`yanked`|`approved`|`pending`,
 /// null = any). `pending` = gated by the repo policy (the approval queue):
@@ -7531,24 +7541,16 @@ impl Catalog {
              join packages p on p.id = pv.package_id \
              join repositories r on r.id = $1 \
              where p.name = $2 \
-               and ( p.repo_id = $1 \
-                     or exists (select 1 from repository_grants g \
-                                where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} ) \
-               and (r.allow_private_packages or p.visibility = 'public') \
-               and pv.yanked_at is null \
-               and pv.held_at is null \
-               and ( $3 = 'auto' \
-                     or pv.approved_at is not null \
-                     or ( $3 = 'delayed' \
-                          and pv.released_at is not null \
-                          and pv.released_at + make_interval(days => $4) <= now() ) ) \
+               and {scope} \
+               and {gate} \
                and ( $5::bigint is null \
                      or ( coalesce(pv.entitlement_date, pv.released_at) is not null \
                           and coalesce(pv.entitlement_date, pv.released_at) \
                               - make_interval(days => pv.grace_days) <= to_timestamp($5::double precision) ) ) \
                and ( $6::int is null \
-                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 )"
+                     or coalesce(nullif(split_part(pv.normalized_version, '.', 1), '')::int, 0) <= $6 )",
+            scope = served_scope(),
+            gate = policy_gate("$3", "$4"),
         ))
         .bind(repo_id)
         .bind(name)
@@ -7562,6 +7564,52 @@ impl Catalog {
             rows.iter().map(row_to_version).collect::<Result<_, _>>()?;
         sort_versions_ascending(&mut versions);
         Ok(versions)
+    }
+
+    /// Every package version `repo_id` serves under `(mode, cooldown_days)`,
+    /// for its human index: one row per version with the package name and its
+    /// description, newest last within each package. The same rules as
+    /// [`Self::visible_versions`] with no license bound; the caller narrows
+    /// the names to what the viewer may read.
+    pub async fn served_version_summaries(
+        &self,
+        repo_id: Uuid,
+        mode: &str,
+        cooldown_days: i32,
+    ) -> Result<Vec<VersionSummary>, sqlx::Error> {
+        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(&format!(
+            "select p.name, pv.version, pv.normalized_version, pv.stability, \
+                        pv.composer_json->>'description' \
+                 from package_versions pv \
+                 join packages p on p.id = pv.package_id \
+                 join repositories r on r.id = $1 \
+                 where {scope} and {gate}",
+            scope = served_scope(),
+            gate = policy_gate("$2", "$3"),
+        ))
+        .bind(repo_id)
+        .bind(mode)
+        .bind(cooldown_days)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<VersionSummary> = rows
+            .into_iter()
+            .map(
+                |(name, version, normalized_version, stability, description)| VersionSummary {
+                    name,
+                    version,
+                    normalized_version,
+                    stability,
+                    description,
+                },
+            )
+            .collect();
+        out.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| compare_normalized(&a.normalized_version, &b.normalized_version))
+        });
+        Ok(out)
     }
 
     /// A repository's update policy: `(update_mode, cooldown_days)`.
@@ -7820,16 +7868,43 @@ async fn run_migrations(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error
 /// A value that fails to parse falls back to a string comparison, keeping the
 /// ordering total.
 fn sort_versions_ascending(versions: &mut [PackageVersion]) {
+    versions.sort_by(|a, b| compare_normalized(&a.normalized_version, &b.normalized_version));
+}
+
+/// Order two normalized versions as Composer does, falling back to text.
+fn compare_normalized(a: &str, b: &str) -> std::cmp::Ordering {
     use composer_semver::Version;
-    versions.sort_by(|a, b| {
-        match (
-            Version::parse(&a.normalized_version),
-            Version::parse(&b.normalized_version),
-        ) {
-            (Ok(va), Ok(vb)) => va.cmp(&vb),
-            _ => a.normalized_version.cmp(&b.normalized_version),
-        }
-    });
+    match (Version::parse(a), Version::parse(b)) {
+        (Ok(va), Ok(vb)) => va.cmp(&vb),
+        _ => a.cmp(b),
+    }
+}
+
+/// The packages repository `$1` serves (aliased `p`, with `r` its row): its
+/// own, granted ones, and those a grant rule brings in, minus private ones in
+/// a public-only repository.
+fn served_scope() -> String {
+    format!(
+        "( p.repo_id = $1 \
+           or exists (select 1 from repository_grants g \
+                      where g.repo_id = $1 and g.package_id = p.id) \
+           or {GRANT_RULE_EXISTS} ) \
+         and (r.allow_private_packages or p.visibility = 'public')"
+    )
+}
+
+/// The update-policy gate on a version `pv`, given the SQL for the mode and
+/// cooldown: not yanked, not held, and released under the policy.
+fn policy_gate(mode: &str, cooldown_days: &str) -> String {
+    format!(
+        "pv.yanked_at is null \
+         and pv.held_at is null \
+         and ( {mode} = 'auto' \
+               or pv.approved_at is not null \
+               or ( {mode} = 'delayed' \
+                    and pv.released_at is not null \
+                    and pv.released_at + make_interval(days => {cooldown_days}) <= now() ) )"
+    )
 }
 
 fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<PackageVersion, sqlx::Error> {
