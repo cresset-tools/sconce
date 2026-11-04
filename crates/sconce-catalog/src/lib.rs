@@ -445,6 +445,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0059_repo_custom_domain",
         include_str!("../migrations/0059_repo_custom_domain.sql"),
     ),
+    (
+        "0060_repo_members",
+        include_str!("../migrations/0060_repo_members.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -908,6 +912,16 @@ pub enum UpsertPackageError {
     Db(#[from] sqlx::Error),
     #[error("{0}")]
     Policy(String),
+}
+
+/// Why setting a repository's members failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RepoMembersError {
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    /// The members break a rule; the string says which.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// Why creating a token failed — a database error, or an org policy that forbids
@@ -1502,6 +1516,18 @@ const GRANT_RULE_EXISTS: &str = "exists ( \
             or ( p.repo_id in (select rr.id from repositories rr where rr.org_id = ps.org_id) \
                  and exists (select 1 from package_set_rules sr \
                              where sr.set_id = gr.set_id and p.name like replace(sr.glob, '*', '%')) ) ) )";
+
+/// SQL `exists(...)` testing whether package `p` reaches repo `$1` as one of its
+/// **member repositories'** own packages, and is not shadowed: an earlier
+/// member owning a package of the same name serves that name instead.
+/// References `p.repo_id`/`p.name`.
+const MEMBER_EXISTS: &str = "exists ( \
+    select 1 from repository_members m \
+    where m.repo_id = $1 and m.member_repo_id = p.repo_id \
+      and not exists ( \
+          select 1 from repository_members m2 \
+          join packages p2 on p2.repo_id = m2.member_repo_id and p2.name = p.name \
+          where m2.repo_id = $1 and m2.position < m.position ) )";
 
 impl Catalog {
     /// Connect to Postgres at `database_url` (e.g.
@@ -3975,6 +4001,13 @@ impl Catalog {
         if effective == Visibility::Private {
             self.ensure_private_allowed(repo_id).await?;
         }
+        if self.has_members(repo_id).await? {
+            return Err(UpsertPackageError::Policy(
+                "this repository is made of member repositories and holds no packages \
+                 of its own: publish or mirror into one of its members"
+                    .to_owned(),
+            ));
+        }
         let id = sqlx::query_scalar(
             "insert into packages (repo_id, name, kind, source, visibility) values ($1, $2, $3, $4, $5) \
              on conflict (repo_id, name) do update set \
@@ -4501,25 +4534,26 @@ impl Catalog {
 
     /// Resolve a dist path as the repository's upstream served it to the package
     /// name and blob stored for it, so `composer.lock` files written against the
-    /// upstream keep installing once its domain points at this repository. Only
-    /// packages the repository itself owns are considered, under the same rules
-    /// as [`Self::repo_serves_dist`] (public-only policy, not yanked).
+    /// upstream keep installing once its domain points at this repository. The
+    /// packages the repository owns are considered, and its member repositories'
+    /// (unless shadowed, as on every read path), under the same rules as
+    /// [`Self::repo_serves_dist`] (public-only policy, not yanked).
     pub async fn dist_by_upstream_path(
         &self,
         repo_id: Uuid,
         upstream_dist_path: &str,
     ) -> Result<Option<(String, [u8; 32])>, sqlx::Error> {
-        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(&format!(
             "select p.name, pv.dist_blob_sha256 \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             join repositories r on r.id = p.repo_id \
-             where p.repo_id = $1 and pv.upstream_dist_path = $2 \
+             join repositories r on r.id = $1 \
+             where (p.repo_id = $1 or {MEMBER_EXISTS}) and pv.upstream_dist_path = $2 \
                and (r.allow_private_packages or p.visibility = 'public') \
                and pv.yanked_at is null \
              order by pv.id \
-             limit 1",
-        )
+             limit 1"
+        ))
         .bind(repo_id)
         .bind(upstream_dist_path)
         .fetch_optional(&self.pool)
@@ -4767,6 +4801,109 @@ impl Catalog {
         .bind(settings.anonymous_access)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Whether `repo_id` is made of member repositories.
+    pub async fn has_members(&self, repo_id: Uuid) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("select exists (select 1 from repository_members where repo_id = $1)")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// The member repositories of `repo_id`, in order, as `(id, "org/repo")`.
+    pub async fn repo_members(&self, repo_id: Uuid) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "select r.id, o.slug || '/' || r.slug from repository_members m \
+             join repositories r on r.id = m.member_repo_id \
+             join organizations o on o.id = r.org_id \
+             where m.repo_id = $1 order by m.position",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Replace the member repositories of `repo_id` with `members`, in that
+    /// order (empty clears them, making it an ordinary repository again).
+    /// Members must be other repositories of the same org, none of them made
+    /// of members itself; and a repository with members owns no packages and
+    /// is no other repository's member.
+    pub async fn set_repo_members(
+        &self,
+        repo_id: Uuid,
+        members: &[Uuid],
+    ) -> Result<(), RepoMembersError> {
+        let mut tx = self.pool.begin().await?;
+        if !members.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for m in members {
+                if *m == repo_id {
+                    return Err(RepoMembersError::Invalid(
+                        "a repository cannot be its own member".into(),
+                    ));
+                }
+                if !seen.insert(*m) {
+                    return Err(RepoMembersError::Invalid("a member is listed twice".into()));
+                }
+            }
+            let other_org: bool = sqlx::query_scalar(
+                "select exists (select 1 from repositories m, repositories r \
+                                where r.id = $1 and m.id = any($2) and m.org_id <> r.org_id) \
+                    or (select count(*) from repositories where id = any($2)) <> cardinality($2)",
+            )
+            .bind(repo_id)
+            .bind(members)
+            .fetch_one(&mut *tx)
+            .await?;
+            if other_org {
+                return Err(RepoMembersError::Invalid(
+                    "members must be repositories of the same organization".into(),
+                ));
+            }
+            let nested: bool = sqlx::query_scalar(
+                "select exists (select 1 from repository_members where repo_id = any($1)) \
+                    or exists (select 1 from repository_members where member_repo_id = $2)",
+            )
+            .bind(members)
+            .bind(repo_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if nested {
+                return Err(RepoMembersError::Invalid(
+                    "only one level: a member cannot have members, and a repository with \
+                     members cannot be a member"
+                        .into(),
+                ));
+            }
+            let owns: bool =
+                sqlx::query_scalar("select exists (select 1 from packages where repo_id = $1)")
+                    .bind(repo_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if owns {
+                return Err(RepoMembersError::Invalid(
+                    "the repository owns packages; a repository with members holds none of its own"
+                        .into(),
+                ));
+            }
+        }
+        sqlx::query("delete from repository_members where repo_id = $1")
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+        for (position, m) in members.iter().enumerate() {
+            sqlx::query(
+                "insert into repository_members (repo_id, member_repo_id, position) values ($1, $2, $3)",
+            )
+            .bind(repo_id)
+            .bind(m)
+            .bind(i32::try_from(position).unwrap_or(i32::MAX))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -7413,7 +7550,8 @@ impl Catalog {
                and ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
                                 where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} ) \
+                     or {GRANT_RULE_EXISTS} \
+                     or {MEMBER_EXISTS} ) \
              order by p.name"
         ))
         .bind(repo_id)
@@ -7439,7 +7577,8 @@ impl Catalog {
              where ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
                                 where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} ) \
+                     or {GRANT_RULE_EXISTS} \
+                     or {MEMBER_EXISTS} ) \
                and ($2::text is null or p.name = $2) \
              group by p.name \
              having bool_and(p.visibility = 'public') \
@@ -7503,7 +7642,8 @@ impl Catalog {
                    and ( p.repo_id = $1 \
                          or exists (select 1 from repository_grants g \
                                     where g.repo_id = $1 and g.package_id = p.id) \
-                         or {GRANT_RULE_EXISTS} ) \
+                         or {GRANT_RULE_EXISTS} \
+                         or {MEMBER_EXISTS} ) \
                    and (r.allow_private_packages or p.visibility = 'public') \
                    and pv.yanked_at is null )"
         ))
@@ -7888,7 +8028,8 @@ fn served_scope() -> String {
         "( p.repo_id = $1 \
            or exists (select 1 from repository_grants g \
                       where g.repo_id = $1 and g.package_id = p.id) \
-           or {GRANT_RULE_EXISTS} ) \
+           or {GRANT_RULE_EXISTS} \
+           or {MEMBER_EXISTS} ) \
          and (r.allow_private_packages or p.visibility = 'public')"
     )
 }
@@ -9890,6 +10031,162 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// A repository made of members serves what they own, in order: the first
+    /// member owning a name serves it, even when a later one has more versions.
+    #[tokio::test]
+    async fn member_repositories_serve_their_packages_first_member_first() {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let org = format!(
+            "m{}-{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        );
+        cat.create_org(&org, None).await.unwrap();
+        let releases = cat.create_repo(&org, "releases").await.unwrap();
+        let mirror = cat.create_repo(&org, "mirror").await.unwrap();
+        let all = cat.create_repo(&org, "all").await.unwrap();
+        let blob = [7u8; 32];
+        let add = async |repo, name: &str, versions: &[&str]| {
+            let pkg = cat
+                .upsert_package(repo, name, "composer", None, Visibility::Public)
+                .await
+                .unwrap();
+            for v in versions {
+                cat.upsert_package_version(
+                    pkg,
+                    v,
+                    &format!("{v}.0"),
+                    "stable",
+                    &serde_json::json!({"name": name}),
+                    Some(&blob),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        };
+        add(releases, "mage-os/a", &["1.0.0"]).await;
+        add(releases, "other/shared", &["1.0.0"]).await;
+        add(mirror, "hyva/b", &["2.0.0"]).await;
+        add(mirror, "other/shared", &["1.0.0", "1.1.0"]).await;
+        cat.backfill_upstream_dist_path(mirror, "hyva/b", "2.0.0.0", "/dist/hyva/b-2.0.0.zip")
+            .await
+            .unwrap();
+
+        cat.set_repo_members(all, &[releases, mirror])
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.repo_members(all)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [releases, mirror]
+        );
+        assert_eq!(
+            cat.all_package_names(all).await.unwrap(),
+            ["hyva/b", "mage-os/a", "other/shared"]
+        );
+        assert_eq!(
+            cat.anonymous_package_names(all, None).await.unwrap(),
+            ["hyva/b", "mage-os/a", "other/shared"]
+        );
+        // The first member's copy of the shared name, never a mix of both.
+        let shared = cat
+            .visible_versions(all, "other/shared", "auto", 0, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            shared
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.0.0"]
+        );
+        assert!(cat.repo_serves_dist(all, "hyva/b", &blob).await.unwrap());
+        assert_eq!(
+            cat.dist_by_upstream_path(all, "/dist/hyva/b-2.0.0.zip")
+                .await
+                .unwrap()
+                .map(|(n, _)| n),
+            Some("hyva/b".to_owned())
+        );
+
+        // Reordering hands the shared name to the mirror.
+        cat.set_repo_members(all, &[mirror, releases])
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.visible_versions(all, "other/shared", "auto", 0, None, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Clearing the members makes it an empty, ordinary repository again.
+        cat.set_repo_members(all, &[]).await.unwrap();
+        assert!(cat.all_package_names(all).await.unwrap().is_empty());
+        assert!(
+            cat.dist_by_upstream_path(all, "/dist/hyva/b-2.0.0.zip")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn member_repositories_are_one_level_in_one_org() {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let Some(cat) = catalog_only().await else {
+            return;
+        };
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let org = format!("n{}-{n}", std::process::id());
+        let other = format!("o{}-{n}", std::process::id());
+        cat.create_org(&org, None).await.unwrap();
+        cat.create_org(&other, None).await.unwrap();
+        let a = cat.create_repo(&org, "a").await.unwrap();
+        let b = cat.create_repo(&org, "b").await.unwrap();
+        let all = cat.create_repo(&org, "all").await.unwrap();
+        let elsewhere = cat.create_repo(&other, "x").await.unwrap();
+        let invalid = |r: Result<(), RepoMembersError>| match r {
+            Err(RepoMembersError::Invalid(why)) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        assert!(
+            invalid(cat.set_repo_members(all, &[a, elsewhere]).await).contains("same organization")
+        );
+        assert!(invalid(cat.set_repo_members(all, &[all]).await).contains("own member"));
+        assert!(invalid(cat.set_repo_members(all, &[a, a]).await).contains("twice"));
+
+        cat.set_repo_members(all, &[a]).await.unwrap();
+        // A repo with members can't be a member, nor take a member that has them.
+        assert!(invalid(cat.set_repo_members(b, &[all]).await).contains("one level"));
+        // It holds no packages of its own...
+        match cat
+            .upsert_package(all, "x/y", "composer", None, Visibility::Public)
+            .await
+        {
+            Err(UpsertPackageError::Policy(why)) => assert!(why.contains("member repositories")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // ...and a repo that owns packages can't take members.
+        cat.upsert_package(b, "x/y", "composer", None, Visibility::Public)
+            .await
+            .unwrap();
+        cat.set_repo_members(all, &[]).await.unwrap();
+        assert!(invalid(cat.set_repo_members(b, &[a]).await).contains("owns packages"));
     }
 
     /// Seller mode: a license key resolves only for its repo and unlocks only
