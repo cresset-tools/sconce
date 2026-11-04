@@ -4046,9 +4046,8 @@ fn serve(
             });
         }
 
-        // Optional in-process admin UI on its own port. It drains on the same
-        // signal as the wire server, which waits for it below.
-        let ui_task = ui_listen.map(|ui_addr| {
+        // Optional in-process admin UI on its own port.
+        if let Some(ui_addr) = ui_listen {
             let ucat = catalog.clone();
             let ubase = base_url.clone();
             let apw = admin_password;
@@ -4059,8 +4058,8 @@ fn serve(
                 {
                     tracing::error!(error = %e, "ui server exited");
                 }
-            })
-        });
+            });
+        }
 
         tracing::info!(
             store = store.describe(),
@@ -4069,9 +4068,6 @@ fn serve(
         sconce_server::serve(catalog, store, base_url, listen)
             .await
             .context("serving")?;
-        if let Some(ui_task) = ui_task {
-            let _ = ui_task.await;
-        }
         Ok::<_, anyhow::Error>(())
     })
 }

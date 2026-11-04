@@ -395,54 +395,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let app = router(catalog, store, base_url);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    serve_until(listener, app, shutdown_signal()).await
-}
-
-/// Serve `app` on `listener` until `shutdown` resolves, then drain: stop
-/// accepting connections, let the requests in flight finish, and return.
-/// A proxy in front sees the closed listener as a refused connection and
-/// retries the request on another instance, so a rolling restart drops
-/// nothing.
-async fn serve_until(
-    listener: tokio::net::TcpListener,
-    app: Router,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-}
-
-/// Resolves when the process is asked to stop: SIGTERM (what podman and
-/// systemd send) or Ctrl-C. Every server in the process waits on its own
-/// copy, so each one drains on the same signal.
-pub async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %e, "cannot listen for Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let term = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                sigterm.recv().await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot listen for SIGTERM");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {}
-        () = term => {}
-    }
-    tracing::info!("shutting down: finishing the requests in flight");
+    axum::serve(listener, app).await
 }
 
 async fn packages_json(
@@ -1341,46 +1294,6 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn shutdown_finishes_requests_in_flight_and_refuses_new_ones() {
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let app = Router::new().route(
-            "/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                "done"
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(super::serve_until(listener, app, async {
-            let _ = stopped.await;
-        }));
-
-        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
-        conn.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        // Ask the server to stop while the request is still sleeping.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        stop.send(()).unwrap();
-
-        let mut response = String::new();
-        conn.read_to_string(&mut response).await.unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response.ends_with("done"), "{response}");
-
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("the server returns once drained")
-            .unwrap()
-            .unwrap();
-        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
-    }
-
     use super::*;
 
     #[test]

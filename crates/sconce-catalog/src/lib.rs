@@ -10051,7 +10051,6 @@ mod tests {
         let mirror = cat.create_repo(&org, "mirror").await.unwrap();
         let all = cat.create_repo(&org, "all").await.unwrap();
         let blob = [7u8; 32];
-        cat.upsert_blob(&blob, 1234).await.unwrap();
         let add = async |repo, name: &str, versions: &[&str]| {
             let pkg = cat
                 .upsert_package(repo, name, "composer", None, Visibility::Public)

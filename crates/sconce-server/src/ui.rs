@@ -248,7 +248,6 @@ pub async fn serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(crate::shutdown_signal())
     .await
 }
 
