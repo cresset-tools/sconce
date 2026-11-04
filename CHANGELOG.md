@@ -1,46 +1,5 @@
 # Changelog
 
-## [0.11.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.10.1...sconce-v0.11.0) (2026-11-11)
-
-
-### Features
-
-* **sconce:** keep git-mirrored versions when a tag moves ([5217487](https://github.com/cresset-tools/sconce/commit/5217487c30024710610d67a9364f3838e1da05ac))
-* **sconce:** sync upstreams automatically ([ddd8969](https://github.com/cresset-tools/sconce/commit/ddd896904e9cf6ed5db763d724339b73bc33527c))
-* **sconce:** use a GitHub token for GitHub upstreams ([0798b52](https://github.com/cresset-tools/sconce/commit/0798b52a5c955ad3a3f07179c6d46de99a14321d))
-
-
-### Bug Fixes
-
-* **console:** return to the page you were on after signing in ([2c0f662](https://github.com/cresset-tools/sconce/commit/2c0f662e7d354428551d34a0df50676b525b5119))
-
-## [0.10.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.10.0...sconce-v0.10.1) (2026-11-08)
-
-
-### Bug Fixes
-
-* **archive:** keep empty directories in package archives ([1b77cad](https://github.com/cresset-tools/sconce/commit/1b77cad8e276b01923205ee5b91f7415b6eefeb1))
-
-## [0.10.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.9.0...sconce-v0.10.0) (2026-11-04)
-
-
-### Features
-
-* **catalog:** repositories made of member repositories ([2702eb2](https://github.com/cresset-tools/sconce/commit/2702eb2a946d4e02f05ec731e4f708d08fd30c6b))
-* **server:** drain requests in flight on shutdown ([90be536](https://github.com/cresset-tools/sconce/commit/90be5362964b859c4fa38489fe965bc2f08c02e8))
-
-## [0.9.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.8.0...sconce-v0.9.0) (2026-11-04)
-
-
-### Features
-
-* **server:** a human index page for every repository ([99ac742](https://github.com/cresset-tools/sconce/commit/99ac7424dc4f471e35c4eb05cf03323210e102a1))
-
-
-### Bug Fixes
-
-* **cli:** never print environment values in --help ([1c5730a](https://github.com/cresset-tools/sconce/commit/1c5730aa5f87e681caf1c76949086e1150c06a15))
-
 ## [0.8.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.1...sconce-v0.8.0) (2026-11-04)
 
 

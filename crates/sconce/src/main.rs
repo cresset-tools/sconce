@@ -386,8 +386,6 @@ enum Command {
         cas: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
-        #[command(flatten)]
-        sync: SyncScheduleArgs,
     },
 
     /// Reclaim unreferenced blobs from the store (garbage collection).
@@ -702,8 +700,6 @@ enum Command {
         /// worker` instead).
         #[arg(long)]
         no_worker: bool,
-        #[command(flatten)]
-        sync: SyncScheduleArgs,
         /// Also serve the admin UI on this address (single-binary deploy).
         #[arg(long)]
         ui_listen: Option<std::net::SocketAddr>,
@@ -1291,7 +1287,6 @@ fn main() -> Result<()> {
             listen,
             base_url,
             no_worker,
-            sync,
             ui_listen,
             single_tenant,
             admin_password,
@@ -1301,7 +1296,6 @@ fn main() -> Result<()> {
             listen,
             base_url,
             no_worker,
-            sync.schedule(),
             ui_listen,
             single_tenant,
             admin_password,
@@ -1405,11 +1399,7 @@ fn main() -> Result<()> {
                 database_url,
             } => package_visibility(&repo, &package, visibility.map(Into::into), &database_url),
         },
-        Command::Worker {
-            cas,
-            database_url,
-            sync,
-        } => worker(cas.as_deref(), &database_url, sync.schedule()),
+        Command::Worker { cas, database_url } => worker(cas.as_deref(), &database_url),
         Command::Gc {
             cas,
             grace_hours,
@@ -1921,16 +1911,9 @@ fn mirror_package(
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
 
-        let key = sconce_catalog::secret::SecretKey::from_env().ok();
-        let report = sconce_mirror::mirror_composer_package(
-            &catalog,
-            &store,
-            upstream,
-            package,
-            key.as_ref(),
-        )
-        .await
-        .with_context(|| format!("mirroring {package} from upstream {upstream}"))?;
+        let report = sconce_mirror::mirror_composer_package(&catalog, &store, upstream, package)
+            .await
+            .with_context(|| format!("mirroring {package} from upstream {upstream}"))?;
         for m in &report.mirrored {
             println!("  + {} {} ({})", m.package, m.tag, m.stability);
         }
@@ -1962,11 +1945,9 @@ fn mirror_registry(upstream: uuid::Uuid, cas: Option<&Path>, database_url: &str)
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
 
-        let key = sconce_catalog::secret::SecretKey::from_env().ok();
-        let report =
-            sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream, key.as_ref())
-                .await
-                .with_context(|| format!("mirroring registry upstream {upstream}"))?;
+        let report = sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream)
+            .await
+            .with_context(|| format!("mirroring registry upstream {upstream}"))?;
         // Summarize per package so a big run is readable.
         let mut by_pkg: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for m in &report.mirrored {
@@ -2205,7 +2186,7 @@ async fn run_job(
                 .package
                 .as_deref()
                 .ok_or_else(|| bad_job("job missing package"))?;
-            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg, key).await?;
+            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg).await?;
             log_conflicts(&r);
             Ok(format!(
                 "{pkg}: {} version(s), {} unchanged, {} conflict(s)",
@@ -2216,7 +2197,7 @@ async fn run_job(
         }
         "resolve_closure" => {
             let rid = job.repo_id.ok_or_else(|| bad_job("job missing repo_id"))?;
-            let plan = sconce_mirror::resolve_closure(catalog, rid, key).await?;
+            let plan = sconce_mirror::resolve_closure(catalog, rid).await?;
             // A DB write failure here is transient — retry, don't give up.
             catalog
                 .replace_dependency_plan(rid, &plan)
@@ -2251,7 +2232,7 @@ fn retry_backoff_secs(attempts: i32) -> f64 {
     base * jitter
 }
 
-fn worker(cas: Option<&Path>, database_url: &str, schedule: SyncSchedule) -> Result<()> {
+fn worker(cas: Option<&Path>, database_url: &str) -> Result<()> {
     use sconce_catalog::Catalog;
 
     let runtime = tokio::runtime::Runtime::new().context("starting async runtime")?;
@@ -2262,7 +2243,7 @@ fn worker(cas: Option<&Path>, database_url: &str, schedule: SyncSchedule) -> Res
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
         let key = sconce_catalog::secret::SecretKey::from_env().ok();
-        run_worker_loop(catalog, store, key, database_url.to_owned(), schedule).await
+        run_worker_loop(catalog, store, key, database_url.to_owned()).await
     })
 }
 
@@ -2510,168 +2491,6 @@ fn set_feature(e: &mut sconce_catalog::Entitlements, f: sconce_catalog::Feature,
     }
 }
 
-/// How often the worker checks upstreams for changes (`--git-check-interval`,
-/// `--composer-sync-interval`).
-#[derive(clap::Args, Debug, Clone, Copy)]
-struct SyncScheduleArgs {
-    /// Seconds between checks of each git upstream for new or moved tags. A
-    /// check is one `git ls-remote`; the upstream is cloned and mirrored only
-    /// when its tags changed. 0 turns automatic git syncs off.
-    #[arg(long, default_value_t = 120)]
-    git_check_interval: u64,
-    /// Seconds between syncs of each composer upstream. Package metadata is
-    /// fetched conditionally, so an unchanged package costs one 304. 0 turns
-    /// automatic composer syncs off.
-    #[arg(long, default_value_t = 600)]
-    composer_sync_interval: u64,
-}
-
-impl SyncScheduleArgs {
-    fn schedule(self) -> SyncSchedule {
-        let secs = |s: u64| (s > 0).then(|| std::time::Duration::from_secs(s));
-        SyncSchedule {
-            git: secs(self.git_check_interval),
-            composer: secs(self.composer_sync_interval),
-        }
-    }
-}
-
-/// Check intervals per upstream kind; `None` leaves that kind unscheduled.
-#[derive(Debug, Clone, Copy)]
-struct SyncSchedule {
-    git: Option<std::time::Duration>,
-    composer: Option<std::time::Duration>,
-}
-
-/// Run upstream checks as they come due, forever: up to `MAX_CONCURRENT` at a
-/// time, so a slow or unreachable upstream holds one slot rather than
-/// delaying every other upstream's check.
-async fn run_scheduler(
-    catalog: sconce_catalog::Catalog,
-    key: Option<sconce_catalog::secret::SecretKey>,
-    schedule: SyncSchedule,
-) {
-    use std::sync::Arc;
-    use std::time::Duration;
-    /// How long to wait when nothing is due: the most a check runs late.
-    const TICK: Duration = Duration::from_secs(5);
-    const MAX_CONCURRENT: usize = 16;
-
-    let git = schedule.git.map(|d| d.as_secs_f64());
-    let composer = schedule.composer.map(|d| d.as_secs_f64());
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
-    loop {
-        // Claim only as many upstreams as can start now, so a claimed check
-        // never sits waiting for a slot.
-        let first = Arc::clone(&slots)
-            .acquire_owned()
-            .await
-            .expect("the semaphore is never closed");
-        let free = 1 + slots.available_permits();
-        let due = match catalog
-            .claim_due_upstreams(i64::try_from(free).unwrap_or(1), git, composer)
-            .await
-        {
-            Ok(due) => due,
-            Err(e) => {
-                tracing::warn!(error = %e, "claiming due upstreams failed");
-                Vec::new()
-            }
-        };
-        if due.is_empty() {
-            drop(first);
-            tokio::time::sleep(TICK).await;
-            continue;
-        }
-        let mut permit = Some(first);
-        for d in due {
-            let permit = match permit.take() {
-                Some(p) => p,
-                None => Arc::clone(&slots)
-                    .acquire_owned()
-                    .await
-                    .expect("the semaphore is never closed"),
-            };
-            let interval = if d.kind == "git" { git } else { composer }.unwrap_or(60.0);
-            let (catalog, key) = (catalog.clone(), key.clone());
-            tokio::spawn(async move {
-                check_and_record(&catalog, key.as_ref(), &d, interval).await;
-                drop(permit);
-            });
-        }
-    }
-}
-
-/// Check one due upstream and record the outcome on it.
-async fn check_and_record(
-    catalog: &sconce_catalog::Catalog,
-    key: Option<&sconce_catalog::secret::SecretKey>,
-    due: &sconce_catalog::DueUpstream,
-    interval_secs: f64,
-) {
-    /// A check is one `git ls-remote` or one queued job; anything slower is
-    /// treated as a failure, so the slot frees up.
-    const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-    let outcome = match tokio::time::timeout(CHECK_TIMEOUT, check_upstream(catalog, key, due)).await
-    {
-        Ok(outcome) => outcome,
-        Err(_) => Err(anyhow::anyhow!("check timed out after {CHECK_TIMEOUT:?}")),
-    };
-    let recorded = match outcome {
-        Ok(queued) => {
-            if queued {
-                tracing::info!(upstream = %due.id, kind = %due.kind, "upstream changed, sync queued");
-            }
-            catalog.record_upstream_check_ok(due.id).await
-        }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            tracing::warn!(upstream = %due.id, kind = %due.kind, error = %msg, "upstream check failed");
-            catalog
-                .record_upstream_check_failed(due.id, interval_secs, &msg)
-                .await
-        }
-    };
-    if let Err(e) = recorded {
-        tracing::warn!(upstream = %due.id, error = %e, "recording the upstream check failed");
-    }
-}
-
-/// Check one upstream; `Ok(true)` when a mirror job was queued for it.
-async fn check_upstream(
-    catalog: &sconce_catalog::Catalog,
-    key: Option<&sconce_catalog::secret::SecretKey>,
-    due: &sconce_catalog::DueUpstream,
-) -> Result<bool> {
-    match due.kind.as_str() {
-        "git" => {
-            let up = catalog
-                .get_upstream(due.id)
-                .await?
-                .context("upstream disappeared")?;
-            // `git ls-remote` is a blocking subprocess: keep it off the
-            // async threads.
-            let (refs, key) = (due.synced_refs.clone(), key.cloned());
-            let changed = tokio::task::spawn_blocking(move || {
-                sconce_mirror::git_upstream_changed(&up, refs.as_deref(), key.as_ref())
-            })
-            .await
-            .context("upstream check task")??;
-            if !changed {
-                return Ok(false);
-            }
-        }
-        // Without a require-list a composer upstream would mirror nothing (or
-        // the whole registry), and its sync is refused.
-        "composer" if !due.has_requires => {
-            anyhow::bail!("no require-list: add one to say which packages to mirror")
-        }
-        _ => {}
-    }
-    catalog.enqueue_mirror_job(due.id).await?;
-    Ok(true)
-}
-
 /// The worker loop: claim and run jobs, then wait on NOTIFY (with a poll
 /// backstop). Runs forever; usable standalone (`sconce worker`) or spawned
 /// in-process by `sconce serve`.
@@ -2680,7 +2499,6 @@ async fn run_worker_loop(
     store: sconce_cas::AnyBlobStore,
     key: Option<sconce_catalog::secret::SecretKey>,
     database_url: String,
-    schedule: SyncSchedule,
 ) -> Result<()> {
     use std::time::Duration;
 
@@ -2696,13 +2514,7 @@ async fn run_worker_loop(
             .listen("mirror_jobs")
             .await
             .context("LISTEN mirror_jobs")?;
-        tracing::info!(poll = ?POLL, ?schedule, "worker ready (LISTEN mirror_jobs)");
-
-        // Upstream checks run on their own, so a long mirror job never delays
-        // them; a check that queues a job wakes this loop through NOTIFY.
-        if schedule.git.is_some() || schedule.composer.is_some() {
-            tokio::spawn(run_scheduler(catalog.clone(), key.clone(), schedule));
-        }
+        tracing::info!(poll = ?POLL, "worker ready (LISTEN mirror_jobs)");
 
         loop {
             // Drain everything currently claimable before going back to sleep.
@@ -4204,7 +4016,6 @@ fn serve(
     listen: std::net::SocketAddr,
     base_url: String,
     no_worker: bool,
-    schedule: SyncSchedule,
     ui_listen: Option<std::net::SocketAddr>,
     single_tenant: bool,
     admin_password: Option<String>,
@@ -4229,15 +4040,14 @@ fn serve(
             let durl = database_url.to_owned();
             let key = sconce_catalog::secret::SecretKey::from_env().ok();
             tokio::spawn(async move {
-                if let Err(e) = run_worker_loop(wcat, wstore, key, durl, schedule).await {
+                if let Err(e) = run_worker_loop(wcat, wstore, key, durl).await {
                     tracing::error!(error = format!("{e:#}"), "worker loop exited");
                 }
             });
         }
 
-        // Optional in-process admin UI on its own port. It drains on the same
-        // signal as the wire server, which waits for it below.
-        let ui_task = ui_listen.map(|ui_addr| {
+        // Optional in-process admin UI on its own port.
+        if let Some(ui_addr) = ui_listen {
             let ucat = catalog.clone();
             let ubase = base_url.clone();
             let apw = admin_password;
@@ -4248,8 +4058,8 @@ fn serve(
                 {
                     tracing::error!(error = %e, "ui server exited");
                 }
-            })
-        });
+            });
+        }
 
         tracing::info!(
             store = store.describe(),
@@ -4258,9 +4068,6 @@ fn serve(
         sconce_server::serve(catalog, store, base_url, listen)
             .await
             .context("serving")?;
-        if let Some(ui_task) = ui_task {
-            let _ = ui_task.await;
-        }
         Ok::<_, anyhow::Error>(())
     })
 }
@@ -4398,9 +4205,8 @@ fn archive(src: &Path, out: &Path) -> Result<()> {
 }
 
 /// Recursively collect files/symlinks under `dir` into `archive`, keyed by their
-/// path relative to `root`. Every directory is added too; the archiver keeps
-/// only the empty ones. `.git` is skipped. Sorting/canonicalization happens in
-/// the archiver.
+/// path relative to `root`. Directory entries are not emitted (implied by
+/// paths). `.git` is skipped. Sorting/canonicalization happens in the archiver.
 fn walk(root: &Path, dir: &Path, archive: &mut CanonicalArchive, count: &mut usize) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -4427,7 +4233,6 @@ fn walk(root: &Path, dir: &Path, archive: &mut CanonicalArchive, count: &mut usi
             ));
             *count += 1;
         } else if file_type.is_dir() {
-            archive.add(Entry::dir(rel));
             walk(root, &path, archive, count)?;
         } else if file_type.is_file() {
             let content = std::fs::read(&path)?;
