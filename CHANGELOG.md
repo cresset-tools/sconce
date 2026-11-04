@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.8.0...sconce-v0.9.0) (2026-11-04)
+
+
+### Features
+
+* **server:** a human index page for every repository ([99ac742](https://github.com/cresset-tools/sconce/commit/99ac7424dc4f471e35c4eb05cf03323210e102a1))
+
+
+### Bug Fixes
+
+* **cli:** never print environment values in --help ([1c5730a](https://github.com/cresset-tools/sconce/commit/1c5730aa5f87e681caf1c76949086e1150c06a15))
+
 ## [0.8.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.1...sconce-v0.8.0) (2026-11-04)
 
 
