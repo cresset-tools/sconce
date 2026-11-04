@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod cache;
 pub mod ci;
 pub mod csrf;
 pub mod mail;
@@ -36,10 +37,12 @@ pub mod ui;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::from_fn_with_state;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
+use cache::{Kind, cache};
 use sconce_cas::{AnyBlobStore, BlobId, BlobStore};
 use sconce_catalog::{Catalog, RepoLocation};
 use serde_json::json;
@@ -103,12 +106,24 @@ fn main_router(state: AppState) -> Router {
     let max_upload = publish::max_upload_bytes();
     let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
     Router::new()
-        .route("/{org}/{repo}/packages.json", get(packages_json))
-        .route("/{org}/{repo}/p2/{*rest}", get(p2))
-        .route("/{org}/{repo}/dist/{*rest}", get(dist))
+        .route(
+            "/{org}/{repo}/packages.json",
+            get(packages_json).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
+        .route(
+            "/{org}/{repo}/p2/{*rest}",
+            get(p2).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
+        .route(
+            "/{org}/{repo}/dist/{*rest}",
+            get(dist).layer(from_fn_with_state(Kind::Dist, cache)),
+        )
         // Dist paths of an imported upstream, for existing composer.lock URLs.
         // Registered as a catch-all: every more specific route wins.
-        .route("/{org}/{repo}/{*path}", get(upstream_dist))
+        .route(
+            "/{org}/{repo}/{*path}",
+            get(upstream_dist).layer(from_fn_with_state(Kind::Dist, cache)),
+        )
         .route("/oauth/ci", post(oauth_ci))
         .route("/oauth/ci-publish", post(oauth_ci_publish))
         // Device authorization grant (RFC 8628) for `bougie login`: the CLI starts
@@ -546,11 +561,23 @@ struct DomainRepo {
 /// domain pointed here exposes nothing a Composer client does not need.
 fn domain_router(state: AppState) -> Router {
     Router::new()
-        .route("/packages.json", get(domain_packages_json))
-        .route("/p2/{*rest}", get(domain_p2))
-        .route("/dist/{*rest}", get(domain_dist))
+        .route(
+            "/packages.json",
+            get(domain_packages_json).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
+        .route(
+            "/p2/{*rest}",
+            get(domain_p2).layer(from_fn_with_state(Kind::Metadata, cache)),
+        )
+        .route(
+            "/dist/{*rest}",
+            get(domain_dist).layer(from_fn_with_state(Kind::Dist, cache)),
+        )
         .route("/healthz", get(healthz))
-        .route("/{*path}", get(domain_upstream_dist))
+        .route(
+            "/{*path}",
+            get(domain_upstream_dist).layer(from_fn_with_state(Kind::Dist, cache)),
+        )
         .with_state(state)
 }
 
@@ -1546,6 +1573,137 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read routes tell caches what they may keep: anonymous responses are
+    /// public, a credential's private, errors never stored, and metadata
+    /// revalidates by `ETag`.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn read_routes_carry_cache_headers() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let cat = Catalog::connect(&url).await.unwrap();
+        cat.migrate().await.unwrap();
+        let slug = format!("cache{}", std::process::id());
+        cat.create_org(&slug, None).await.unwrap();
+        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
+        let dir = std::env::temp_dir().join(format!("sconce-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AnyBlobStore::open(Some(&dir)).unwrap();
+        let pid = cat
+            .upsert_package(
+                repo_id,
+                "open/lib",
+                "composer",
+                None,
+                sconce_catalog::Visibility::Public,
+            )
+            .await
+            .unwrap();
+        let blob = store.put(b"PK\x03\x04cache").unwrap();
+        cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
+        cat.insert_mirrored_version(
+            pid,
+            "1.0.0",
+            "1.0.0.0",
+            "stable",
+            &json!({ "name": "open/lib" }),
+            blob.as_bytes(),
+            "unused",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let token = cat.create_token(repo_id, Some("r"), None).await.unwrap();
+        let dist = format!("dist/open/lib/{}.zip", blob.to_hex());
+
+        let app = router(cat.clone(), store, "http://localhost".to_owned());
+        let get = async |path: &str, auth: Option<&str>, etag: Option<&str>| {
+            let mut req = Request::builder().uri(format!("/{slug}/r/{path}"));
+            if let Some(t) = auth {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            if let Some(e) = etag {
+                req = req.header(header::IF_NONE_MATCH, e);
+            }
+            app.clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        };
+        let cc = |r: &Response| {
+            r.headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        let varies = |r: &Response| {
+            r.headers()
+                .get_all(header::VARY)
+                .iter()
+                .any(|v| v.to_str().unwrap().contains("Authorization"))
+        };
+
+        // Anonymous access off: the 401 is never stored.
+        let r = get("packages.json", None, None).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(cc(&r).as_deref(), Some("no-store"));
+
+        // A credential's responses are private.
+        let r = get("p2/open/lib.json", Some(&token), None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(cc(&r).as_deref(), Some("private, max-age=60"));
+        assert!(varies(&r));
+        let r = get(&dist, Some(&token), None).await;
+        assert_eq!(cc(&r).as_deref(), Some("private, max-age=86400"));
+
+        let mut settings = cat.repo_settings(repo_id).await.unwrap();
+        settings.anonymous_access = true;
+        cat.set_repo_settings(repo_id, settings).await.unwrap();
+
+        // Anonymous ones are public: metadata for a minute, dists for a day.
+        for path in ["packages.json", "p2/open/lib.json"] {
+            let r = get(path, None, None).await;
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(cc(&r).as_deref(), Some("public, max-age=60"), "{path}");
+            assert!(varies(&r), "{path}");
+        }
+        let r = get(&dist, None, None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(cc(&r).as_deref(), Some("public, max-age=86400"));
+        assert!(varies(&r));
+
+        // Metadata revalidates by ETag: unchanged is a 304 with its headers.
+        let r = get("p2/open/lib.json", None, None).await;
+        let etag = r.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let r = get("p2/open/lib.json", None, Some(&etag)).await;
+        assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(cc(&r).as_deref(), Some("public, max-age=60"));
+        assert_eq!(r.headers()[header::ETAG].to_str().unwrap(), etag);
+        let weak = format!("\"x\", W/{etag}");
+        assert_eq!(
+            get("p2/open/lib.json", None, Some(&weak)).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
+        // A changed document gets a new tag, so the old one no longer matches.
+        cat.hold_version(repo_id, "open/lib", "1.0.0.0")
+            .await
+            .unwrap();
+        let r = get("p2/open/lib.json", None, Some(&etag)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_ne!(r.headers()[header::ETAG].to_str().unwrap(), etag);
+
+        // A missing dist is never stored either.
+        let missing = format!("dist/open/lib/{}.zip", "0".repeat(64));
+        let r = get(&missing, None, None).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cc(&r).as_deref(), Some("no-store"));
     }
 
     /// A custom domain serves its repository's Composer routes at the root, with
