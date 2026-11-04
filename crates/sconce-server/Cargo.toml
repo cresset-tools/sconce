@@ -18,7 +18,7 @@ sconce-archive = { workspace = true }
 # Composer version normalization for a published version string.
 composer-semver = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "signal"] }
 base64 = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
