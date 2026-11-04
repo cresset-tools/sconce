@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.9.0...sconce-v0.10.0) (2026-11-04)
+
+
+### Features
+
+* **catalog:** repositories made of member repositories ([2702eb2](https://github.com/cresset-tools/sconce/commit/2702eb2a946d4e02f05ec731e4f708d08fd30c6b))
+* **server:** drain requests in flight on shutdown ([90be536](https://github.com/cresset-tools/sconce/commit/90be5362964b859c4fa38489fe965bc2f08c02e8))
+
 ## [0.9.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.8.0...sconce-v0.9.0) (2026-11-04)
 
 
