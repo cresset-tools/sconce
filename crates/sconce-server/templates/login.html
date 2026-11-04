@@ -15,10 +15,9 @@
     <h1>Sign in</h1><p class=authsub>to your Bougie Repo dashboard</p>
     {% if sso_enabled %}
       {% if has_default %}
-        <a class=ssobtn href="/auth/start{{ next_query }}"><svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=#5a4ff0 stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M15 7h3a4 4 0 0 1 0 8h-3M9 7H6a4 4 0 0 0 0 8h3M8 11h8"></path></svg><span>Sign in with SSO</span></a>
+        <a class=ssobtn href="/auth/start"><svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=#5a4ff0 stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M15 7h3a4 4 0 0 1 0 8h-3M9 7H6a4 4 0 0 0 0 8h3M8 11h8"></path></svg><span>Sign in with SSO</span></a>
       {% endif %}
       <form class=authform method=post action=/auth/route style="margin-top:14px">
-        {% if !next.is_empty() %}<input type=hidden name=next value="{{ next }}">{% endif %}
         <div><label>Organization email</label>
           <div class=orgrow>
             <input class=mono name=email type=email placeholder="you@acme.com">
@@ -28,7 +27,6 @@
       <div class=authsep>or with a password</div>
     {% endif %}
     <form id=loginform class=authform method=post action=/login>
-      {% if !next.is_empty() %}<input type=hidden name=next value="{{ next }}">{% endif %}
       {% if !error.is_empty() %}
         <div class=errbanner><svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=#c0362c stroke-width=2 stroke-linecap=round stroke-linejoin=round><circle cx=12 cy=12 r=9></circle><path d="M12 8v5M12 16h0"></path></svg><span>{{ error }}</span></div>
       {% endif %}

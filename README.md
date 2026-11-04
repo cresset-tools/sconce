@@ -51,31 +51,6 @@ Then in the UI: create an org + repo, add an upstream (a git URL or a Composer
 registry like `https://repo.mage-os.org` with a `^vendor/` match), hit **Sync**,
 and add a read token — the install snippet is shown on the token page.
 
-After that the worker keeps upstreams in sync by itself. Every two minutes it
-asks each git upstream for its tags (`git ls-remote`, no clone) and mirrors it
-only when a tag was added or moved. Every ten minutes it re-syncs each Composer
-upstream, fetching package metadata conditionally so an unchanged package costs
-one `304`. Change the intervals with `--git-check-interval` and
-`--composer-sync-interval` (seconds; `0` turns that kind off) on `serve` or
-`worker`. An upstream whose check fails is retried later and later, up to once
-an hour.
-
-Set `SCONCE_GITHUB_TOKEN` to a GitHub token (a fine-grained token with no
-permissions is enough for public repositories) to raise GitHub's rate limits:
-git upstreams on `https://github.com` without a credential of their own use it,
-and so do dist downloads from `api.github.com` (where Packagist's zipballs
-live). It is sent to those two hosts only.
-
-A Composer upstream behind a login (Private Packagist, a vendor's paid
-registry) takes `--credential` like a git one: `user:password` as HTTP basic
-auth (Private Packagist's is `token:<key>`), or a token with `--credential-type`
-`bearer`, `github` or `gitlab` (sent in GitLab's `PRIVATE-TOKEN` header).
-It is sent only to the upstream's own scheme, host and port, never to dists
-hosted elsewhere. A registry that lists its packages at `list.json` instead of
-`available-packages`, as Packagist does, is enumerated from there. Visibility
-stays a licensing choice: an upstream that needs a login can still be public
-when its packages may be redistributed.
-
 Config is environment-based (12-factor): `DATABASE_URL`, `SCONCE_ADMIN_PASSWORD`,
 and `SCONCE_SECRET_KEY` (base64 of 32 bytes; needed only to store *private*
 upstream credentials). Run a dedicated worker instead of the in-process one with

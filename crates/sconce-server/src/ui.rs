@@ -129,11 +129,6 @@ pub fn router(
         // Human side of `bougie login` (RFC 8628): a signed-in member confirms
         // the code the CLI printed and picks the org to scope its token to.
         .route("/device", get(device_page).post(device_approve))
-        // Authorization-code + PKCE for `bougie login` (see crate::authcode):
-        // the consent page, and the page that shows a code to paste when the
-        // CLI can't run a loopback listener.
-        .route("/authorize", get(authorize_page).post(authorize_decide))
-        .route(crate::authcode::PASTE_PATH, get(authorize_code_page))
         .route(
             "/scim/v2/Users",
             get(scim_list_users).post(scim_create_user),
@@ -253,7 +248,6 @@ pub async fn serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(crate::shutdown_signal())
     .await
 }
 
@@ -315,48 +309,8 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
             });
             next.run(req).await
         }
-        None => Redirect::to(&login_url_for(&req)).into_response(),
+        None => Redirect::to("/login").into_response(),
     }
-}
-
-/// The sign-in URL for a signed-out request: `/login?next=<path?query>` so a
-/// deep link (the `bougie login` approval page, a package page) survives
-/// signing in. Only a `GET` is worth returning to — re-running a form post
-/// after sign-in isn't — and `/` needs no `next`.
-fn login_url_for(req: &Request) -> String {
-    let target = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
-    if req.method() != axum::http::Method::GET || target == "/" {
-        return "/login".to_owned();
-    }
-    format!("/login?next={}", percent_encode(target))
-}
-
-/// A post-sign-in destination, if `raw` is safe to redirect to: a path on
-/// this site. Rejects absolute and scheme-relative URLs (`//evil.example`,
-/// `/\evil.example`, which browsers treat as another host) so `next` can't
-/// turn sign-in into an open redirect.
-fn safe_next(raw: &str) -> Option<&str> {
-    let ok = raw.starts_with('/')
-        && !raw.starts_with("//")
-        && !raw.starts_with("/\\")
-        && raw.len() <= 2048
-        && !raw.chars().any(char::is_control);
-    ok.then_some(raw)
-}
-
-/// Percent-encode `s` for a query-string value (RFC 3986 unreserved kept;
-/// `/` kept for readability, it is legal in a query).
-fn percent_encode(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
 }
 
 /// Unauthenticated health probe (mirrors the wire server's `/healthz`):
@@ -1336,8 +1290,7 @@ async fn not_found_page() -> impl IntoResponse {
 
 /// Render the sign-in page (two-pane card). A non-empty `error` shows an inline
 /// banner above the email field. Shared by the form and every auth error path.
-async fn login_page(s: &Ui, error: &str, next: &str) -> Html<String> {
-    let next = safe_next(next).unwrap_or_default();
+async fn login_page(s: &Ui, error: &str) -> Html<String> {
     // Offer SSO if configured: a direct button for the instance default, plus an
     // email box that routes org domains to their own IdP.
     let sso_enabled = s.catalog.oidc_configured().await.unwrap_or(false);
@@ -1346,34 +1299,20 @@ async fn login_page(s: &Ui, error: &str, next: &str) -> Html<String> {
         sso_enabled,
         has_default,
         error: error.to_owned(),
-        next: next.to_owned(),
-        next_query: if next.is_empty() {
-            String::new()
-        } else {
-            format!("?next={}", percent_encode(next))
-        },
     }
     .render()
     .unwrap_or_default();
     doc("Sign in", &body)
 }
 
-#[derive(Deserialize)]
-struct NextParam {
-    #[serde(default)]
-    next: String,
-}
-
-async fn login_form(State(s): State<Ui>, Query(q): Query<NextParam>) -> Html<String> {
-    login_page(&s, "", &q.next).await
+async fn login_form(State(s): State<Ui>) -> Html<String> {
+    login_page(&s, "").await
 }
 
 #[derive(Deserialize)]
 struct LoginForm {
     email: String,
     password: String,
-    #[serde(default)]
-    next: String,
 }
 
 async fn login(
@@ -1401,17 +1340,15 @@ async fn login(
         .await
         .map_err(e500)?
     else {
-        return Ok(login_page(
-            &s,
-            "Invalid email or password. Try again, or use SSO.",
-            &f.next,
-        )
-        .await
-        .into_response());
+        return Ok(
+            login_page(&s, "Invalid email or password. Try again, or use SSO.")
+                .await
+                .into_response(),
+        );
     };
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
     Ok(redirect_with_cookie(
-        safe_next(&f.next).unwrap_or("/"),
+        "/",
         &session_set_cookie(&token, s.cookie_secure),
     ))
 }
@@ -1637,8 +1574,6 @@ fn oidc_secret(
 #[derive(Deserialize)]
 struct StartParams {
     conn: Option<String>,
-    #[serde(default)]
-    next: String,
 }
 
 /// Begin SSO: build the identity-provider redirect, persist the flow, redirect.
@@ -1658,7 +1593,7 @@ async fn auth_start(
     let begin = match crate::oidc::begin(&conn, secret.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
-            return Ok(login_page(&s, &format!("SSO unavailable: {e}"), &q.next)
+            return Ok(login_page(&s, &format!("SSO unavailable: {e}"))
                 .await
                 .into_response());
         }
@@ -1669,7 +1604,7 @@ async fn auth_start(
             Some(conn.id),
             &begin.nonce,
             &begin.pkce_verifier,
-            safe_next(&q.next).unwrap_or("/"),
+            "/",
             600,
         )
         .await
@@ -1680,8 +1615,6 @@ async fn auth_start(
 #[derive(Deserialize)]
 struct RouteForm {
     email: String,
-    #[serde(default)]
-    next: String,
 }
 
 /// Route an organization email to its identity provider (by domain), else the
@@ -1693,17 +1626,10 @@ async fn auth_route(State(s): State<Ui>, Form(f): Form<RouteForm>) -> Result<Res
         .await
         .map_err(e500)?
     {
-        Some(id) => {
-            let next = safe_next(&f.next)
-                .map(|n| format!("&next={}", percent_encode(n)))
-                .unwrap_or_default();
-            Ok(Redirect::to(&format!("/auth/start?conn={id}{next}")).into_response())
-        }
-        None => Ok(
-            login_page(&s, "no SSO is configured for that email domain", &f.next)
-                .await
-                .into_response(),
-        ),
+        Some(id) => Ok(Redirect::to(&format!("/auth/start?conn={id}")).into_response()),
+        None => Ok(login_page(&s, "no SSO is configured for that email domain")
+            .await
+            .into_response()),
     }
 }
 
@@ -1720,7 +1646,7 @@ async fn auth_callback(
     Query(p): Query<CallbackParams>,
 ) -> Result<Response, StatusCode> {
     if let Some(err) = p.error {
-        return Ok(login_page(&s, &format!("IdP returned an error: {err}"), "")
+        return Ok(login_page(&s, &format!("IdP returned an error: {err}"))
             .await
             .into_response());
     }
@@ -1732,7 +1658,7 @@ async fn auth_callback(
         s.catalog.consume_oidc_flow(&state).await.map_err(e500)?
     else {
         return Ok(
-            login_page(&s, "login session expired or invalid — try again", "")
+            login_page(&s, "login session expired or invalid — try again")
                 .await
                 .into_response(),
         );
@@ -1751,7 +1677,7 @@ async fn auth_callback(
         match crate::oidc::finish(&conn, secret.as_deref(), &code, &nonce, &verifier).await {
             Ok(id) => id,
             Err(e) => {
-                return Ok(login_page(&s, &format!("SSO failed: {e}"), "")
+                return Ok(login_page(&s, &format!("SSO failed: {e}"))
                     .await
                     .into_response());
             }
@@ -1762,7 +1688,7 @@ async fn auth_callback(
         && !crate::oidc::domain_matches(&identity.email, &conn.allowed_domains)
     {
         return Ok(
-            login_page(&s, "your email domain is not allowed to sign in", "")
+            login_page(&s, "your email domain is not allowed to sign in")
                 .await
                 .into_response(),
         );
@@ -2721,210 +2647,6 @@ async fn device_approve(
     .into_response())
 }
 
-/// `/authorize` parameters: the query string of the CLI's link, and the
-/// consent form's fields on submit.
-#[derive(Deserialize)]
-struct AuthorizeParams {
-    #[serde(default)]
-    response_type: String,
-    #[serde(default)]
-    client_id: String,
-    #[serde(default)]
-    redirect_uri: String,
-    #[serde(default)]
-    code_challenge: String,
-    #[serde(default)]
-    code_challenge_method: String,
-    #[serde(default)]
-    state: String,
-    /// Slug of the org to scope the token to (form submit only).
-    #[serde(default)]
-    org: String,
-    /// "approve" or "deny" (form submit only).
-    #[serde(default)]
-    action: String,
-}
-
-/// Whether an authorization request is safe to redirect at all: the client
-/// and its redirect URI (RFC 6749 §4.1.2.1 — never redirect to an unchecked
-/// URI), and the `state` we would echo. A request that fails is answered with
-/// [`authorize_refused`] here, not sent anywhere.
-fn authorize_target_ok(s: &Ui, p: &AuthorizeParams) -> bool {
-    use crate::authcode;
-    p.client_id == authcode::CLIENT_ID
-        && authcode::redirect_uri_allowed(&p.redirect_uri, &s.dashboard_url)
-        && authcode::state_acceptable(&p.state)
-}
-
-fn authorize_refused(s: &Ui, user: &CurrentUser) -> Response {
-    error_card(
-        s,
-        user,
-        "Can't sign in",
-        "This sign-in link isn't valid. Run bougie login again from your terminal.",
-        "/",
-    )
-}
-
-/// Send the browser back to the client's redirect URI with `params` (and the
-/// request's `state`) in the query string.
-fn authorize_redirect(redirect_uri: &str, params: &[(&str, &str)], state: &str) -> Response {
-    let mut url = redirect_uri.to_owned();
-    let mut sep = '?';
-    for (k, v) in params.iter().chain([("state", state)].iter()) {
-        if v.is_empty() {
-            continue;
-        }
-        let _ = write!(url, "{sep}{k}={}", percent_encode(v));
-        sep = '&';
-    }
-    Redirect::to(&url).into_response()
-}
-
-/// `/authorize` — the consent page for `bougie login`'s authorization-code
-/// flow. A signed-out visitor is sent through sign-in and back here first.
-async fn authorize_page(
-    State(s): State<Ui>,
-    Extension(user): Extension<CurrentUser>,
-    Query(p): Query<AuthorizeParams>,
-) -> Result<Response, StatusCode> {
-    if !authorize_target_ok(&s, &p) {
-        return Ok(authorize_refused(&s, &user));
-    }
-    if p.response_type != "code" {
-        return Ok(authorize_redirect(
-            &p.redirect_uri,
-            &[("error", "unsupported_response_type")],
-            &p.state,
-        ));
-    }
-    if p.code_challenge_method != "S256"
-        || !crate::authcode::challenge_well_formed(&p.code_challenge)
-    {
-        return Ok(authorize_redirect(
-            &p.redirect_uri,
-            &[
-                ("error", "invalid_request"),
-                ("error_description", "PKCE with S256 is required"),
-            ],
-            &p.state,
-        ));
-    }
-    let orgs = s.catalog.list_organizations().await.map_err(e500)?;
-    let view = views::Authorize {
-        client_id: p.client_id,
-        loopback: crate::authcode::is_loopback(&p.redirect_uri),
-        redirect_uri: p.redirect_uri,
-        code_challenge: p.code_challenge,
-        state: p.state,
-        orgs: orgs
-            .iter()
-            .filter(|o| user.can(o.id))
-            .map(|o| views::DeviceOrg {
-                slug: o.slug.clone(),
-                name: o.name.clone().unwrap_or_else(|| o.slug.clone()),
-            })
-            .collect(),
-    };
-    Ok(shell(
-        &s,
-        &user,
-        "Sign in to bougie",
-        &view.render().map_err(e500)?,
-    )
-    .into_response())
-}
-
-/// `/authorize` POST — approve (issue a one-time code bound to the chosen org,
-/// the redirect URI and the PKCE challenge) or deny, then redirect back to
-/// the CLI.
-async fn authorize_decide(
-    State(s): State<Ui>,
-    Extension(user): Extension<CurrentUser>,
-    Form(p): Form<AuthorizeParams>,
-) -> Result<Response, StatusCode> {
-    if !authorize_target_ok(&s, &p) {
-        return Ok(authorize_refused(&s, &user));
-    }
-    if p.action != "approve" {
-        return Ok(authorize_redirect(
-            &p.redirect_uri,
-            &[("error", "access_denied")],
-            &p.state,
-        ));
-    }
-    if !crate::authcode::challenge_well_formed(&p.code_challenge) {
-        return Ok(authorize_redirect(
-            &p.redirect_uri,
-            &[("error", "invalid_request")],
-            &p.state,
-        ));
-    }
-    let Some(org_id) = s.catalog.org_id_by_slug(p.org.trim()).await.map_err(e500)? else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    if !user.can(org_id) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let grant = sconce_catalog::AuthorizationGrant {
-        org_id,
-        approved_by: user.id,
-        client_id: &p.client_id,
-        redirect_uri: &p.redirect_uri,
-        code_challenge: &p.code_challenge,
-    };
-    let code = s
-        .catalog
-        .create_authorization_code(&grant, crate::authcode::CODE_TTL_SECS)
-        .await
-        .map_err(e500)?;
-    Ok(authorize_redirect(
-        &p.redirect_uri,
-        &[("code", &code)],
-        &p.state,
-    ))
-}
-
-#[derive(Deserialize)]
-struct AuthorizeCodeQuery {
-    #[serde(default)]
-    code: String,
-    #[serde(default)]
-    state: String,
-    #[serde(default)]
-    error: String,
-}
-
-/// The paste page: shows `code#state` for the user to copy into the waiting
-/// `bougie login`. The code alone is useless without the CLI's PKCE verifier.
-async fn authorize_code_page(
-    State(s): State<Ui>,
-    Extension(user): Extension<CurrentUser>,
-    Query(q): Query<AuthorizeCodeQuery>,
-) -> Result<Html<String>, StatusCode> {
-    let view = if q.error.is_empty() && !q.code.is_empty() {
-        views::AuthorizeCode {
-            code: format!("{}#{}", q.code, q.state),
-            error: String::new(),
-        }
-    } else {
-        views::AuthorizeCode {
-            code: String::new(),
-            error: if q.error.is_empty() {
-                "invalid_request".to_owned()
-            } else {
-                q.error
-            },
-        }
-    };
-    Ok(shell(
-        &s,
-        &user,
-        "Sign in to bougie",
-        &view.render().map_err(e500)?,
-    ))
-}
-
 async fn new_repo_page(
     State(s): State<Ui>,
     Extension(user): Extension<CurrentUser>,
@@ -3141,11 +2863,6 @@ async fn repo_page(
     let upstreams = s.catalog.list_upstreams(summary.id).await.map_err(e500)?;
     let ci_policies = s.catalog.ci_policies(summary.id).await.map_err(e500)?;
     let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
-    let conflicts = s
-        .catalog
-        .version_conflicts(summary.id)
-        .await
-        .map_err(e500)?;
     let dep_plan = s
         .catalog
         .list_dependency_plan(summary.id)
@@ -3748,7 +3465,6 @@ async fn repo_page(
         total_versions,
         policy_phrase,
         broken_count,
-        conflicts,
         read_only: !user.can_admin(summary.org_id),
         filtering,
         approvals_count: pending_count + held_count,
@@ -5083,40 +4799,6 @@ async fn merge_license_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn safe_next_keeps_same_site_paths_only() {
-        assert_eq!(safe_next("/device?code=AB-CD"), Some("/device?code=AB-CD"));
-        assert_eq!(safe_next("/"), Some("/"));
-        for bad in [
-            "",
-            "device",
-            "https://evil.example/",
-            "//evil.example",
-            "/\\evil.example",
-            "/a\nb",
-        ] {
-            assert_eq!(safe_next(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn login_url_carries_the_original_get_target() {
-        let req = |method: &str, uri: &str| {
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(axum::body::Body::empty())
-                .unwrap()
-        };
-        assert_eq!(
-            login_url_for(&req("GET", "/device?code=AB-CD")),
-            "/login?next=/device%3Fcode%3DAB-CD"
-        );
-        assert_eq!(login_url_for(&req("GET", "/")), "/login");
-        // A form post isn't replayed after sign-in.
-        assert_eq!(login_url_for(&req("POST", "/device")), "/login");
-    }
 
     #[test]
     fn session_cookie_secure_only_on_https_dashboards() {

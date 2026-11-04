@@ -445,22 +445,6 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0059_repo_custom_domain",
         include_str!("../migrations/0059_repo_custom_domain.sql"),
     ),
-    (
-        "0060_repo_members",
-        include_str!("../migrations/0060_repo_members.sql"),
-    ),
-    (
-        "0061_upstream_sync_schedule",
-        include_str!("../migrations/0061_upstream_sync_schedule.sql"),
-    ),
-    (
-        "0062_version_conflicts",
-        include_str!("../migrations/0062_version_conflicts.sql"),
-    ),
-    (
-        "0063_authorization_codes",
-        include_str!("../migrations/0063_authorization_codes.sql"),
-    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -764,21 +748,6 @@ pub enum PublishOutcome {
     Conflict,
 }
 
-/// A stored version whose upstream changed after it was mirrored
-/// ([`Catalog::version_conflicts`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionConflict {
-    pub package: String,
-    /// The version as stored (its display form).
-    pub version: String,
-    pub reason: String,
-    /// The upstream that changed, when it still exists.
-    pub upstream: Option<String>,
-    /// `YYYY-MM-DD HH:MI` (UTC).
-    pub detected_at: String,
-    pub last_seen_at: String,
-}
-
 /// The dist identity already stored for one version ([`Catalog::stored_dists`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredDist {
@@ -872,41 +841,6 @@ pub struct DependencyPlanEntry {
     pub required_by: Option<String>,
 }
 
-/// An upstream whose scheduled check is due (see [`Catalog::claim_due_upstreams`]).
-#[derive(Debug, Clone)]
-pub struct DueUpstream {
-    pub id: Uuid,
-    pub kind: String,
-    /// git: digest of the tag set the last successful mirror saw (`None` = never).
-    pub synced_refs: Option<String>,
-    /// Whether the upstream has a require-list (a composer one can't sync without).
-    pub has_requires: bool,
-}
-
-/// HTTP validators of an upstream response, for a conditional request.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HttpValidator {
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
-}
-
-/// Forget what the last sync of an upstream saw (its git tag digest and HTTP
-/// validators), so the next check mirrors it in full.
-async fn forget_sync_state(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    upstream_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("update upstreams set synced_refs = null where id = $1")
-        .bind(upstream_id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("delete from upstream_validators where upstream_id = $1")
-        .bind(upstream_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 /// An upstream loaded for mirroring — includes the encrypted credential blob.
 #[derive(Debug, Clone)]
 pub struct UpstreamRow {
@@ -974,16 +908,6 @@ pub enum UpsertPackageError {
     Db(#[from] sqlx::Error),
     #[error("{0}")]
     Policy(String),
-}
-
-/// Why setting a repository's members failed.
-#[derive(Debug, thiserror::Error)]
-pub enum RepoMembersError {
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
-    /// The members break a rule; the string says which.
-    #[error("{0}")]
-    Invalid(String),
 }
 
 /// Why creating a token failed — a database error, or an org policy that forbids
@@ -1139,19 +1063,6 @@ pub enum DeviceFlowPoll {
     Denied,
     /// Unknown `device_code`, or the flow expired.
     Expired,
-}
-
-/// What a member approved on the `/authorize` page, for
-/// [`Catalog::create_authorization_code`].
-#[derive(Debug)]
-pub struct AuthorizationGrant<'a> {
-    pub org_id: Uuid,
-    /// The approving user; `None` in single-tenant mode (no accounts).
-    pub approved_by: Option<Uuid>,
-    pub client_id: &'a str,
-    pub redirect_uri: &'a str,
-    /// `BASE64URL(SHA256(code_verifier))`, unpadded (RFC 7636 S256).
-    pub code_challenge: &'a str,
 }
 
 /// An org-scoped session token resolved for relay introspection: the org it
@@ -1591,18 +1502,6 @@ const GRANT_RULE_EXISTS: &str = "exists ( \
             or ( p.repo_id in (select rr.id from repositories rr where rr.org_id = ps.org_id) \
                  and exists (select 1 from package_set_rules sr \
                              where sr.set_id = gr.set_id and p.name like replace(sr.glob, '*', '%')) ) ) )";
-
-/// SQL `exists(...)` testing whether package `p` reaches repo `$1` as one of its
-/// **member repositories'** own packages, and is not shadowed: an earlier
-/// member owning a package of the same name serves that name instead.
-/// References `p.repo_id`/`p.name`.
-const MEMBER_EXISTS: &str = "exists ( \
-    select 1 from repository_members m \
-    where m.repo_id = $1 and m.member_repo_id = p.repo_id \
-      and not exists ( \
-          select 1 from repository_members m2 \
-          join packages p2 on p2.repo_id = m2.member_repo_id and p2.name = p.name \
-          where m2.repo_id = $1 and m2.position < m.position ) )";
 
 impl Catalog {
     /// Connect to Postgres at `database_url` (e.g.
@@ -3749,75 +3648,6 @@ impl Catalog {
         })
     }
 
-    /// Issue a one-time authorization code (RFC 6749 §4.1) for a signed-in
-    /// member's approval: bound to `org_id`, the client, the exact
-    /// `redirect_uri` and the PKCE `code_challenge` (S256), stored only as its
-    /// sha256. Also clears out codes that expired unredeemed. TTL in seconds.
-    pub async fn create_authorization_code(
-        &self,
-        grant: &AuthorizationGrant<'_>,
-        ttl_secs: i64,
-    ) -> Result<String, sqlx::Error> {
-        sqlx::query("delete from authorization_codes where expires_at <= now()")
-            .execute(&self.pool)
-            .await?;
-        let code = generate_secret("scac_");
-        sqlx::query(
-            "insert into authorization_codes \
-             (code_hash, org_id, approved_by, client_id, redirect_uri, code_challenge, expires_at) \
-             values ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
-        )
-        .bind(token_hash(&code))
-        .bind(grant.org_id)
-        .bind(grant.approved_by)
-        .bind(grant.client_id)
-        .bind(grant.redirect_uri)
-        .bind(grant.code_challenge)
-        .bind(ttl_secs)
-        .execute(&self.pool)
-        .await?;
-        Ok(code)
-    }
-
-    /// Redeem an authorization code: returns the org to mint a token for when
-    /// the code is fresh and the request repeats the same `client_id` and
-    /// `redirect_uri` and presents the PKCE verifier for its challenge.
-    ///
-    /// The code is consumed by the attempt whether or not it succeeds, so a
-    /// code that leaked can't be retried against with guessed verifiers.
-    pub async fn redeem_authorization_code(
-        &self,
-        code: &str,
-        client_id: &str,
-        redirect_uri: &str,
-        code_verifier: &str,
-    ) -> Result<Option<Uuid>, sqlx::Error> {
-        let row = sqlx::query(
-            "delete from authorization_codes where code_hash = $1 \
-             returning org_id, client_id, redirect_uri, code_challenge, \
-             expires_at > now() as fresh",
-        )
-        .bind(token_hash(code))
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let fresh: bool = row.try_get("fresh")?;
-        let bound_client: String = row.try_get("client_id")?;
-        let bound_redirect: String = row.try_get("redirect_uri")?;
-        let challenge: String = row.try_get("code_challenge")?;
-        let ok = fresh
-            && bound_client == client_id
-            && bound_redirect == redirect_uri
-            && pkce_s256_matches(code_verifier, &challenge);
-        Ok(if ok {
-            Some(row.try_get("org_id")?)
-        } else {
-            None
-        })
-    }
-
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
     ///
     /// Concurrent migrators (multiple app instances starting at once, or
@@ -4144,13 +3974,6 @@ impl Catalog {
         };
         if effective == Visibility::Private {
             self.ensure_private_allowed(repo_id).await?;
-        }
-        if self.has_members(repo_id).await? {
-            return Err(UpsertPackageError::Policy(
-                "this repository is made of member repositories and holds no packages \
-                 of its own: publish or mirror into one of its members"
-                    .to_owned(),
-            ));
         }
         let id = sqlx::query_scalar(
             "insert into packages (repo_id, name, kind, source, visibility) values ($1, $2, $3, $4, $5) \
@@ -4582,7 +4405,8 @@ impl Catalog {
     }
 
     /// Insert a **published** (pushed) version *immutably*. Unlike
-    /// [`Self::upsert_package_version`] — which overwrites on conflict — a published version cannot be silently replaced:
+    /// [`Self::upsert_package_version`] — which overwrites on conflict, still used
+    /// by the git mirror — a published version cannot be silently replaced:
     /// re-publishing identical dist bytes is an idempotent no-op, and publishing
     /// *different* bytes for an existing version is rejected. Returns which of the
     /// three happened; the caller maps it to 201 / 200 / 409.
@@ -4650,157 +4474,6 @@ impl Catalog {
         .await
     }
 
-    /// Insert a version mirrored from a **git upstream**, immutably like
-    /// [`Self::insert_mirrored_version`]: a tag later moved to another commit
-    /// does not replace what Composer clients have locked. `commit` is the
-    /// tag's commit, stored as the version's `source_reference`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_git_version(
-        &self,
-        package_id: Uuid,
-        version: &str,
-        normalized_version: &str,
-        stability: &str,
-        composer_json: &Value,
-        dist_blob_sha256: &[u8; 32],
-        dist_shasum: &str,
-        commit: &str,
-        released_at_unix: Option<i64>,
-    ) -> Result<PublishOutcome, sqlx::Error> {
-        self.insert_version_once(
-            package_id,
-            version,
-            normalized_version,
-            stability,
-            composer_json,
-            dist_blob_sha256,
-            dist_shasum,
-            Some(commit),
-            None,
-            released_at_unix,
-        )
-        .await
-    }
-
-    /// Record the commit of a version stored before git versions kept theirs.
-    /// Never overwrites a recorded commit.
-    pub async fn backfill_source_reference(
-        &self,
-        package_id: Uuid,
-        normalized_version: &str,
-        reference: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "update package_versions set source_reference = $3 \
-             where package_id = $1 and normalized_version = $2 and source_reference is null",
-        )
-        .bind(package_id)
-        .bind(normalized_version)
-        .bind(reference)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Record that the upstream of a stored version now serves something else
-    /// for it. Repeated sightings keep the first `detected_at`.
-    pub async fn record_version_conflict(
-        &self,
-        repo_id: Uuid,
-        package: &str,
-        normalized_version: &str,
-        upstream_id: Option<Uuid>,
-        reason: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "insert into version_conflicts (package_id, normalized_version, upstream_id, reason) \
-             select p.id, $3, $4, $5 from packages p where p.repo_id = $1 and p.name = $2 \
-             on conflict (package_id, normalized_version) do update set \
-                 upstream_id = excluded.upstream_id, reason = excluded.reason, \
-                 last_seen_at = now()",
-        )
-        .bind(repo_id)
-        .bind(package)
-        .bind(normalized_version)
-        .bind(upstream_id)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Forget a recorded conflict: the upstream matches the stored version again.
-    pub async fn clear_version_conflict(
-        &self,
-        repo_id: Uuid,
-        package: &str,
-        normalized_version: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "delete from version_conflicts vc using packages p \
-             where p.id = vc.package_id and p.repo_id = $1 and p.name = $2 \
-               and vc.normalized_version = $3",
-        )
-        .bind(repo_id)
-        .bind(package)
-        .bind(normalized_version)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// `(package, normalized version)` of every recorded conflict in `repo_id`,
-    /// so a sync clears only those that exist.
-    pub async fn conflicted_versions(
-        &self,
-        repo_id: Uuid,
-    ) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "select p.name, vc.normalized_version from version_conflicts vc \
-             join packages p on p.id = vc.package_id where p.repo_id = $1",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().collect())
-    }
-
-    /// Versions in `repo_id` whose upstream changed after they were mirrored,
-    /// newest first.
-    pub async fn version_conflicts(
-        &self,
-        repo_id: Uuid,
-    ) -> Result<Vec<VersionConflict>, sqlx::Error> {
-        let rows = sqlx::query(
-            "select p.name, coalesce(pv.version, vc.normalized_version) as version, vc.reason, \
-                    u.base as upstream, \
-                    to_char(vc.detected_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as detected_at, \
-                    to_char(vc.last_seen_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as last_seen_at \
-             from version_conflicts vc \
-             join packages p on p.id = vc.package_id \
-             left join package_versions pv \
-                 on pv.package_id = vc.package_id and pv.normalized_version = vc.normalized_version \
-             left join upstreams u on u.id = vc.upstream_id \
-             where p.repo_id = $1 \
-             order by vc.detected_at desc, p.name, vc.normalized_version",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|r| {
-                Ok(VersionConflict {
-                    package: r.try_get("name")?,
-                    version: r.try_get("version")?,
-                    reason: r.try_get("reason")?,
-                    upstream: r.try_get("upstream")?,
-                    detected_at: r.try_get("detected_at")?,
-                    last_seen_at: r.try_get("last_seen_at")?,
-                })
-            })
-            .collect()
-    }
-
     /// Record the upstream dist path of an already-stored version that has none
     /// yet — a version mirrored before the path was tracked. Never overwrites a
     /// recorded path, so a version keeps answering at its first-seen path.
@@ -4828,26 +4501,25 @@ impl Catalog {
 
     /// Resolve a dist path as the repository's upstream served it to the package
     /// name and blob stored for it, so `composer.lock` files written against the
-    /// upstream keep installing once its domain points at this repository. The
-    /// packages the repository owns are considered, and its member repositories'
-    /// (unless shadowed, as on every read path), under the same rules as
-    /// [`Self::repo_serves_dist`] (public-only policy, not yanked).
+    /// upstream keep installing once its domain points at this repository. Only
+    /// packages the repository itself owns are considered, under the same rules
+    /// as [`Self::repo_serves_dist`] (public-only policy, not yanked).
     pub async fn dist_by_upstream_path(
         &self,
         repo_id: Uuid,
         upstream_dist_path: &str,
     ) -> Result<Option<(String, [u8; 32])>, sqlx::Error> {
-        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(&format!(
+        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
             "select p.name, pv.dist_blob_sha256 \
              from package_versions pv \
              join packages p on p.id = pv.package_id \
-             join repositories r on r.id = $1 \
-             where (p.repo_id = $1 or {MEMBER_EXISTS}) and pv.upstream_dist_path = $2 \
+             join repositories r on r.id = p.repo_id \
+             where p.repo_id = $1 and pv.upstream_dist_path = $2 \
                and (r.allow_private_packages or p.visibility = 'public') \
                and pv.yanked_at is null \
              order by pv.id \
-             limit 1"
-        ))
+             limit 1",
+        )
         .bind(repo_id)
         .bind(upstream_dist_path)
         .fetch_optional(&self.pool)
@@ -5098,109 +4770,6 @@ impl Catalog {
         Ok(())
     }
 
-    /// Whether `repo_id` is made of member repositories.
-    pub async fn has_members(&self, repo_id: Uuid) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("select exists (select 1 from repository_members where repo_id = $1)")
-            .bind(repo_id)
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    /// The member repositories of `repo_id`, in order, as `(id, "org/repo")`.
-    pub async fn repo_members(&self, repo_id: Uuid) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-        sqlx::query_as(
-            "select r.id, o.slug || '/' || r.slug from repository_members m \
-             join repositories r on r.id = m.member_repo_id \
-             join organizations o on o.id = r.org_id \
-             where m.repo_id = $1 order by m.position",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await
-    }
-
-    /// Replace the member repositories of `repo_id` with `members`, in that
-    /// order (empty clears them, making it an ordinary repository again).
-    /// Members must be other repositories of the same org, none of them made
-    /// of members itself; and a repository with members owns no packages and
-    /// is no other repository's member.
-    pub async fn set_repo_members(
-        &self,
-        repo_id: Uuid,
-        members: &[Uuid],
-    ) -> Result<(), RepoMembersError> {
-        let mut tx = self.pool.begin().await?;
-        if !members.is_empty() {
-            let mut seen = std::collections::HashSet::new();
-            for m in members {
-                if *m == repo_id {
-                    return Err(RepoMembersError::Invalid(
-                        "a repository cannot be its own member".into(),
-                    ));
-                }
-                if !seen.insert(*m) {
-                    return Err(RepoMembersError::Invalid("a member is listed twice".into()));
-                }
-            }
-            let other_org: bool = sqlx::query_scalar(
-                "select exists (select 1 from repositories m, repositories r \
-                                where r.id = $1 and m.id = any($2) and m.org_id <> r.org_id) \
-                    or (select count(*) from repositories where id = any($2)) <> cardinality($2)",
-            )
-            .bind(repo_id)
-            .bind(members)
-            .fetch_one(&mut *tx)
-            .await?;
-            if other_org {
-                return Err(RepoMembersError::Invalid(
-                    "members must be repositories of the same organization".into(),
-                ));
-            }
-            let nested: bool = sqlx::query_scalar(
-                "select exists (select 1 from repository_members where repo_id = any($1)) \
-                    or exists (select 1 from repository_members where member_repo_id = $2)",
-            )
-            .bind(members)
-            .bind(repo_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if nested {
-                return Err(RepoMembersError::Invalid(
-                    "only one level: a member cannot have members, and a repository with \
-                     members cannot be a member"
-                        .into(),
-                ));
-            }
-            let owns: bool =
-                sqlx::query_scalar("select exists (select 1 from packages where repo_id = $1)")
-                    .bind(repo_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if owns {
-                return Err(RepoMembersError::Invalid(
-                    "the repository owns packages; a repository with members holds none of its own"
-                        .into(),
-                ));
-            }
-        }
-        sqlx::query("delete from repository_members where repo_id = $1")
-            .bind(repo_id)
-            .execute(&mut *tx)
-            .await?;
-        for (position, m) in members.iter().enumerate() {
-            sqlx::query(
-                "insert into repository_members (repo_id, member_repo_id, position) values ($1, $2, $3)",
-            )
-            .bind(repo_id)
-            .bind(m)
-            .bind(i32::try_from(position).unwrap_or(i32::MAX))
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// The custom domain a repository is served at, if any (see
     /// [`Self::set_custom_domain`]).
     pub async fn custom_domain(&self, repo_id: Uuid) -> Result<Option<String>, sqlx::Error> {
@@ -5277,9 +4846,12 @@ impl Catalog {
         credential: Option<&[u8]>,
         credential_type: &str,
     ) -> Result<Uuid, sqlx::Error> {
-        // The credential is about access and visibility about licensing, so
-        // a public upstream may need one too (an OSL package behind a paid
-        // registry).
+        // Public upstreams are unauthenticated by definition — never store a
+        // credential for one, whatever the caller passed.
+        let credential = match visibility {
+            Visibility::Public => None,
+            Visibility::Private => credential,
+        };
         sqlx::query_scalar(
             "insert into upstreams (repo_id, kind, base, visibility, label, credential, credential_type) \
              values ($1, $2, $3, $4, $5, $6, $7) returning id",
@@ -5476,9 +5048,6 @@ impl Catalog {
             .execute(&mut *tx)
             .await?;
         }
-        // A new require-list can take in versions the last sync skipped, so
-        // forget what that sync saw: the next check mirrors everything again.
-        forget_sync_state(&mut tx, upstream_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5565,7 +5134,6 @@ impl Catalog {
             .execute(&mut *tx)
             .await?;
         }
-        forget_sync_state(&mut tx, upstream_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5699,164 +5267,6 @@ impl Catalog {
         )
         .bind(job_id)
         .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Claim up to `limit` upstreams whose check is due and move each one's
-    /// next check a full interval ahead (±10% jitter, so upstreams added
-    /// together drift apart), before checking them. Rows are claimed with
-    /// `skip locked`, so several workers never check the same upstream twice.
-    /// An interval of `None` leaves that kind of upstream unscheduled.
-    pub async fn claim_due_upstreams(
-        &self,
-        limit: i64,
-        git_interval_secs: Option<f64>,
-        composer_interval_secs: Option<f64>,
-    ) -> Result<Vec<DueUpstream>, sqlx::Error> {
-        let rows: Vec<(Uuid, String, Option<String>, bool)> = sqlx::query_as(
-            "update upstreams u set \
-                 next_check_at = now() + make_interval(secs => \
-                     (case u.kind when 'git' then $2 else $3 end) * (0.9 + random() * 0.2)) \
-             where u.id in ( \
-                 select id from upstreams \
-                 where next_check_at <= now() \
-                   and ((kind = 'git' and $2 is not null) or (kind = 'composer' and $3 is not null)) \
-                 order by next_check_at \
-                 for update skip locked \
-                 limit $1) \
-             returning u.id, u.kind, u.synced_refs, \
-                 exists (select 1 from upstream_requires r where r.upstream_id = u.id)",
-        )
-        .bind(limit)
-        .bind(git_interval_secs)
-        .bind(composer_interval_secs)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, kind, synced_refs, has_requires)| DueUpstream {
-                id,
-                kind,
-                synced_refs,
-                has_requires,
-            })
-            .collect())
-    }
-
-    /// Record a check that succeeded (whether or not it queued a mirror).
-    pub async fn record_upstream_check_ok(&self, upstream_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "update upstreams set last_checked_at = now(), check_failures = 0, \
-                 last_check_error = null \
-             where id = $1",
-        )
-        .bind(upstream_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Record a failed check. Each consecutive failure doubles the wait before
-    /// the next one (from `interval_secs`, capped at an hour), so an upstream
-    /// that is down or gone isn't hammered.
-    pub async fn record_upstream_check_failed(
-        &self,
-        upstream_id: Uuid,
-        interval_secs: f64,
-        error: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "update upstreams set last_checked_at = now(), \
-                 check_failures = check_failures + 1, last_check_error = $3, \
-                 next_check_at = now() + make_interval(secs => \
-                     least($2 * power(2, least(check_failures + 1, 20)), 3600)) \
-             where id = $1",
-        )
-        .bind(upstream_id)
-        .bind(interval_secs)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// The tag-set digest of the last successful git mirror (`None` = never).
-    pub async fn upstream_synced_refs(
-        &self,
-        upstream_id: Uuid,
-    ) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar::<_, Option<String>>("select synced_refs from upstreams where id = $1")
-            .bind(upstream_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map(Option::flatten)
-    }
-
-    /// Store the tag-set digest a git mirror just mirrored, so the next check
-    /// can tell whether anything changed since.
-    pub async fn set_upstream_synced_refs(
-        &self,
-        upstream_id: Uuid,
-        digest: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("update upstreams set synced_refs = $2 where id = $1")
-            .bind(upstream_id)
-            .bind(digest)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// The validators (`ETag`, `Last-Modified`) of the last response from
-    /// `url` that was processed successfully, for a conditional request.
-    pub async fn upstream_validator(
-        &self,
-        upstream_id: Uuid,
-        url: &str,
-    ) -> Result<Option<HttpValidator>, sqlx::Error> {
-        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "select etag, last_modified from upstream_validators \
-             where upstream_id = $1 and url = $2",
-        )
-        .bind(upstream_id)
-        .bind(url)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(etag, last_modified)| HttpValidator {
-            etag,
-            last_modified,
-        }))
-    }
-
-    /// Remember the validators of a response from `url` once it has been
-    /// processed in full. A response without any validator clears the entry.
-    pub async fn set_upstream_validator(
-        &self,
-        upstream_id: Uuid,
-        url: &str,
-        validator: &HttpValidator,
-    ) -> Result<(), sqlx::Error> {
-        if validator.etag.is_none() && validator.last_modified.is_none() {
-            sqlx::query("delete from upstream_validators where upstream_id = $1 and url = $2")
-                .bind(upstream_id)
-                .bind(url)
-                .execute(&self.pool)
-                .await?;
-            return Ok(());
-        }
-        sqlx::query(
-            "insert into upstream_validators (upstream_id, url, etag, last_modified) \
-             values ($1, $2, $3, $4) \
-             on conflict (upstream_id, url) do update set \
-                 etag = excluded.etag, last_modified = excluded.last_modified, \
-                 updated_at = now()",
-        )
-        .bind(upstream_id)
-        .bind(url)
-        .bind(validator.etag.as_deref())
-        .bind(validator.last_modified.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -8003,8 +7413,7 @@ impl Catalog {
                and ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
                                 where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} \
-                     or {MEMBER_EXISTS} ) \
+                     or {GRANT_RULE_EXISTS} ) \
              order by p.name"
         ))
         .bind(repo_id)
@@ -8030,8 +7439,7 @@ impl Catalog {
              where ( p.repo_id = $1 \
                      or exists (select 1 from repository_grants g \
                                 where g.repo_id = $1 and g.package_id = p.id) \
-                     or {GRANT_RULE_EXISTS} \
-                     or {MEMBER_EXISTS} ) \
+                     or {GRANT_RULE_EXISTS} ) \
                and ($2::text is null or p.name = $2) \
              group by p.name \
              having bool_and(p.visibility = 'public') \
@@ -8095,8 +7503,7 @@ impl Catalog {
                    and ( p.repo_id = $1 \
                          or exists (select 1 from repository_grants g \
                                     where g.repo_id = $1 and g.package_id = p.id) \
-                         or {GRANT_RULE_EXISTS} \
-                         or {MEMBER_EXISTS} ) \
+                         or {GRANT_RULE_EXISTS} ) \
                    and (r.allow_private_packages or p.visibility = 'public') \
                    and pv.yanked_at is null )"
         ))
@@ -8381,30 +7788,6 @@ fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-/// RFC 7636 S256: whether `BASE64URL(SHA256(verifier))` equals `challenge`.
-/// A verifier outside the RFC's 43–128 unreserved characters never matches.
-fn pkce_s256_matches(verifier: &str, challenge: &str) -> bool {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    let well_formed = (43..=128).contains(&verifier.len())
-        && verifier
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
-    if !well_formed {
-        return false;
-    }
-    let digest = Sha256::digest(verifier.as_bytes());
-    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    // Both sides are public-length base64 of a digest; compare without an
-    // early exit anyway.
-    expected.len() == challenge.len()
-        && expected
-            .bytes()
-            .zip(challenge.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
-}
-
 /// Whether a query error is a Postgres unique-constraint violation (SQLSTATE
 /// 23505) — used to turn a lost idempotency race into a graceful replay.
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -8505,8 +7888,7 @@ fn served_scope() -> String {
         "( p.repo_id = $1 \
            or exists (select 1 from repository_grants g \
                       where g.repo_id = $1 and g.package_id = p.id) \
-           or {GRANT_RULE_EXISTS} \
-           or {MEMBER_EXISTS} ) \
+           or {GRANT_RULE_EXISTS} ) \
          and (r.allow_private_packages or p.visibility = 'public')"
     )
 }
@@ -9404,91 +8786,6 @@ mod tests {
         assert_eq!(got, ["api", "r", "web"]);
     }
 
-    #[test]
-    fn pkce_s256_matches_base64url_sha256_of_the_verifier() {
-        // Challenge computed independently:
-        // printf %s "$verifier" | openssl dgst -sha256 -binary | basenc --base64url
-        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
-        let challenge = "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o";
-        assert!(pkce_s256_matches(verifier, challenge));
-        assert!(!pkce_s256_matches(
-            "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Z",
-            challenge
-        ));
-        assert!(
-            !pkce_s256_matches("short", challenge),
-            "too short to be a verifier"
-        );
-    }
-
-    #[tokio::test]
-    async fn authorization_code_redeems_once_with_matching_pkce_and_redirect() {
-        let Some((cat, repo_id)) = repo().await else {
-            return;
-        };
-        let org_id = org_of(&cat, repo_id).await;
-        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
-        let redirect = "http://127.0.0.1:53682/callback";
-        let grant = AuthorizationGrant {
-            org_id,
-            approved_by: None,
-            client_id: "bougie-cli",
-            redirect_uri: redirect,
-            code_challenge: "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o",
-        };
-
-        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            Some(org_id)
-        );
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            None,
-            "a code works once"
-        );
-
-        // A wrong redirect_uri fails, and burns the code.
-        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
-        let other = "http://127.0.0.1:1/callback";
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", other, verifier)
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            None,
-            "a failed attempt consumes the code"
-        );
-
-        // A wrong verifier fails.
-        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
-        let wrong = "x".repeat(43);
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, &wrong)
-                .await
-                .unwrap(),
-            None
-        );
-
-        // An expired code fails.
-        let code = cat.create_authorization_code(&grant, -1).await.unwrap();
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            None
-        );
-    }
-
     #[tokio::test]
     async fn device_flow_approve_mints_org_scoped_token() {
         let Some((cat, repo_id)) = repo().await else {
@@ -10242,113 +9539,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_upstreams_are_claimed_once_per_interval_and_back_off_on_failure() {
-        let Some((cat, repo_id)) = repo().await else {
-            return;
-        };
-        let add = |kind: &'static str| {
-            let cat = cat.clone();
-            async move {
-                cat.create_upstream(
-                    repo_id,
-                    kind,
-                    "https://example.test/x",
-                    Visibility::Public,
-                    None,
-                    None,
-                    "basic",
-                )
-                .await
-                .unwrap()
-            }
-        };
-        let git = add("git").await;
-        let composer = add("composer").await;
-        let next_check = |id: Uuid| {
-            let cat = cat.clone();
-            async move {
-                sqlx::query_scalar::<_, f64>(
-                    "select extract(epoch from next_check_at - now())::float8 \
-                     from upstreams where id = $1",
-                )
-                .bind(id)
-                .fetch_one(&cat.pool)
-                .await
-                .unwrap()
-            }
-        };
-
-        // New upstreams are due at once. Composer syncs are off here, so only
-        // the git one is claimed; other tests' upstreams may come along too.
-        let due = cat
-            .claim_due_upstreams(10_000, Some(120.0), None)
-            .await
-            .unwrap();
-        assert!(due.iter().any(|d| d.id == git && d.synced_refs.is_none()));
-        assert!(due.iter().all(|d| d.id != composer));
-        let ahead = next_check(git).await;
-        assert!(
-            (100.0..=140.0).contains(&ahead),
-            "a full interval ahead: {ahead}"
-        );
-
-        // Claimed once per interval.
-        let again = cat
-            .claim_due_upstreams(10_000, Some(120.0), Some(600.0))
-            .await
-            .unwrap();
-        assert!(again.iter().all(|d| d.id != git));
-        let c = again
-            .iter()
-            .find(|d| d.id == composer)
-            .expect("composer due");
-        assert!(!c.has_requires);
-
-        // Failures double the wait, capped at an hour.
-        cat.record_upstream_check_failed(git, 120.0, "boom")
-            .await
-            .unwrap();
-        let after_one = next_check(git).await;
-        assert!(
-            (230.0..=250.0).contains(&after_one),
-            "2× interval: {after_one}"
-        );
-        for _ in 0..10 {
-            cat.record_upstream_check_failed(git, 120.0, "boom")
-                .await
-                .unwrap();
-        }
-        assert!(next_check(git).await <= 3600.0, "capped at an hour");
-        cat.record_upstream_check_ok(git).await.unwrap();
-        let (failures, error): (i32, Option<String>) =
-            sqlx::query_as("select check_failures, last_check_error from upstreams where id = $1")
-                .bind(git)
-                .fetch_one(&cat.pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            (failures, error),
-            (0, None),
-            "a good check resets the failures"
-        );
-
-        // Validators: stored, replaced, and cleared by an empty one.
-        let v = HttpValidator {
-            etag: Some("\"a\"".to_owned()),
-            last_modified: None,
-        };
-        cat.set_upstream_validator(composer, "u", &v).await.unwrap();
-        assert_eq!(
-            cat.upstream_validator(composer, "u").await.unwrap(),
-            Some(v)
-        );
-        cat.set_upstream_validator(composer, "u", &HttpValidator::default())
-            .await
-            .unwrap();
-        assert_eq!(cat.upstream_validator(composer, "u").await.unwrap(), None);
-    }
-
-    #[tokio::test]
     async fn upstream_requires_round_trip() {
         let Some((cat, repo_id)) = repo().await else {
             return;
@@ -10403,27 +9593,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_upstream_keeps_its_credential() {
+    async fn public_upstream_drops_any_credential() {
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
-        // Redistributable packages behind a registry that needs a login.
+        // A credential passed for a PUBLIC upstream must not be stored.
         let id = cat
             .create_upstream(
                 repo_id,
                 "composer",
-                "https://registry.example/acme",
+                "https://repo.packagist.org",
                 Visibility::Public,
                 None,
-                Some(b"enc"),
-                "basic",
+                Some(b"should-be-dropped"),
+                "github",
             )
             .await
             .unwrap();
         let got = cat.get_upstream(id).await.unwrap().unwrap();
-        assert_eq!(got.credential.as_deref(), Some(&b"enc"[..]));
+        assert!(
+            got.credential.is_none(),
+            "public upstream stores no credential"
+        );
         let listed = cat.list_upstreams(repo_id).await.unwrap();
-        assert!(listed.iter().find(|u| u.id == id).unwrap().has_credential);
+        assert!(!listed.iter().find(|u| u.id == id).unwrap().has_credential);
     }
 
     #[tokio::test]
@@ -10697,163 +9890,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    /// A repository made of members serves what they own, in order: the first
-    /// member owning a name serves it, even when a later one has more versions.
-    #[tokio::test]
-    async fn member_repositories_serve_their_packages_first_member_first() {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let Some(cat) = catalog_only().await else {
-            return;
-        };
-        let org = format!(
-            "m{}-{}",
-            std::process::id(),
-            C.fetch_add(1, Ordering::Relaxed)
-        );
-        cat.create_org(&org, None).await.unwrap();
-        let releases = cat.create_repo(&org, "releases").await.unwrap();
-        let mirror = cat.create_repo(&org, "mirror").await.unwrap();
-        let all = cat.create_repo(&org, "all").await.unwrap();
-        let blob = [7u8; 32];
-        cat.upsert_blob(&blob, 1234).await.unwrap();
-        let add = async |repo, name: &str, versions: &[&str]| {
-            let pkg = cat
-                .upsert_package(repo, name, "composer", None, Visibility::Public)
-                .await
-                .unwrap();
-            for v in versions {
-                cat.upsert_package_version(
-                    pkg,
-                    v,
-                    &format!("{v}.0"),
-                    "stable",
-                    &serde_json::json!({"name": name}),
-                    Some(&blob),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            }
-        };
-        add(releases, "mage-os/a", &["1.0.0"]).await;
-        add(releases, "other/shared", &["1.0.0"]).await;
-        add(mirror, "hyva/b", &["2.0.0"]).await;
-        add(mirror, "other/shared", &["1.0.0", "1.1.0"]).await;
-        cat.backfill_upstream_dist_path(mirror, "hyva/b", "2.0.0.0", "/dist/hyva/b-2.0.0.zip")
-            .await
-            .unwrap();
-
-        cat.set_repo_members(all, &[releases, mirror])
-            .await
-            .unwrap();
-        assert_eq!(
-            cat.repo_members(all)
-                .await
-                .unwrap()
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>(),
-            [releases, mirror]
-        );
-        assert_eq!(
-            cat.all_package_names(all).await.unwrap(),
-            ["hyva/b", "mage-os/a", "other/shared"]
-        );
-        assert_eq!(
-            cat.anonymous_package_names(all, None).await.unwrap(),
-            ["hyva/b", "mage-os/a", "other/shared"]
-        );
-        // The first member's copy of the shared name, never a mix of both.
-        let shared = cat
-            .visible_versions(all, "other/shared", "auto", 0, None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            shared
-                .iter()
-                .map(|v| v.version.as_str())
-                .collect::<Vec<_>>(),
-            ["1.0.0"]
-        );
-        assert!(cat.repo_serves_dist(all, "hyva/b", &blob).await.unwrap());
-        assert_eq!(
-            cat.dist_by_upstream_path(all, "/dist/hyva/b-2.0.0.zip")
-                .await
-                .unwrap()
-                .map(|(n, _)| n),
-            Some("hyva/b".to_owned())
-        );
-
-        // Reordering hands the shared name to the mirror.
-        cat.set_repo_members(all, &[mirror, releases])
-            .await
-            .unwrap();
-        assert_eq!(
-            cat.visible_versions(all, "other/shared", "auto", 0, None, None)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-
-        // Clearing the members makes it an empty, ordinary repository again.
-        cat.set_repo_members(all, &[]).await.unwrap();
-        assert!(cat.all_package_names(all).await.unwrap().is_empty());
-        assert!(
-            cat.dist_by_upstream_path(all, "/dist/hyva/b-2.0.0.zip")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn member_repositories_are_one_level_in_one_org() {
-        static C: AtomicU64 = AtomicU64::new(0);
-        let Some(cat) = catalog_only().await else {
-            return;
-        };
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        let org = format!("n{}-{n}", std::process::id());
-        let other = format!("o{}-{n}", std::process::id());
-        cat.create_org(&org, None).await.unwrap();
-        cat.create_org(&other, None).await.unwrap();
-        let a = cat.create_repo(&org, "a").await.unwrap();
-        let b = cat.create_repo(&org, "b").await.unwrap();
-        let all = cat.create_repo(&org, "all").await.unwrap();
-        let elsewhere = cat.create_repo(&other, "x").await.unwrap();
-        let invalid = |r: Result<(), RepoMembersError>| match r {
-            Err(RepoMembersError::Invalid(why)) => why,
-            other => panic!("expected a refusal, got {other:?}"),
-        };
-
-        assert!(
-            invalid(cat.set_repo_members(all, &[a, elsewhere]).await).contains("same organization")
-        );
-        assert!(invalid(cat.set_repo_members(all, &[all]).await).contains("own member"));
-        assert!(invalid(cat.set_repo_members(all, &[a, a]).await).contains("twice"));
-
-        cat.set_repo_members(all, &[a]).await.unwrap();
-        // A repo with members can't be a member, nor take a member that has them.
-        assert!(invalid(cat.set_repo_members(b, &[all]).await).contains("one level"));
-        // It holds no packages of its own...
-        match cat
-            .upsert_package(all, "x/y", "composer", None, Visibility::Public)
-            .await
-        {
-            Err(UpsertPackageError::Policy(why)) => assert!(why.contains("member repositories")),
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-        // ...and a repo that owns packages can't take members.
-        cat.upsert_package(b, "x/y", "composer", None, Visibility::Public)
-            .await
-            .unwrap();
-        cat.set_repo_members(all, &[]).await.unwrap();
-        assert!(invalid(cat.set_repo_members(b, &[a]).await).contains("owns packages"));
     }
 
     /// Seller mode: a license key resolves only for its repo and unlocks only
