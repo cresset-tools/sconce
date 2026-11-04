@@ -1,43 +1,5 @@
 # Changelog
 
-## [0.10.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.9.0...sconce-v0.10.0) (2026-11-04)
-
-
-### Features
-
-* **catalog:** repositories made of member repositories ([2702eb2](https://github.com/cresset-tools/sconce/commit/2702eb2a946d4e02f05ec731e4f708d08fd30c6b))
-* **server:** drain requests in flight on shutdown ([90be536](https://github.com/cresset-tools/sconce/commit/90be5362964b859c4fa38489fe965bc2f08c02e8))
-
-## [0.9.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.8.0...sconce-v0.9.0) (2026-11-04)
-
-
-### Features
-
-* **server:** a human index page for every repository ([99ac742](https://github.com/cresset-tools/sconce/commit/99ac7424dc4f471e35c4eb05cf03323210e102a1))
-
-
-### Bug Fixes
-
-* **cli:** never print environment values in --help ([1c5730a](https://github.com/cresset-tools/sconce/commit/1c5730aa5f87e681caf1c76949086e1150c06a15))
-
-## [0.8.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.1...sconce-v0.8.0) (2026-11-04)
-
-
-### Features
-
-* anonymous access to a repository's public packages ([e4cd1e1](https://github.com/cresset-tools/sconce/commit/e4cd1e152db1579ed86318871f02377e4cefece7))
-* let a package's owner declare its visibility ([570eeeb](https://github.com/cresset-tools/sconce/commit/570eeebbf1b157c30a9cddd84672752e7e743f30))
-* **mirror:** never change a version once it is mirrored from a composer upstream ([3542666](https://github.com/cresset-tools/sconce/commit/35426669ec653050f5ce782d7b61596978324686))
-* serve a repository at the root of a custom domain ([bc6f329](https://github.com/cresset-tools/sconce/commit/bc6f32957c6ca1ec735c0e99dcc3ea94ed5d69e4))
-* **server:** cache headers on the Composer read routes ([52147f7](https://github.com/cresset-tools/sconce/commit/52147f7bf410bcd0b265fcda13c157cf157591a9))
-* **server:** serve imported registries' dists under their original paths ([2cf0037](https://github.com/cresset-tools/sconce/commit/2cf00372a5a68cf17837cbf96f2355deebbbb5f4))
-
-
-### Bug Fixes
-
-* **mirror:** accept composer dists published without a shasum ([d2d6008](https://github.com/cresset-tools/sconce/commit/d2d600808ac74f26b79242f17893af91756659ab))
-* **server:** only serve a dist blob that the repository serves for that package ([275555e](https://github.com/cresset-tools/sconce/commit/275555ef04a0241a5e7f4e722a71d7476cb4d1f9))
-
 ## [0.7.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.7.0...sconce-v0.7.1) (2026-08-11)
 
 

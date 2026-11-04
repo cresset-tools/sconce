@@ -476,26 +476,6 @@ enum Command {
         database_url: String,
     },
 
-    /// Show or set the member repositories a repo is made of.
-    ///
-    /// A repo with members serves everything its members own, as one Composer
-    /// repository: say a repo that releases are published to and a mirror of
-    /// another registry, behind one URL. Members are other repos of the same
-    /// org, in order; when two own a package of the same name, the first one
-    /// serves it. One level only: a repo with members owns no packages, and
-    /// members have none of their own. Publish and mirror into the members.
-    RepoMembers {
-        /// Repository, as `<org>/<repo>`.
-        repo: String,
-        /// Members, in order, as `<org>/<repo>`. Omit to show the current ones.
-        members: Vec<String>,
-        /// Remove every member, making it an ordinary repository again.
-        #[arg(long, conflicts_with = "members")]
-        clear: bool,
-        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
-        database_url: String,
-    },
-
     /// Create (or update) an admin-UI user. Use `--superadmin` for the first,
     /// all-tenant account.
     UserCreate {
@@ -1423,12 +1403,6 @@ fn main() -> Result<()> {
             anonymous_access,
             &database_url,
         ),
-        Command::RepoMembers {
-            repo,
-            members,
-            clear,
-            database_url,
-        } => repo_members(&repo, &members, clear, &database_url),
         Command::RepoDomain {
             repo,
             domain,
@@ -2791,40 +2765,6 @@ fn repo_domain(repo: &str, domain: Option<&str>, clear: bool, database_url: &str
     })
 }
 
-fn repo_members(repo: &str, members: &[String], clear: bool, database_url: &str) -> Result<()> {
-    with_catalog(database_url, async |catalog| {
-        let repo_id = resolve_repo(&catalog, repo).await?;
-        if clear || !members.is_empty() {
-            let mut ids = Vec::with_capacity(members.len());
-            for m in members {
-                ids.push(resolve_repo(&catalog, m).await?);
-            }
-            catalog
-                .set_repo_members(repo_id, &ids)
-                .await
-                .map_err(|e| match e {
-                    sconce_catalog::RepoMembersError::Invalid(why) => anyhow::anyhow!(why),
-                    sconce_catalog::RepoMembersError::Db(e) => {
-                        anyhow::Error::new(e).context("setting the members")
-                    }
-                })?;
-        }
-        let current = catalog
-            .repo_members(repo_id)
-            .await
-            .context("loading the members")?;
-        if current.is_empty() {
-            println!("repo {repo} has no members");
-        } else {
-            println!("repo {repo} serves, in order:");
-            for (_, name) in current {
-                println!("  {name}");
-            }
-        }
-        Ok(())
-    })
-}
-
 fn repo_create(org: &str, repo: &str, database_url: &str) -> Result<()> {
     with_catalog(database_url, async |catalog| {
         // A retired repo slug can't be reused (it still redirects).
@@ -4046,9 +3986,8 @@ fn serve(
             });
         }
 
-        // Optional in-process admin UI on its own port. It drains on the same
-        // signal as the wire server, which waits for it below.
-        let ui_task = ui_listen.map(|ui_addr| {
+        // Optional in-process admin UI on its own port.
+        if let Some(ui_addr) = ui_listen {
             let ucat = catalog.clone();
             let ubase = base_url.clone();
             let apw = admin_password;
@@ -4059,8 +3998,8 @@ fn serve(
                 {
                     tracing::error!(error = %e, "ui server exited");
                 }
-            })
-        });
+            });
+        }
 
         tracing::info!(
             store = store.describe(),
@@ -4069,9 +4008,6 @@ fn serve(
         sconce_server::serve(catalog, store, base_url, listen)
             .await
             .context("serving")?;
-        if let Some(ui_task) = ui_task {
-            let _ = ui_task.await;
-        }
         Ok::<_, anyhow::Error>(())
     })
 }
