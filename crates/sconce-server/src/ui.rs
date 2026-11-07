@@ -248,7 +248,6 @@ pub async fn serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(crate::shutdown_signal())
     .await
 }
 
@@ -310,8 +309,48 @@ async fn auth(State(s): State<Ui>, mut req: Request, next: Next) -> Response {
             });
             next.run(req).await
         }
-        None => Redirect::to("/login").into_response(),
+        None => Redirect::to(&login_url_for(&req)).into_response(),
     }
+}
+
+/// The sign-in URL for a signed-out request: `/login?next=<path?query>` so a
+/// deep link (the `bougie login` approval page, a package page) survives
+/// signing in. Only a `GET` is worth returning to — re-running a form post
+/// after sign-in isn't — and `/` needs no `next`.
+fn login_url_for(req: &Request) -> String {
+    let target = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    if req.method() != axum::http::Method::GET || target == "/" {
+        return "/login".to_owned();
+    }
+    format!("/login?next={}", percent_encode(target))
+}
+
+/// A post-sign-in destination, if `raw` is safe to redirect to: a path on
+/// this site. Rejects absolute and scheme-relative URLs (`//evil.example`,
+/// `/\evil.example`, which browsers treat as another host) so `next` can't
+/// turn sign-in into an open redirect.
+fn safe_next(raw: &str) -> Option<&str> {
+    let ok = raw.starts_with('/')
+        && !raw.starts_with("//")
+        && !raw.starts_with("/\\")
+        && raw.len() <= 2048
+        && !raw.chars().any(char::is_control);
+    ok.then_some(raw)
+}
+
+/// Percent-encode `s` for a query-string value (RFC 3986 unreserved kept;
+/// `/` kept for readability, it is legal in a query).
+fn percent_encode(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// Unauthenticated health probe (mirrors the wire server's `/healthz`):
@@ -1131,7 +1170,6 @@ async fn repo_settings_page(
             .unwrap_or_default(),
         private: repo_cfg.allow_private_packages,
         anonymous: repo_cfg.anonymous_access,
-        custom_domain: s.catalog.custom_domain(summary.id).await.map_err(e500)?,
         org_raw: if org_cfg.allow_raw_tokens {
             "allowed"
         } else {
@@ -1291,7 +1329,8 @@ async fn not_found_page() -> impl IntoResponse {
 
 /// Render the sign-in page (two-pane card). A non-empty `error` shows an inline
 /// banner above the email field. Shared by the form and every auth error path.
-async fn login_page(s: &Ui, error: &str) -> Html<String> {
+async fn login_page(s: &Ui, error: &str, next: &str) -> Html<String> {
+    let next = safe_next(next).unwrap_or_default();
     // Offer SSO if configured: a direct button for the instance default, plus an
     // email box that routes org domains to their own IdP.
     let sso_enabled = s.catalog.oidc_configured().await.unwrap_or(false);
@@ -1300,20 +1339,34 @@ async fn login_page(s: &Ui, error: &str) -> Html<String> {
         sso_enabled,
         has_default,
         error: error.to_owned(),
+        next: next.to_owned(),
+        next_query: if next.is_empty() {
+            String::new()
+        } else {
+            format!("?next={}", percent_encode(next))
+        },
     }
     .render()
     .unwrap_or_default();
     doc("Sign in", &body)
 }
 
-async fn login_form(State(s): State<Ui>) -> Html<String> {
-    login_page(&s, "").await
+#[derive(Deserialize)]
+struct NextParam {
+    #[serde(default)]
+    next: String,
+}
+
+async fn login_form(State(s): State<Ui>, Query(q): Query<NextParam>) -> Html<String> {
+    login_page(&s, "", &q.next).await
 }
 
 #[derive(Deserialize)]
 struct LoginForm {
     email: String,
     password: String,
+    #[serde(default)]
+    next: String,
 }
 
 async fn login(
@@ -1341,15 +1394,17 @@ async fn login(
         .await
         .map_err(e500)?
     else {
-        return Ok(
-            login_page(&s, "Invalid email or password. Try again, or use SSO.")
-                .await
-                .into_response(),
-        );
+        return Ok(login_page(
+            &s,
+            "Invalid email or password. Try again, or use SSO.",
+            &f.next,
+        )
+        .await
+        .into_response());
     };
     let token = s.catalog.create_session(user_id, 7).await.map_err(e500)?;
     Ok(redirect_with_cookie(
-        "/",
+        safe_next(&f.next).unwrap_or("/"),
         &session_set_cookie(&token, s.cookie_secure),
     ))
 }
@@ -1575,6 +1630,8 @@ fn oidc_secret(
 #[derive(Deserialize)]
 struct StartParams {
     conn: Option<String>,
+    #[serde(default)]
+    next: String,
 }
 
 /// Begin SSO: build the identity-provider redirect, persist the flow, redirect.
@@ -1594,7 +1651,7 @@ async fn auth_start(
     let begin = match crate::oidc::begin(&conn, secret.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
-            return Ok(login_page(&s, &format!("SSO unavailable: {e}"))
+            return Ok(login_page(&s, &format!("SSO unavailable: {e}"), &q.next)
                 .await
                 .into_response());
         }
@@ -1605,7 +1662,7 @@ async fn auth_start(
             Some(conn.id),
             &begin.nonce,
             &begin.pkce_verifier,
-            "/",
+            safe_next(&q.next).unwrap_or("/"),
             600,
         )
         .await
@@ -1616,6 +1673,8 @@ async fn auth_start(
 #[derive(Deserialize)]
 struct RouteForm {
     email: String,
+    #[serde(default)]
+    next: String,
 }
 
 /// Route an organization email to its identity provider (by domain), else the
@@ -1627,10 +1686,17 @@ async fn auth_route(State(s): State<Ui>, Form(f): Form<RouteForm>) -> Result<Res
         .await
         .map_err(e500)?
     {
-        Some(id) => Ok(Redirect::to(&format!("/auth/start?conn={id}")).into_response()),
-        None => Ok(login_page(&s, "no SSO is configured for that email domain")
-            .await
-            .into_response()),
+        Some(id) => {
+            let next = safe_next(&f.next)
+                .map(|n| format!("&next={}", percent_encode(n)))
+                .unwrap_or_default();
+            Ok(Redirect::to(&format!("/auth/start?conn={id}{next}")).into_response())
+        }
+        None => Ok(
+            login_page(&s, "no SSO is configured for that email domain", &f.next)
+                .await
+                .into_response(),
+        ),
     }
 }
 
@@ -1647,7 +1713,7 @@ async fn auth_callback(
     Query(p): Query<CallbackParams>,
 ) -> Result<Response, StatusCode> {
     if let Some(err) = p.error {
-        return Ok(login_page(&s, &format!("IdP returned an error: {err}"))
+        return Ok(login_page(&s, &format!("IdP returned an error: {err}"), "")
             .await
             .into_response());
     }
@@ -1659,7 +1725,7 @@ async fn auth_callback(
         s.catalog.consume_oidc_flow(&state).await.map_err(e500)?
     else {
         return Ok(
-            login_page(&s, "login session expired or invalid — try again")
+            login_page(&s, "login session expired or invalid — try again", "")
                 .await
                 .into_response(),
         );
@@ -1678,7 +1744,7 @@ async fn auth_callback(
         match crate::oidc::finish(&conn, secret.as_deref(), &code, &nonce, &verifier).await {
             Ok(id) => id,
             Err(e) => {
-                return Ok(login_page(&s, &format!("SSO failed: {e}"))
+                return Ok(login_page(&s, &format!("SSO failed: {e}"), "")
                     .await
                     .into_response());
             }
@@ -1689,7 +1755,7 @@ async fn auth_callback(
         && !crate::oidc::domain_matches(&identity.email, &conn.allowed_domains)
     {
         return Ok(
-            login_page(&s, "your email domain is not allowed to sign in")
+            login_page(&s, "your email domain is not allowed to sign in", "")
                 .await
                 .into_response(),
         );
@@ -3422,12 +3488,6 @@ async fn repo_page(
         .next()
         .unwrap_or(&base)
         .to_owned();
-    // A custom domain replaces the `/<org>/<repo>` URL in what we tell users.
-    let scheme = base.split_once("://").map_or("https", |(scheme, _)| scheme);
-    let (repo_url, host) = match s.catalog.custom_domain(summary.id).await.map_err(e500)? {
-        Some(domain) => (format!("{scheme}://{domain}"), domain),
-        None => (format!("{base}/{org}/{repo}"), host),
-    };
     let example_pkg = packages
         .first()
         .map_or_else(|| "<package>".to_owned(), |p| p.name.clone());
@@ -3470,7 +3530,6 @@ async fn repo_page(
         filtering,
         approvals_count: pending_count + held_count,
         base,
-        repo_url,
         host,
         example_pkg,
         pending_count,
@@ -4800,6 +4859,40 @@ async fn merge_license_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_next_keeps_same_site_paths_only() {
+        assert_eq!(safe_next("/device?code=AB-CD"), Some("/device?code=AB-CD"));
+        assert_eq!(safe_next("/"), Some("/"));
+        for bad in [
+            "",
+            "device",
+            "https://evil.example/",
+            "//evil.example",
+            "/\\evil.example",
+            "/a\nb",
+        ] {
+            assert_eq!(safe_next(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn login_url_carries_the_original_get_target() {
+        let req = |method: &str, uri: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            login_url_for(&req("GET", "/device?code=AB-CD")),
+            "/login?next=/device%3Fcode%3DAB-CD"
+        );
+        assert_eq!(login_url_for(&req("GET", "/")), "/login");
+        // A form post isn't replayed after sign-in.
+        assert_eq!(login_url_for(&req("POST", "/device")), "/login");
+    }
 
     #[test]
     fn session_cookie_secure_only_on_https_dashboards() {

@@ -24,11 +24,6 @@
   </p>
   <button>Save settings</button>
 </form>
-{% if let Some(domain) = custom_domain %}
-<p><strong>Custom domain:</strong> <code>{{ domain }}</code><br>
-  <span class=muted>Composer can use this repository at the root of that domain.
-  Only the server operator can change it (<code>sconce repo-domain</code>).</span></p>
-{% endif %}
 <p><strong>Effective now:</strong> raw tokens {{ eff_raw }}, max TTL {{ eff_ttl }}.</p>
 
 <h2>Rename repository</h2>
