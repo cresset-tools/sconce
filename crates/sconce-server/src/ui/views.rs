@@ -129,8 +129,6 @@ pub struct RepoSettings {
     pub private: bool,
     /// Anonymous access on (public packages readable without a credential).
     pub anonymous: bool,
-    /// The custom domain the repository is served at (operator-set, shown only).
-    pub custom_domain: Option<String>,
     pub org_raw: &'static str,
     pub org_ttl: String,
     pub eff_raw: &'static str,
@@ -309,6 +307,11 @@ pub struct Login {
     pub has_default: bool,
     /// Inline error banner text, or empty.
     pub error: String,
+    /// Where to land after signing in (a same-site path), or empty for `/`.
+    /// Carried as a hidden field through the password form and SSO routing.
+    pub next: String,
+    /// `?next=…` (percent-encoded) for the direct SSO link, or empty.
+    pub next_query: String,
 }
 
 /// `/forgot` — request a password-reset link.
@@ -421,6 +424,34 @@ pub struct DeviceApproved {
     pub outcome: &'static str,
     /// The org the token was scoped to (empty when denied).
     pub org: String,
+}
+
+/// `/authorize` — approve a `bougie login` authorization-code request: pick
+/// which org the CLI's read token should cover. The request's parameters ride
+/// along as hidden fields and are checked again on submit.
+#[derive(Template)]
+#[template(path = "authorize.html")]
+pub struct Authorize {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub state: String,
+    /// Orgs the approver may scope the token to (member or above).
+    pub orgs: Vec<DeviceOrg>,
+    /// The code goes straight to the CLI's loopback listener, rather than to
+    /// the paste page.
+    pub loopback: bool,
+}
+
+/// The paste page `/authorize` redirects to when the CLI can't listen
+/// locally: shows `code#state` to copy into the terminal, or the error.
+#[derive(Template)]
+#[template(path = "authorize_code.html")]
+pub struct AuthorizeCode {
+    /// What to paste; empty when `error` is set.
+    pub code: String,
+    /// An RFC 6749 error code (`access_denied`, …), or empty.
+    pub error: String,
 }
 
 /// One version row in the package detail table.
@@ -728,10 +759,6 @@ pub struct RepoPage {
     pub approvals_count: i64,
     // Overview
     pub base: String,
-    /// The URL to configure in Composer: the custom domain when there is one,
-    /// else `<base>/<org>/<repo>`.
-    pub repo_url: String,
-    /// The hostname Composer keys the credential on (that of `repo_url`).
     pub host: String,
     pub example_pkg: String,
     pub pending_count: i64,
@@ -888,7 +915,6 @@ mod tests {
             filtering: false,
             approvals_count: 0,
             base: "https://x".to_owned(),
-            repo_url: "https://x/o/r".to_owned(),
             host: "x".to_owned(),
             example_pkg: "acme/widget".to_owned(),
             pending_count: 0,

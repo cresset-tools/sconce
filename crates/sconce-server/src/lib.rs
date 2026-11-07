@@ -16,18 +16,13 @@
 //! **license key** unlocks only its entitled (purchased) packages — unentitled
 //! packages serve an empty document. A credential from one repo can't read
 //! another. Unknown repo → 404; missing/invalid credential → 401.
-//!
-//! A repository can also have a **custom domain**: requests whose Host is that
-//! domain reach the same read routes at its root (`/packages.json`, `/p2/…`,
-//! `/dist/…`), with every metadata URL on the domain. See `by_host`.
 
 #![forbid(unsafe_code)]
 
 mod api;
-mod cache;
+pub mod authcode;
 pub mod ci;
 pub mod csrf;
-mod index;
 pub mod mail;
 pub mod oidc;
 mod publish;
@@ -35,19 +30,16 @@ pub mod ratelimit;
 mod snapshots;
 pub mod ui;
 
+use axum::Form;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::middleware::from_fn_with_state;
-use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
-use cache::{Kind, cache};
 use sconce_cas::{AnyBlobStore, BlobId, BlobStore};
-use sconce_catalog::{Catalog, RepoLocation};
+use sconce_catalog::Catalog;
 use serde_json::json;
-use tower::ServiceExt as _;
 use uuid::Uuid;
 
 /// Shared handler state.
@@ -67,9 +59,13 @@ struct AppState {
 }
 
 /// Build the router. Repositories are served under `/{org}/{repo}/…`, each
-/// gated by a token valid *for that repository*, and a repository with a
-/// custom domain also at that domain's root (see `by_host`).
+/// gated by a token valid *for that repository*.
+#[allow(clippy::too_many_lines)]
 pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router {
+    // Uploads carry package bytes, so they need a much larger body cap than axum's
+    // 2 MiB default — applied per-route so the read/serving routes keep the default.
+    let max_upload = publish::max_upload_bytes();
+    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
     // Relay-introspection secrets, loaded once at startup. Accept a *set*
     // (comma- or whitespace-separated) so a secret can be rotated with zero
     // downtime: add the new one here and restart, roll the relay onto it, then
@@ -79,72 +75,28 @@ pub fn router(catalog: Catalog, store: AnyBlobStore, base_url: String) -> Router
         .ok()
         .map(|raw| parse_introspect_secrets(&raw))
         .unwrap_or_default();
-    let (scheme, main_host) = base_scheme_and_host(&base_url);
-    let state = AppState {
-        catalog,
-        store,
-        base_url,
-        introspect_secrets,
-    };
-    let routing = HostRouting {
-        state: state.clone(),
-        domains: domain_router(state.clone()),
-        main_host,
-        scheme,
-    };
-    // The host decides before any route matches: `Router::layer` would run
-    // after matching, leaking the main routes' path parameters into a
-    // domain's request. A router with only a fallback has no routes to match.
     Router::new()
-        .fallback_service(main_router(state))
-        .layer(middleware::from_fn_with_state(routing, by_host))
-}
-
-/// The Composer read routes and the human index, by `/{org}/{repo}/…`.
-fn read_routes() -> Router<AppState> {
-    Router::new()
-        // The human index: how to add the repository, and its packages.
-        .route(
-            "/{org}/{repo}",
-            get(repo_index).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/{org}/{repo}/",
-            get(repo_index).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/{org}/{repo}/packages.json",
-            get(packages_json).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/{org}/{repo}/p2/{*rest}",
-            get(p2).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/{org}/{repo}/dist/{*rest}",
-            get(dist).layer(from_fn_with_state(Kind::Dist, cache)),
-        )
+        .route("/{org}/{repo}/packages.json", get(packages_json))
+        .route("/{org}/{repo}/p2/{*rest}", get(p2))
+        .route("/{org}/{repo}/dist/{*rest}", get(dist))
         // Dist paths of an imported upstream, for existing composer.lock URLs.
         // Registered as a catch-all: every more specific route wins.
-        .route(
-            "/{org}/{repo}/{*path}",
-            get(upstream_dist).layer(from_fn_with_state(Kind::Dist, cache)),
-        )
-}
-
-/// Every route of the main host, addressed by `/{org}/{repo}/…`.
-fn main_router(state: AppState) -> Router {
-    // Uploads carry package bytes, so they need a much larger body cap than axum's
-    // 2 MiB default — applied per-route so the read/serving routes keep the default.
-    let max_upload = publish::max_upload_bytes();
-    let upload_limit = DefaultBodyLimit::max(usize::try_from(max_upload).unwrap_or(usize::MAX));
-    read_routes()
+        .route("/{org}/{repo}/{*path}", get(upstream_dist))
         .route("/oauth/ci", post(oauth_ci))
         .route("/oauth/ci-publish", post(oauth_ci_publish))
         // Device authorization grant (RFC 8628) for `bougie login`: the CLI starts
         // a flow + polls here; the human approves on the dashboard (see ui.rs).
         .route("/oauth/device", post(oauth_device))
         .route("/oauth/device/token", post(oauth_device_token))
+        // Authorization-code grant with PKCE for `bougie login`: the human
+        // approves on the dashboard's /authorize page; the CLI redeems the code
+        // here. Advertised by the RFC 8414 metadata document, which is how the
+        // CLI tells this server supports it.
+        .route("/oauth/token", post(oauth_token))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_metadata),
+        )
         // Token introspection (RFC 7662 style) for a first-party relay: verify a
         // `bougie login` org-session token. Caller-authenticated by a shared
         // secret; never exposed to end users.
@@ -240,7 +192,12 @@ fn main_router(state: AppState) -> Router {
             post(api::merge_license),
         )
         .route("/healthz", get(healthz))
-        .with_state(state)
+        .with_state(AppState {
+            catalog,
+            store,
+            base_url,
+            introspect_secrets,
+        })
 }
 
 /// Unauthenticated health probe for load balancers / orchestrators: `200 ok`
@@ -395,54 +352,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let app = router(catalog, store, base_url);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    serve_until(listener, app, shutdown_signal()).await
-}
-
-/// Serve `app` on `listener` until `shutdown` resolves, then drain: stop
-/// accepting connections, let the requests in flight finish, and return.
-/// A proxy in front sees the closed listener as a refused connection and
-/// retries the request on another instance, so a rolling restart drops
-/// nothing.
-async fn serve_until(
-    listener: tokio::net::TcpListener,
-    app: Router,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-}
-
-/// Resolves when the process is asked to stop: SIGTERM (what podman and
-/// systemd send) or Ctrl-C. Every server in the process waits on its own
-/// copy, so each one drains on the same signal.
-pub async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %e, "cannot listen for Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let term = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                sigterm.recv().await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot listen for SIGTERM");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {}
-        () = term => {}
-    }
-    tracing::info!("shutting down: finishing the requests in flight");
+    axum::serve(listener, app).await
 }
 
 async fn packages_json(
@@ -454,18 +364,7 @@ async fn packages_json(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let base = repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug);
-    serve_root(&s, &loc, &base, &headers).await
-}
-
-/// The root document of `loc`, with every URL under `base`.
-async fn serve_root(
-    s: &AppState,
-    loc: &RepoLocation,
-    base: &str,
-    headers: &HeaderMap,
-) -> Result<Response, AppError> {
-    let (access, _policy) = authorize(s, loc.repo_id, headers).await?;
+    let (access, _policy) = authorize(&s, loc.repo_id, &headers).await?;
     let names = match access {
         Access::Full => s.catalog.all_package_names(loc.repo_id).await?,
         Access::Licensed(entitled) => {
@@ -475,7 +374,11 @@ async fn serve_root(
         }
         Access::Anonymous => s.catalog.anonymous_package_names(loc.repo_id, None).await?,
     };
-    Ok(Json(sconce_metadata::render_root(&names, base)).into_response())
+    Ok(Json(sconce_metadata::render_root(
+        &names,
+        &repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug),
+    ))
+    .into_response())
 }
 
 async fn p2(
@@ -487,20 +390,7 @@ async fn p2(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    let base = repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug);
-    serve_p2(&s, &loc, &base, &rest, &headers).await
-}
-
-/// One package's metadata document (`rest` is `vendor/name[~dev].json`), with
-/// its dist URLs under `base`.
-async fn serve_p2(
-    s: &AppState,
-    loc: &RepoLocation,
-    base: &str,
-    rest: &str,
-    headers: &HeaderMap,
-) -> Result<Response, AppError> {
-    let (access, policy) = authorize(s, loc.repo_id, headers).await?;
+    let (access, policy) = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name.json" or "vendor/name~dev.json".
     let stem = rest.strip_suffix(".json").ok_or(AppError::NotFound)?;
@@ -511,7 +401,7 @@ async fn serve_p2(
 
     // A license key only unlocks its entitled packages; everything else (and the
     // dev variant) is an empty document.
-    if is_dev || !access.allows(s, loc.repo_id, package).await? {
+    if is_dev || !access.allows(&s, loc.repo_id, package).await? {
         return Ok(Json(json!({ "packages": { package: [] } })).into_response());
     }
 
@@ -542,7 +432,12 @@ async fn serve_p2(
             bound.major,
         )
         .await?;
-    Ok(Json(sconce_metadata::render_package(package, &versions, base)).into_response())
+    Ok(Json(sconce_metadata::render_package(
+        package,
+        &versions,
+        &repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug),
+    ))
+    .into_response())
 }
 
 async fn dist(
@@ -554,17 +449,7 @@ async fn dist(
         Ok(loc) => loc,
         Err(redirect) => return Ok(redirect),
     };
-    serve_dist(&s, &loc, &rest, &headers).await
-}
-
-/// A download under `dist/` (`rest` is what follows it).
-async fn serve_dist(
-    s: &AppState,
-    loc: &RepoLocation,
-    rest: &str,
-    headers: &HeaderMap,
-) -> Result<Response, AppError> {
-    let (access, _) = authorize(s, loc.repo_id, headers).await?;
+    let (access, _) = authorize(&s, loc.repo_id, &headers).await?;
 
     // `rest` is "vendor/name/<sha256>.zip"; the final segment carries the sha.
     // Anything else under `dist/` may be an imported registry's own dist path
@@ -573,12 +458,12 @@ async fn serve_dist(
         .rsplit_once('/')
         .and_then(|(package, file)| Some((package, parse_hex32(file.strip_suffix(".zip")?)?)))
     else {
-        return serve_upstream_path(s, loc.repo_id, &access, &format!("dist/{rest}")).await;
+        return serve_upstream_path(&s, loc.repo_id, &access, &format!("dist/{rest}")).await;
     };
     // The sha256 is public (every composer.lock carries it), so it only opens a
     // blob this repository serves for that package, to a credential that can
     // read the package. Anything else is indistinguishable from a missing blob.
-    if !access.allows(s, loc.repo_id, package).await?
+    if !access.allows(&s, loc.repo_id, package).await?
         || !s
             .catalog
             .repo_serves_dist(loc.repo_id, package, &sha)
@@ -586,7 +471,7 @@ async fn serve_dist(
     {
         return Err(AppError::NotFound);
     }
-    serve_blob(s, BlobId::from_bytes(sha)).await
+    serve_blob(&s, BlobId::from_bytes(sha)).await
 }
 
 /// `GET /{org}/{repo}/{*path}` — a dist path as the repository's upstream served
@@ -607,189 +492,6 @@ async fn upstream_dist(
     };
     let (access, _) = authorize(&s, loc.repo_id, &headers).await?;
     serve_upstream_path(&s, loc.repo_id, &access, &path).await
-}
-
-/// A repository served at the root of its custom domain. [`by_host`] attaches
-/// it to a request whose Host is one, before routing it to [`domain_router`].
-#[derive(Clone)]
-struct DomainRepo {
-    loc: RepoLocation,
-    /// `<scheme>://<host as requested>`: the base of every URL in its metadata.
-    base: String,
-}
-
-/// The routes a custom domain serves: the Composer read routes, at the root.
-/// Publishing, uploads, snapshots and the APIs stay on the main host, so a
-/// domain pointed here exposes nothing a Composer client does not need.
-fn domain_router(state: AppState) -> Router {
-    Router::new()
-        .route(
-            "/",
-            get(domain_index).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/packages.json",
-            get(domain_packages_json).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/p2/{*rest}",
-            get(domain_p2).layer(from_fn_with_state(Kind::Metadata, cache)),
-        )
-        .route(
-            "/dist/{*rest}",
-            get(domain_dist).layer(from_fn_with_state(Kind::Dist, cache)),
-        )
-        .route("/healthz", get(healthz))
-        .route(
-            "/{*path}",
-            get(domain_upstream_dist).layer(from_fn_with_state(Kind::Dist, cache)),
-        )
-        .with_state(state)
-}
-
-/// `?q=` on the index: the search to start from.
-#[derive(serde::Deserialize, Default)]
-struct IndexQuery {
-    q: Option<String>,
-}
-
-async fn repo_index(
-    State(s): State<AppState>,
-    Path((org, repo)): Path<(String, String)>,
-    Query(query): Query<IndexQuery>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let loc = match locate(&s, &org, &repo, "").await? {
-        Ok(loc) => loc,
-        Err(redirect) => return Ok(redirect),
-    };
-    let base = repo_base(&s.base_url, &loc.org_slug, &loc.repo_slug);
-    let title = format!("{}/{}", loc.org_slug, loc.repo_slug);
-    index::serve_index(&s, &loc, &base, title, &headers, query.q.as_deref()).await
-}
-
-async fn domain_index(
-    State(s): State<AppState>,
-    Extension(d): Extension<DomainRepo>,
-    Query(query): Query<IndexQuery>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let title = domain_part(d.base.split_once("://").map_or(&*d.base, |(_, rest)| rest))
-        .unwrap_or_else(|| d.loc.repo_slug.clone());
-    index::serve_index(&s, &d.loc, &d.base, title, &headers, query.q.as_deref()).await
-}
-
-async fn domain_packages_json(
-    State(s): State<AppState>,
-    Extension(d): Extension<DomainRepo>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    serve_root(&s, &d.loc, &d.base, &headers).await
-}
-
-async fn domain_p2(
-    State(s): State<AppState>,
-    Extension(d): Extension<DomainRepo>,
-    Path(rest): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    serve_p2(&s, &d.loc, &d.base, &rest, &headers).await
-}
-
-async fn domain_dist(
-    State(s): State<AppState>,
-    Extension(d): Extension<DomainRepo>,
-    Path(rest): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    serve_dist(&s, &d.loc, &rest, &headers).await
-}
-
-async fn domain_upstream_dist(
-    State(s): State<AppState>,
-    Extension(d): Extension<DomainRepo>,
-    Path(path): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let (access, _) = authorize(&s, d.loc.repo_id, &headers).await?;
-    serve_upstream_path(&s, d.loc.repo_id, &access, &path).await
-}
-
-/// State for [`by_host`].
-#[derive(Clone)]
-struct HostRouting {
-    state: AppState,
-    domains: Router,
-    /// The main host (from the base URL), which never needs a lookup.
-    main_host: Option<String>,
-    /// `http` or `https`, as the base URL says, for a domain's URLs.
-    scheme: &'static str,
-}
-
-/// Send a request whose Host is a repository's custom domain to that
-/// repository's [`domain_router`]; everything else routes as usual. Only the
-/// Host the request arrived with counts, never `X-Forwarded-Host`, so a reverse
-/// proxy in front must pass it through.
-async fn by_host(State(h): State<HostRouting>, mut req: Request, next: Next) -> Response {
-    let Some(authority) = request_authority(&req) else {
-        return next.run(req).await;
-    };
-    let Some(host) = domain_part(&authority) else {
-        return next.run(req).await;
-    };
-    if h.main_host.as_deref() == Some(host.as_str()) {
-        return next.run(req).await;
-    }
-    match h.state.catalog.repo_by_custom_domain(&host).await {
-        Ok(Some(loc)) => {
-            let base = format!("{}://{authority}", h.scheme);
-            req.extensions_mut().insert(DomainRepo { loc, base });
-            match h.domains.oneshot(req).await {
-                Ok(resp) => resp,
-                Err(never) => match never {},
-            }
-        }
-        Ok(None) => next.run(req).await,
-        Err(e) => AppError::from(e).into_response(),
-    }
-}
-
-/// The authority a request was made to: the URI's (HTTP/2, absolute-form) or
-/// the Host header (HTTP/1.1).
-fn request_authority(req: &Request) -> Option<String> {
-    if let Some(a) = req.uri().authority() {
-        return Some(a.as_str().to_owned());
-    }
-    req.headers()
-        .get(header::HOST)?
-        .to_str()
-        .ok()
-        .map(str::to_owned)
-}
-
-/// The hostname of an authority, lowercased and without port, when it could be
-/// a custom domain (an IPv6 literal cannot).
-fn domain_part(authority: &str) -> Option<String> {
-    if authority.starts_with('[') {
-        return None;
-    }
-    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    Some(host.trim_end_matches('.').to_ascii_lowercase())
-}
-
-/// The scheme and hostname of the base URL.
-fn base_scheme_and_host(base_url: &str) -> (&'static str, Option<String>) {
-    let (scheme, rest) = match base_url.split_once("://") {
-        Some((scheme, rest)) => (scheme, rest),
-        None => ("https", base_url),
-    };
-    let scheme = if scheme.eq_ignore_ascii_case("http") {
-        "http"
-    } else {
-        "https"
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
-    (scheme, domain_part(authority))
 }
 
 /// Serve the dist recorded under an upstream path. The path is guessable, unlike
@@ -1002,14 +704,7 @@ struct DeviceTokenRequest {
 /// auth: the flow is inert until a signed-in org member approves it in the browser.
 async fn oauth_device(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let (device_code, user_code) = s.catalog.start_device_flow(DEVICE_FLOW_TTL_SECS).await?;
-    // The approval page lives on the dashboard (UI router), which may be a
-    // different origin than this wire endpoint; prefer its configured URL, fall
-    // back to this server's base_url for a single-binary deploy.
-    let dashboard = std::env::var("SCONCE_UI_BASE_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| s.base_url.clone());
-    let dashboard = dashboard.trim_end_matches('/');
+    let dashboard = dashboard_url(&s);
     Ok(Json(json!({
         "device_code": device_code,
         "user_code": user_code,
@@ -1055,6 +750,117 @@ async fn oauth_device_token(
             device_error(StatusCode::BAD_REQUEST, "expired_token")
         }
         Err(_) => device_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+    }
+}
+
+/// The dashboard's base URL, without a trailing slash. Approval pages live on
+/// the dashboard (UI router), which may be a different origin than this wire
+/// server; prefer its configured URL, fall back to this server's `base_url`
+/// for a single-binary deploy.
+fn dashboard_url(s: &AppState) -> String {
+    std::env::var("SCONCE_UI_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| s.base_url.clone())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// RFC 8414 authorization-server metadata. Its presence is how `bougie login`
+/// knows to use the authorization-code flow; an older server answers 404 and
+/// the CLI falls back to the device flow.
+async fn oauth_metadata(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let base = s.base_url.trim_end_matches('/');
+    let dashboard = dashboard_url(&s);
+    Json(json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{dashboard}/authorize"),
+        "token_endpoint": format!("{base}/oauth/token"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        // Not part of RFC 8414: the redirect URI that shows the code for
+        // pasting, for a CLI that can't run a loopback listener.
+        "bougie_paste_redirect_uri": format!("{dashboard}{}", authcode::PASTE_PATH),
+    }))
+}
+
+/// `POST /oauth/token` form body (RFC 6749 §4.1.3 plus the PKCE verifier).
+#[derive(serde::Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    redirect_uri: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    code_verifier: String,
+}
+
+/// The token endpoint for the authorization-code grant: trade a one-time code
+/// and its PKCE verifier for an org-scoped read token — the same credential
+/// the device flow issues. Errors follow RFC 6749 §5.2.
+async fn oauth_token(State(s): State<AppState>, Form(req): Form<TokenRequest>) -> Response {
+    let no_store = || [(header::CACHE_CONTROL, "no-store")];
+    let error = |code: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": code })),
+        )
+            .into_response()
+    };
+    if req.grant_type != "authorization_code" {
+        return error("unsupported_grant_type");
+    }
+    if req.code.is_empty() || req.redirect_uri.is_empty() || req.code_verifier.is_empty() {
+        return error("invalid_request");
+    }
+    if req.client_id != authcode::CLIENT_ID {
+        return error("invalid_client");
+    }
+    let org_id = match s
+        .catalog
+        .redeem_authorization_code(
+            &req.code,
+            &req.client_id,
+            &req.redirect_uri,
+            &req.code_verifier,
+        )
+        .await
+    {
+        Ok(Some(org_id)) => org_id,
+        Ok(None) => return error("invalid_grant"),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "server_error" })),
+            )
+                .into_response();
+        }
+    };
+    match s
+        .catalog
+        .create_session_token(org_id, "bougie login", DEVICE_TOKEN_TTL_SECS)
+        .await
+    {
+        Ok(token) => (
+            no_store(),
+            Json(json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": DEVICE_TOKEN_TTL_SECS,
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "server_error" })),
+        )
+            .into_response(),
     }
 }
 
@@ -1341,46 +1147,6 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn shutdown_finishes_requests_in_flight_and_refuses_new_ones() {
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let app = Router::new().route(
-            "/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                "done"
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(super::serve_until(listener, app, async {
-            let _ = stopped.await;
-        }));
-
-        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
-        conn.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        // Ask the server to stop while the request is still sleeping.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        stop.send(()).unwrap();
-
-        let mut response = String::new();
-        conn.read_to_string(&mut response).await.unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response.ends_with("done"), "{response}");
-
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("the server returns once drained")
-            .unwrap()
-            .unwrap();
-        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
-    }
-
     use super::*;
 
     #[test]
@@ -1711,431 +1477,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The human index: instructions for everyone, and the packages the viewer
-    /// can install, newest stable version and description, searchable.
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn index_lists_what_the_viewer_can_install() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use http_body_util::BodyExt;
-        use sconce_catalog::Visibility::{Private, Public};
-        use tower::ServiceExt;
-
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let cat = Catalog::connect(&url).await.unwrap();
-        cat.migrate().await.unwrap();
-        let slug = format!("idx{}", std::process::id());
-        cat.create_org(&slug, None).await.unwrap();
-        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
-        let dir = std::env::temp_dir().join(format!("sconce-idx-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = AnyBlobStore::open(Some(&dir)).unwrap();
-        let add = async |name: &str, visibility, versions: &[(&str, &str, &str)]| {
-            let pid = cat
-                .upsert_package(repo_id, name, "composer", None, visibility)
-                .await
-                .unwrap();
-            for (v, stability, desc) in versions {
-                let blob = store.put(format!("PK{name}{v}").as_bytes()).unwrap();
-                cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
-                cat.insert_mirrored_version(
-                    pid,
-                    v,
-                    &format!("{}.0", v.split('-').next().unwrap()),
-                    stability,
-                    &json!({ "name": name, "description": desc }),
-                    blob.as_bytes(),
-                    "unused",
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            }
-        };
-        add(
-            "open/catalog",
-            Public,
-            &[
-                ("1.0.0", "stable", "Old words"),
-                ("1.2.0", "stable", "Browse <the> catalog"),
-                ("2.0.0-beta1", "beta", "Next"),
-            ],
-        )
-        .await;
-        add("open/checkout", Public, &[("3.1.0", "stable", "")]).await;
-        add("acme/secret", Private, &[("1.0.0", "stable", "Paid")]).await;
-        cat.set_custom_domain(repo_id, Some(&format!("{slug}.example.org")))
-            .await
-            .unwrap();
-
-        let app = router(cat.clone(), store, "https://sconce.example".to_owned());
-        let get = async |host: &str, path: &str, auth: Option<&str>| {
-            let mut req = Request::builder().uri(path).header(header::HOST, host);
-            if let Some(t) = auth {
-                req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
-            }
-            let r = app
-                .clone()
-                .oneshot(req.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = r.status();
-            let ct = r
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .map(|v| v.to_str().unwrap().to_owned());
-            let body = r.into_body().collect().await.unwrap().to_bytes();
-            (status, ct, String::from_utf8_lossy(&body).into_owned())
-        };
-        let main = "sconce.example";
-        let page = format!("/{slug}/r/");
-
-        // No anonymous access, no credential: how to add it, but no packages.
-        let (status, ct, html) = get(main, &page, None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(ct.unwrap().starts_with("text/html"));
-        assert!(html.contains(&format!("bougie repo add https://sconce.example/{slug}/r")));
-        assert!(html.contains(&format!(
-            "composer config repositories.r composer https://sconce.example/{slug}/r"
-        )));
-        assert!(html.contains("bougie login"), "a token is needed");
-        assert!(!html.contains("open/catalog"));
-        assert!(!html.contains("acme/secret"));
-        // The slash is optional.
-        assert_eq!(
-            get(main, &format!("/{slug}/r"), None).await.0,
-            StatusCode::OK
-        );
-
-        // A token sees everything, private packages included.
-        let token = cat.create_token(repo_id, Some("r"), None).await.unwrap();
-        let (_, _, html) = get(main, &page, Some(&token)).await;
-        assert!(html.contains("acme/secret"));
-
-        let mut settings = cat.repo_settings(repo_id).await.unwrap();
-        settings.anonymous_access = true;
-        cat.set_repo_settings(repo_id, settings).await.unwrap();
-
-        // Anonymous: public packages only, at their newest stable version with
-        // its description (escaped), and no token instructions.
-        let (_, _, html) = get(main, &page, None).await;
-        assert!(html.contains("open/catalog") && html.contains("open/checkout"));
-        assert!(!html.contains("acme/secret"));
-        assert!(html.contains("1.2.0") && !html.contains("2.0.0-beta1"));
-        assert!(
-            html.contains("Browse &#60;the&#62; catalog")
-                || html.contains("Browse &lt;the&gt; catalog"),
-            "{html}"
-        );
-        assert!(!html.contains("bougie login"));
-
-        // ?q= hides what does not match, but keeps it for live search.
-        let (_, _, html) = get(main, &format!("{page}?q=Catalog"), None).await;
-        let row = |name: &str| {
-            let at = html.find(&format!(">{name}<")).unwrap();
-            html[..at].rsplit("<li").next().unwrap().to_owned()
-        };
-        assert!(!row("open/catalog").contains("hidden"));
-        assert!(row("open/checkout").contains("hidden"));
-
-        // At the root of the custom domain, with its URL in the commands.
-        let (status, _, html) = get(&format!("{slug}.example.org"), "/", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(html.contains(&format!("bougie repo add https://{slug}.example.org<")));
-        assert!(html.contains("open/catalog"));
-    }
-
-    /// The read routes tell caches what they may keep: anonymous responses are
-    /// public, a credential's private, errors never stored, and metadata
-    /// revalidates by `ETag`.
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn read_routes_carry_cache_headers() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let cat = Catalog::connect(&url).await.unwrap();
-        cat.migrate().await.unwrap();
-        let slug = format!("cache{}", std::process::id());
-        cat.create_org(&slug, None).await.unwrap();
-        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
-        let dir = std::env::temp_dir().join(format!("sconce-cache-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = AnyBlobStore::open(Some(&dir)).unwrap();
-        let pid = cat
-            .upsert_package(
-                repo_id,
-                "open/lib",
-                "composer",
-                None,
-                sconce_catalog::Visibility::Public,
-            )
-            .await
-            .unwrap();
-        let blob = store.put(b"PK\x03\x04cache").unwrap();
-        cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
-        cat.insert_mirrored_version(
-            pid,
-            "1.0.0",
-            "1.0.0.0",
-            "stable",
-            &json!({ "name": "open/lib" }),
-            blob.as_bytes(),
-            "unused",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let token = cat.create_token(repo_id, Some("r"), None).await.unwrap();
-        let dist = format!("dist/open/lib/{}.zip", blob.to_hex());
-
-        let app = router(cat.clone(), store, "http://localhost".to_owned());
-        let get = async |path: &str, auth: Option<&str>, etag: Option<&str>| {
-            let mut req = Request::builder().uri(format!("/{slug}/r/{path}"));
-            if let Some(t) = auth {
-                req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
-            }
-            if let Some(e) = etag {
-                req = req.header(header::IF_NONE_MATCH, e);
-            }
-            app.clone()
-                .oneshot(req.body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-        };
-        let cc = |r: &Response| {
-            r.headers()
-                .get(header::CACHE_CONTROL)
-                .map(|v| v.to_str().unwrap().to_owned())
-        };
-        let varies = |r: &Response| {
-            r.headers()
-                .get_all(header::VARY)
-                .iter()
-                .any(|v| v.to_str().unwrap().contains("Authorization"))
-        };
-
-        // Anonymous access off: the 401 is never stored.
-        let r = get("packages.json", None, None).await;
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(cc(&r).as_deref(), Some("no-store"));
-
-        // A credential's responses are private.
-        let r = get("p2/open/lib.json", Some(&token), None).await;
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(cc(&r).as_deref(), Some("private, max-age=60"));
-        assert!(varies(&r));
-        let r = get(&dist, Some(&token), None).await;
-        assert_eq!(cc(&r).as_deref(), Some("private, max-age=86400"));
-
-        let mut settings = cat.repo_settings(repo_id).await.unwrap();
-        settings.anonymous_access = true;
-        cat.set_repo_settings(repo_id, settings).await.unwrap();
-
-        // Anonymous ones are public: metadata for a minute, dists for a day.
-        for path in ["packages.json", "p2/open/lib.json"] {
-            let r = get(path, None, None).await;
-            assert_eq!(r.status(), StatusCode::OK, "{path}");
-            assert_eq!(cc(&r).as_deref(), Some("public, max-age=60"), "{path}");
-            assert!(varies(&r), "{path}");
-        }
-        let r = get(&dist, None, None).await;
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(cc(&r).as_deref(), Some("public, max-age=86400"));
-        assert!(varies(&r));
-
-        // Metadata revalidates by ETag: unchanged is a 304 with its headers.
-        let r = get("p2/open/lib.json", None, None).await;
-        let etag = r.headers()[header::ETAG].to_str().unwrap().to_owned();
-        let r = get("p2/open/lib.json", None, Some(&etag)).await;
-        assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
-        assert_eq!(cc(&r).as_deref(), Some("public, max-age=60"));
-        assert_eq!(r.headers()[header::ETAG].to_str().unwrap(), etag);
-        let weak = format!("\"x\", W/{etag}");
-        assert_eq!(
-            get("p2/open/lib.json", None, Some(&weak)).await.status(),
-            StatusCode::NOT_MODIFIED
-        );
-        // A changed document gets a new tag, so the old one no longer matches.
-        cat.hold_version(repo_id, "open/lib", "1.0.0.0")
-            .await
-            .unwrap();
-        let r = get("p2/open/lib.json", None, Some(&etag)).await;
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_ne!(r.headers()[header::ETAG].to_str().unwrap(), etag);
-
-        // A missing dist is never stored either.
-        let missing = format!("dist/open/lib/{}.zip", "0".repeat(64));
-        let r = get(&missing, None, None).await;
-        assert_eq!(r.status(), StatusCode::NOT_FOUND);
-        assert_eq!(cc(&r).as_deref(), Some("no-store"));
-    }
-
-    /// A custom domain serves its repository's Composer routes at the root, with
-    /// every metadata URL on that domain, and nothing else; other hosts route
-    /// as before.
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn custom_domain_serves_the_repo_at_its_root() {
-        use axum::body::Body;
-        use axum::http::{Method, Request};
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let cat = Catalog::connect(&url).await.unwrap();
-        cat.migrate().await.unwrap();
-        let slug = format!("dom{}", std::process::id());
-        let domain = format!("repo-{slug}.example.org");
-        cat.create_org(&slug, None).await.unwrap();
-        let repo_id = cat.create_repo(&slug, "r").await.unwrap();
-        let other = cat.create_repo(&slug, "other").await.unwrap();
-
-        let dir = std::env::temp_dir().join(format!("sconce-dom-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = AnyBlobStore::open(Some(&dir)).unwrap();
-        let pid = cat
-            .upsert_package(
-                repo_id,
-                "open/lib",
-                "composer",
-                None,
-                sconce_catalog::Visibility::Public,
-            )
-            .await
-            .unwrap();
-        let bytes = b"PK\x03\x04open-lib".to_vec();
-        let blob = store.put(&bytes).unwrap();
-        cat.upsert_blob(blob.as_bytes(), 1).await.unwrap();
-        cat.insert_mirrored_version(
-            pid,
-            "1.0.0",
-            "1.0.0.0",
-            "stable",
-            &json!({ "name": "open/lib" }),
-            blob.as_bytes(),
-            "unused",
-            None,
-            Some("dist/open/lib/open-lib-1.0.0-abc.zip"),
-        )
-        .await
-        .unwrap();
-        let mut settings = cat.repo_settings(repo_id).await.unwrap();
-        settings.anonymous_access = true;
-        cat.set_repo_settings(repo_id, settings).await.unwrap();
-
-        // Normalised on the way in, and one repository per hostname.
-        let stored = cat
-            .set_custom_domain(repo_id, Some(&format!(" {}. ", domain.to_uppercase())))
-            .await
-            .unwrap();
-        assert_eq!(stored.as_deref(), Some(domain.as_str()));
-        assert!(matches!(
-            cat.set_custom_domain(other, Some(&domain)).await,
-            Err(sconce_catalog::CustomDomainError::Taken)
-        ));
-        for bad in [
-            "https://x.org",
-            "x.org:443",
-            "x.org/p",
-            "localhost",
-            "10.0.0.1",
-            "*.x.org",
-        ] {
-            assert!(
-                matches!(
-                    cat.set_custom_domain(other, Some(bad)).await,
-                    Err(sconce_catalog::CustomDomainError::Invalid)
-                ),
-                "{bad}"
-            );
-        }
-
-        let app = router(cat.clone(), store, "https://sconce.example".to_owned());
-        let send = async |method: Method, host: &str, path: &str| {
-            let req = Request::builder()
-                .method(method)
-                .uri(path)
-                .header(header::HOST, host)
-                .body(Body::empty())
-                .unwrap();
-            let r = app.clone().oneshot(req).await.unwrap();
-            let status = r.status();
-            let body = r.into_body().collect().await.unwrap().to_bytes();
-            (status, String::from_utf8_lossy(&body).into_owned())
-        };
-        let get = async |host: &str, path: &str| send(Method::GET, host, path).await;
-
-        // The root document, with its URLs on the domain (port kept).
-        let host = format!("{domain}:8443");
-        let (status, root) = get(&host, "/packages.json").await;
-        assert_eq!(status, StatusCode::OK, "{root}");
-        let root: serde_json::Value = serde_json::from_str(&root).unwrap();
-        assert_eq!(root["available-packages"], json!(["open/lib"]));
-        assert_eq!(
-            root["metadata-url"],
-            json!(format!("https://{host}/p2/%package%.json"))
-        );
-
-        // Package metadata: its dist URL is on the domain too, and serves.
-        let (status, doc) = get(&host, "/p2/open/lib.json").await;
-        assert_eq!(status, StatusCode::OK, "{doc}");
-        let doc: serde_json::Value = serde_json::from_str(&doc).unwrap();
-        let dist = doc["packages"]["open/lib"][0]["dist"]["url"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let prefix = format!("https://{host}/");
-        let dist_path = dist.strip_prefix(&prefix).expect("dist on the domain");
-        assert_eq!(get(&host, &format!("/{dist_path}")).await.0, StatusCode::OK);
-        // And the upstream's own dist path, for existing lock files.
-        let (status, body) = get(&domain, "/dist/open/lib/open-lib-1.0.0-abc.zip").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_bytes(), bytes.as_slice());
-
-        // Only the Composer read routes exist there: no publish, no slug paths.
-        let publish = "/packages/open/lib/2.0.0";
-        assert_eq!(
-            send(Method::PUT, &domain, publish).await.0,
-            StatusCode::METHOD_NOT_ALLOWED
-        );
-        assert_eq!(
-            get(&domain, &format!("/{slug}/r/packages.json")).await.0,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(get(&domain, "/healthz").await.0, StatusCode::OK);
-
-        // The main host and unknown hosts route by slug, as before.
-        for host in ["sconce.example", "other.example.org", "127.0.0.1:8080"] {
-            let (status, root) = get(host, &format!("/{slug}/r/packages.json")).await;
-            assert_eq!(status, StatusCode::OK, "{host}");
-            let root: serde_json::Value = serde_json::from_str(&root).unwrap();
-            assert_eq!(
-                root["metadata-url"],
-                json!(format!("https://sconce.example/{slug}/r/p2/%package%.json")),
-                "{host}"
-            );
-        }
-
-        // Cleared, the domain is just another unknown host.
-        assert_eq!(cat.set_custom_domain(repo_id, None).await.unwrap(), None);
-        assert_eq!(
-            get(&domain, "/packages.json").await.0,
-            StatusCode::NOT_FOUND
-        );
     }
 
     /// Anonymous access: off by default; when on, a request with no credential
