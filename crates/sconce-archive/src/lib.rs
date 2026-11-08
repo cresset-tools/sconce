@@ -18,8 +18,8 @@
 //! - **No extra fields** — in particular no extended-timestamp (`UT`) or Unix
 //!   uid/gid (`ux`) records, the usual silent nondeterminism.
 //! - **Canonical Unix modes** in the external attributes: regular files become
-//!   `0644`, executables `0755`, symlinks `0777` with the target as content.
-//!   Nothing else (git itself only tracks these).
+//!   `0644`, executables `0755`, symlinks `0777` with the target as content,
+//!   empty directories `0755`.
 //! - **Stored method (0), never compressed.** Compression is a *transport*
 //!   concern handled at the HTTP layer (`Content-Encoding: gzip`), so the hashed
 //!   artifact never depends on a DEFLATE implementation. This is the single
@@ -28,15 +28,23 @@
 //!
 //! # Layout note
 //!
-//! No wrapping top-level directory and no explicit directory entries: only files
-//! and symlinks are emitted, directories are implied by paths. (git tracks no
-//! empty directories, so nothing is lost, and it removes an ordering ambiguity.)
+//! No wrapping top-level directory. Directories are implied by paths, so a
+//! directory entry is written only for an **empty** directory (`path/`, no
+//! content), which would otherwise be lost on extraction. Callers may add every
+//! directory they see; [`CanonicalArchive::into_zip`] keeps just the empty ones,
+//! so the output depends only on the tree. An archive without empty directories
+//! is byte-identical to one built before directory entries existed.
+//!
+//! Empty directories matter to Composer packages: magento2-base's `extra.map`
+//! deploys `app/design/frontend/Magento` and the like, and the installer stops
+//! when a mapped source is missing from `vendor/`.
 
 #![forbid(unsafe_code)]
 
-/// The canonical kind + permission of an entry. These are exactly the modes git
-/// records in a tree (regular, regular+exec, symlink); anything else from a
-/// filesystem is normalized into one of these.
+/// The canonical kind + permission of an entry: the modes git records in a tree
+/// (regular, regular+exec, symlink), plus empty directories, which git cannot
+/// hold but a published tarball can. Anything else from a filesystem is
+/// normalized into one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Regular file → `0644`.
@@ -45,6 +53,9 @@ pub enum Mode {
     Executable,
     /// Symbolic link → `0777`; the entry's content is the (UTF-8) link target.
     Symlink,
+    /// Directory → `0755`, written as `path/` with no content, and only when
+    /// nothing else in the archive lives under it.
+    Dir,
 }
 
 impl Mode {
@@ -55,6 +66,7 @@ impl Mode {
             Mode::File => 0o100_644,
             Mode::Executable => 0o100_755,
             Mode::Symlink => 0o120_777,
+            Mode::Dir => 0o040_755,
         }
     }
 }
@@ -70,15 +82,34 @@ pub struct Entry {
 impl Entry {
     /// Create an entry. `path` is normalized to forward slashes with any
     /// leading `./` or `/` stripped; the original casing/bytes are otherwise
-    /// preserved (they participate in the canonical sort).
+    /// preserved (they participate in the canonical sort). A [`Mode::Dir`]
+    /// entry gets exactly one trailing `/` and no content.
     pub fn new(path: impl Into<String>, mode: Mode, content: impl Into<Vec<u8>>) -> Self {
         let raw = path.into();
         let norm = raw.replace('\\', "/");
         let norm = norm.trim_start_matches("./").trim_start_matches('/');
+        if mode == Mode::Dir {
+            return Self::dir(norm);
+        }
         Self {
             path: norm.to_owned(),
             mode,
             content: content.into(),
+        }
+    }
+
+    /// A directory entry (see [`Mode::Dir`]).
+    pub fn dir(path: impl Into<String>) -> Self {
+        let raw = path.into();
+        let norm = raw.replace('\\', "/");
+        let norm = norm
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        Self {
+            path: format!("{norm}/"),
+            mode: Mode::Dir,
+            content: Vec::new(),
         }
     }
 }
@@ -123,6 +154,25 @@ impl CanonicalArchive {
         // tree, which has unique paths.
         self.entries
             .sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        // Keep a directory entry only when it is empty. After the sort, anything
+        // under `d/` sorts directly after `d/` itself, so the next entry tells.
+        // Duplicates of the same directory collapse into one.
+        self.entries
+            .dedup_by(|b, a| a.mode == Mode::Dir && b.path == a.path);
+        let keep: Vec<bool> = (0..self.entries.len())
+            .map(|i| {
+                let e = &self.entries[i];
+                e.mode != Mode::Dir
+                    || self
+                        .entries
+                        .get(i + 1)
+                        .is_none_or(|next| !next.path.as_bytes().starts_with(e.path.as_bytes()))
+            })
+            .collect();
+        let mut keep = keep.into_iter();
+        self.entries.retain(|_| keep.next().unwrap_or(true));
+        // The root directory ("/") is never an entry.
+        self.entries.retain(|e| e.path != "/");
 
         let mut body = Vec::new(); // local headers + data, in order
         let mut central = Vec::new();
@@ -289,6 +339,55 @@ mod tests {
     fn deterministic_regardless_of_insertion_order() {
         // Identical content, opposite insertion order → identical bytes.
         assert_eq!(fixture(false).into_zip(), fixture(true).into_zip());
+    }
+
+    #[test]
+    fn only_empty_directories_are_written() {
+        let mut a = fixture(false);
+        a.add(Entry::dir("src")); // has files: dropped
+        a.add(Entry::dir("app/design/frontend/Magento")); // empty: kept
+        a.add(Entry::dir("app/design/frontend")); // only holds the empty dir: dropped
+        a.add(Entry::dir("app/design/frontend/Magento/")); // duplicate
+        a.add(Entry::new("./", Mode::Dir, Vec::new())); // root: dropped
+        let zip = a.into_zip();
+        let names = names(&zip);
+        assert!(names.contains(&"app/design/frontend/Magento/".to_owned()));
+        assert!(!names.contains(&"src/".to_owned()));
+        assert!(!names.contains(&"app/design/frontend/".to_owned()));
+        assert!(!names.contains(&"/".to_owned()));
+        assert_eq!(names.iter().filter(|n| n.ends_with('/')).count(), 1);
+    }
+
+    #[test]
+    fn directories_of_non_empty_paths_leave_the_bytes_unchanged() {
+        let mut a = fixture(false);
+        a.add(Entry::dir("src"));
+        a.add(Entry::dir("bin/"));
+        assert_eq!(a.into_zip(), fixture(false).into_zip());
+    }
+
+    #[test]
+    fn a_sibling_with_a_shared_prefix_does_not_hide_an_empty_directory() {
+        let mut a = CanonicalArchive::new();
+        a.add(Entry::dir("lib"));
+        a.add(Entry::new("lib-extra/x", Mode::File, b"x".to_vec()));
+        assert!(names(&a.into_zip()).contains(&"lib/".to_owned()));
+    }
+
+    /// Entry names from the central directory, in order.
+    fn names(zip: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 46 <= zip.len() {
+            if zip[i..i + 4] == [b'P', b'K', 0x01, 0x02] {
+                let n = usize::from(u16::from_le_bytes([zip[i + 28], zip[i + 29]]));
+                out.push(String::from_utf8(zip[i + 46..i + 46 + n].to_vec()).unwrap());
+                i += 46 + n;
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 
     #[test]

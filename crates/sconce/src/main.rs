@@ -4209,8 +4209,9 @@ fn archive(src: &Path, out: &Path) -> Result<()> {
 }
 
 /// Recursively collect files/symlinks under `dir` into `archive`, keyed by their
-/// path relative to `root`. Directory entries are not emitted (implied by
-/// paths). `.git` is skipped. Sorting/canonicalization happens in the archiver.
+/// path relative to `root`. Every directory is added too; the archiver keeps
+/// only the empty ones. `.git` is skipped. Sorting/canonicalization happens in
+/// the archiver.
 fn walk(root: &Path, dir: &Path, archive: &mut CanonicalArchive, count: &mut usize) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -4237,6 +4238,7 @@ fn walk(root: &Path, dir: &Path, archive: &mut CanonicalArchive, count: &mut usi
             ));
             *count += 1;
         } else if file_type.is_dir() {
+            archive.add(Entry::dir(rel));
             walk(root, &path, archive, count)?;
         } else if file_type.is_file() {
             let content = std::fs::read(&path)?;
