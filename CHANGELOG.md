@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.10.0...sconce-v0.10.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* **archive:** keep empty directories in package archives ([1b77cad](https://github.com/cresset-tools/sconce/commit/1b77cad8e276b01923205ee5b91f7415b6eefeb1))
+
 ## [0.10.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.9.0...sconce-v0.10.0) (2026-11-04)
 
 
