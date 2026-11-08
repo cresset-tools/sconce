@@ -458,6 +458,8 @@ fn archive_targz(
         }
 
         if kind.is_dir() {
+            // Kept only if empty (the archiver drops the rest).
+            archive.add(Entry::dir(rel));
             continue;
         }
         if kind.is_symlink() {
@@ -720,6 +722,48 @@ mod tests {
         assert_eq!(prepared.composer_json["name"], "acme/tool");
         // The blob was actually stored.
         assert!(store.exists(&BlobId::from_bytes(prepared.blob)).unwrap());
+    }
+
+    /// An empty directory survives the re-archive (Composer's magento2-base
+    /// deploys some from its `extra.map`); directories with content add nothing.
+    #[test]
+    fn archive_targz_keeps_empty_directories() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let cj = br#"{"name":"acme/tool"}"#;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut b = tar::Builder::new(&mut enc);
+            for dir in ["./", "./src/", "./app/design/frontend/Magento/"] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(0);
+                h.set_mode(0o755);
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_cksum();
+                b.append_data(&mut h, dir, &[][..]).unwrap();
+            }
+            for (path, content) in [("./composer.json", &cj[..]), ("./src/Foo.php", b"hi")] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(content.len() as u64);
+                h.set_mode(0o644);
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_cksum();
+                b.append_data(&mut h, path, content).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let tar = enc.finish().unwrap();
+        let store = tmp_store();
+        let prepared = archive_targz(&tar, "acme/tool", &store, 1 << 30).expect("archive");
+
+        let mut expected = CanonicalArchive::new();
+        expected.add(Entry::new("composer.json", Mode::File, cj.to_vec()));
+        expected.add(Entry::new("src/Foo.php", Mode::File, b"hi".to_vec()));
+        expected.add(Entry::dir("app/design/frontend/Magento"));
+        let expected_zip = expected.into_zip();
+        let needle = b"app/design/frontend/Magento/";
+        assert!(expected_zip.windows(needle.len()).any(|w| w == needle));
+        assert_eq!(&prepared.blob, BlobId::of(&expected_zip).as_bytes());
     }
 
     #[test]
