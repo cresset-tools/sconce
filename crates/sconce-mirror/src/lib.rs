@@ -239,20 +239,9 @@ async fn mirror_git_clone(
     key: Option<&SecretKey>,
     sub: &Subscription,
 ) -> Result<Report, Error> {
-    // Decrypt the credential (if any) to inject into the clone URL.
-    let credential = match up.credential.as_deref() {
-        None => None,
-        Some(ct) => Some(
-            key.ok_or(sconce_catalog::secret::SecretError::NoKey)?
-                .decrypt(ct)?,
-        ),
-    };
-    let credential = credential
-        .as_deref()
-        .map(|b| String::from_utf8_lossy(b).into_owned());
-
+    let credential = decrypt_credential(up, key)?;
     let checkout = TempCheckout::clone_repo(&up.base, credential.as_deref(), &up.credential_type)?;
-    mirror_checkout(
+    let report = mirror_checkout(
         up.repo_id,
         checkout.path(),
         &up.base,
@@ -263,7 +252,119 @@ async fn mirror_git_clone(
         store,
         catalog,
     )
-    .await
+    .await?;
+    // Remember the tag set just mirrored, read from the clone itself so a tag
+    // pushed after the clone still counts as a change at the next check.
+    let digest = tags_digest(&checkout.path().to_string_lossy(), &[])?;
+    catalog
+        .set_upstream_synced_refs(up.id, &digest)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
+    Ok(report)
+}
+
+/// The upstream's decrypted credential, if it has one.
+fn decrypt_credential(
+    up: &sconce_catalog::UpstreamRow,
+    key: Option<&SecretKey>,
+) -> Result<Option<String>, Error> {
+    let Some(ct) = up.credential.as_deref() else {
+        return Ok(None);
+    };
+    let plain = key
+        .ok_or(sconce_catalog::secret::SecretError::NoKey)?
+        .decrypt(ct)?;
+    Ok(Some(String::from_utf8_lossy(&plain).into_owned()))
+}
+
+/// Whether a git upstream's tags differ from the set its last mirror saw —
+/// one `git ls-remote`, no clone. An upstream never mirrored has changed.
+pub fn git_upstream_changed(
+    up: &sconce_catalog::UpstreamRow,
+    synced_refs: Option<&str>,
+    key: Option<&SecretKey>,
+) -> Result<bool, Error> {
+    let credential = decrypt_credential(up, key)?;
+    let (url, pre_args) =
+        build_clone_invocation(&up.base, credential.as_deref(), &up.credential_type);
+    let digest = tags_digest(&url, &pre_args).map_err(|e| match (e, credential.as_deref()) {
+        (Error::Clone(msg), Some(cred)) => Error::Clone(msg.replace(cred, "***")),
+        (e, _) => e,
+    })?;
+    Ok(synced_refs != Some(digest.as_str()))
+}
+
+/// A digest of a repository's tags: each tag name with the commit it points
+/// at (annotated tags peeled), sorted. Equal digests mean the same versions.
+/// `target` is a URL or a local path; `pre_args` go before the subcommand.
+fn tags_digest(target: &str, pre_args: &[String]) -> Result<String, Error> {
+    let out = git_command()
+        .args(pre_args)
+        .args(["ls-remote", "--tags", target])
+        .output()
+        .map_err(|e| Error::Clone(format!("spawning git: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Clone(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(digest_ls_remote(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Digest `git ls-remote --tags` output (see [`tags_digest`]).
+fn digest_ls_remote(output: &str) -> String {
+    use sha1::{Digest, Sha1};
+    use std::fmt::Write as _;
+    let mut tags = std::collections::BTreeMap::new();
+    for line in output.lines() {
+        let Some((oid, name)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(name) = name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        match name.strip_suffix("^{}") {
+            // The peeled commit of an annotated tag wins over the tag object.
+            Some(tag) => {
+                tags.insert(tag.to_owned(), oid.to_owned());
+            }
+            None => {
+                tags.entry(name.to_owned())
+                    .or_insert_with(|| oid.to_owned());
+            }
+        }
+    }
+    let mut hasher = Sha1::new();
+    for (name, oid) in &tags {
+        hasher.update(format!("{name} {oid}\n"));
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(40), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// `git` that never waits on a person or a dead connection: no credential
+/// prompt (a missing or wrong credential fails at once), no interactive ssh,
+/// and a transfer that stalls for 30 seconds is aborted.
+fn git_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0").args([
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=30",
+    ]);
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=20",
+        );
+    }
+    cmd
 }
 
 /// Largest dist we'll download from a Composer upstream (guards against a
@@ -450,7 +551,15 @@ async fn mirror_one_composer_package_inner(
     // p2 metadata: {base}/p2/{vendor}/{name}.json (the standard metadata-url).
     let base = up.base.trim_end_matches('/');
     let meta_url = format!("{base}/p2/{package}.json");
-    let body = http_get_string(&meta_url)?;
+    // Ask only for what changed since the last complete sync of this package:
+    // an unchanged document is a 304, and there is nothing to do.
+    let previous = catalog
+        .upstream_validator(up.id, &meta_url)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
+    let Some((body, validator)) = http_get_if_changed(&meta_url, previous.as_ref())? else {
+        return Ok(Report::default());
+    };
     // Parse + apply composer/2.0 minified-expansion. Packagist and many mirrors
     // serve minified p2 documents; the previous hand-rolled parse read the raw
     // sparse-diff entries verbatim and mis-read every entry after the first.
@@ -607,6 +716,12 @@ async fn mirror_one_composer_package_inner(
             stability,
         });
     }
+    // Every version is handled (a failed download returned early above), so
+    // the next sync may skip this document until it changes.
+    catalog
+        .set_upstream_validator(up.id, &meta_url, &validator)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
     Ok(report)
 }
 
@@ -812,6 +927,35 @@ fn http_get_string(url: &str) -> Result<String, Error> {
         .map_err(|e| http_error(url, e))?
         .into_string()
         .map_err(|e| Error::Http(format!("{url}: {e}")))
+}
+
+/// GET `url`, conditionally when `previous` holds validators. `None` means the
+/// server answered 304 Not Modified; otherwise the body and its validators.
+fn http_get_if_changed(
+    url: &str,
+    previous: Option<&sconce_catalog::HttpValidator>,
+) -> Result<Option<(String, sconce_catalog::HttpValidator)>, Error> {
+    let mut req = ureq::get(url);
+    if let Some(prev) = previous {
+        if let Some(etag) = &prev.etag {
+            req = req.set("If-None-Match", etag);
+        }
+        if let Some(last_modified) = &prev.last_modified {
+            req = req.set("If-Modified-Since", last_modified);
+        }
+    }
+    let resp = req.call().map_err(|e| http_error(url, e))?;
+    if resp.status() == 304 {
+        return Ok(None);
+    }
+    let validator = sconce_catalog::HttpValidator {
+        etag: resp.header("ETag").map(str::to_owned),
+        last_modified: resp.header("Last-Modified").map(str::to_owned),
+    };
+    let body = resp
+        .into_string()
+        .map_err(|e| Error::Http(format!("{url}: {e}")))?;
+    Ok(Some((body, validator)))
 }
 
 fn http_get_bytes(url: &str) -> Result<Vec<u8>, Error> {
@@ -1033,7 +1177,7 @@ impl TempCheckout {
         let mut dir = std::env::temp_dir();
         dir.push(format!("sconce-clone-{}", Uuid::new_v4()));
         let (url, pre_args) = build_clone_invocation(base, credential, credential_type);
-        let out = std::process::Command::new("git")
+        let out = git_command()
             .args(&pre_args)
             .args(["clone", "--quiet", &url])
             .arg(&dir)
@@ -1848,6 +1992,9 @@ mod tests {
         base: String,
         routes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
         hits: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+        /// When on, responses carry an `ETag` and a matching `If-None-Match`
+        /// gets a 304 (off by default, like a static registry without one).
+        etags: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FixtureServer {
@@ -1864,7 +2011,8 @@ mod tests {
                 String,
                 usize,
             >::new()));
-            let (r, h) = (routes.clone(), hits.clone());
+            let etags = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (r, h, e) = (routes.clone(), hits.clone(), etags.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
@@ -1873,9 +2021,16 @@ mod tests {
                     if reader.read_line(&mut request_line).is_err() {
                         continue;
                     }
-                    // Drain the headers; fixture requests never carry a body.
+                    // Read the headers (keeping If-None-Match); fixture requests
+                    // never carry a body.
+                    let mut if_none_match = None;
                     let mut line = String::new();
                     while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.eq_ignore_ascii_case("if-none-match")
+                        {
+                            if_none_match = Some(v.trim().to_owned());
+                        }
                         line.clear();
                     }
                     let path = request_line
@@ -1884,11 +2039,20 @@ mod tests {
                         .unwrap_or("/")
                         .to_owned();
                     *h.lock().unwrap().entry(path.clone()).or_default() += 1;
-                    let body = r.lock().unwrap().get(&path).cloned();
+                    let mut body = r.lock().unwrap().get(&path).cloned();
+                    let etag = body
+                        .as_ref()
+                        .filter(|_| e.load(std::sync::atomic::Ordering::SeqCst))
+                        .map(|b| format!("\"{}\"", sha1_hex(b)));
                     let head = match &body {
+                        Some(_) if etag.is_some() && etag == if_none_match => {
+                            body = None;
+                            "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_owned()
+                        }
                         Some(b) => format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            b.len()
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+                            b.len(),
+                            etag.map(|t| format!("ETag: {t}\r\n")).unwrap_or_default()
                         ),
                         None => {
                             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1901,7 +2065,16 @@ mod tests {
                     }
                 }
             });
-            Self { base, routes, hits }
+            Self {
+                base,
+                routes,
+                hits,
+                etags,
+            }
+        }
+
+        fn enable_etags(&self) {
+            self.etags.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn set(&self, path: &str, body: impl Into<Vec<u8>>) {
@@ -2368,5 +2541,201 @@ mod tests {
             upstream_relative_path(base, "https://repo.mage-os.org/"),
             None
         );
+    }
+
+    #[test]
+    fn tag_digest_peels_annotated_tags_and_ignores_order() {
+        let a = "1111\trefs/tags/v1.0.0\n2222\trefs/tags/v1.1.0\n3333\trefs/tags/v1.1.0^{}\n";
+        let b = "3333\trefs/tags/v1.1.0^{}\n2222\trefs/tags/v1.1.0\n1111\trefs/tags/v1.0.0\n";
+        assert_eq!(
+            digest_ls_remote(a),
+            digest_ls_remote(b),
+            "order does not matter"
+        );
+        // A lightweight tag on the same commit is the same version.
+        let light = "1111\trefs/tags/v1.0.0\n3333\trefs/tags/v1.1.0\n";
+        assert_eq!(digest_ls_remote(a), digest_ls_remote(light));
+        let moved = "1111\trefs/tags/v1.0.0\n4444\trefs/tags/v1.1.0\n";
+        assert_ne!(
+            digest_ls_remote(a),
+            digest_ls_remote(moved),
+            "a moved tag is a change"
+        );
+        assert_ne!(
+            digest_ls_remote(a),
+            digest_ls_remote("1111\trefs/tags/v1.0.0\n")
+        );
+    }
+
+    /// The scheduler's git check: an upstream never mirrored has changed; after
+    /// a mirror it hasn't, until a tag is added or moved.
+    #[tokio::test]
+    async fn git_upstream_changes_until_mirrored_then_on_a_new_or_moved_tag() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let slug = format!("gchk{}", std::process::id());
+        catalog.create_org(&slug, None).await.unwrap();
+        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
+        let name = format!("acme/chk-{}", std::process::id());
+        let dir = fixture_repo(&name);
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+        let up_id = catalog
+            .create_upstream(
+                repo_id,
+                "git",
+                &dir.to_string_lossy(),
+                Visibility::Public,
+                None,
+                None,
+                "basic",
+            )
+            .await
+            .unwrap();
+        let changed = |refs: Option<String>| {
+            let catalog = catalog.clone();
+            async move {
+                let up = catalog.get_upstream(up_id).await.unwrap().unwrap();
+                git_upstream_changed(&up, refs.as_deref(), None).unwrap()
+            }
+        };
+
+        assert!(changed(None).await, "never mirrored");
+        mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        let refs = catalog.upstream_synced_refs(up_id).await.unwrap();
+        assert!(refs.is_some(), "the mirror records what it saw");
+        assert!(!changed(refs.clone()).await, "nothing changed since");
+
+        // An annotated tag for a new version.
+        std::fs::write(
+            dir.join("composer.json"),
+            serde_json::to_vec(&serde_json::json!({"name": name, "version": "1.2.0"})).unwrap(),
+        )
+        .unwrap();
+        git(&dir, &["commit", "-qam", "v1.2"]);
+        git(&dir, &["tag", "-a", "-m", "1.2.0", "v1.2.0"]);
+        assert!(changed(refs).await, "a new tag is a change");
+        mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        let refs = catalog.upstream_synced_refs(up_id).await.unwrap();
+        assert!(
+            !changed(refs.clone()).await,
+            "the clone's digest matches ls-remote's"
+        );
+
+        // Moving an existing tag is a change too.
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "later"]);
+        git(&dir, &["tag", "-f", "v1.0.0"]);
+        assert!(changed(refs).await, "a moved tag is a change");
+
+        // A new require-list forgets the sync state, so everything is mirrored again.
+        catalog
+            .set_upstream_requires(
+                repo_id,
+                up_id,
+                &[sconce_catalog::UpstreamRequire::parse("*@1.1").unwrap()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog.upstream_synced_refs(up_id).await.unwrap(), None);
+
+        std::fs::remove_dir_all(&cas).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With an `ETag`, re-syncing an unchanged package is one 304: no parsing,
+    /// no download. A changed document is fetched and mirrored again.
+    #[tokio::test]
+    async fn composer_resync_of_an_unchanged_package_is_one_conditional_request() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let server = FixtureServer::start();
+        server.enable_etags();
+        let (repo_id, up) = composer_fixture_repo(&catalog, &server, "etag").await;
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+
+        let name = "acme/etag";
+        let zip1 = b"PK\x03\x04etag-1.0.0".to_vec();
+        let zip2 = b"PK\x03\x04etag-1.1.0".to_vec();
+        server.set("/dist/acme/etag-1.0.0.zip", zip1.clone());
+        server.set("/dist/acme/etag-1.1.0.zip", zip2.clone());
+        let v1 = p2_version(
+            &server,
+            name,
+            "1.0.0",
+            "/dist/acme/etag-1.0.0.zip",
+            &sha1_hex(&zip1),
+        );
+        server.set(
+            "/p2/acme/etag.json",
+            p2_document(name, std::slice::from_ref(&v1)),
+        );
+
+        let first = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(first.mirrored.len(), 1);
+        let meta_url = format!("{}/p2/acme/etag.json", server.base);
+        assert!(
+            catalog
+                .upstream_validator(up, &meta_url)
+                .await
+                .unwrap()
+                .is_some(),
+            "the ETag is remembered after a complete sync"
+        );
+
+        let second = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert!(
+            second.mirrored.is_empty() && second.unchanged == 0,
+            "304: nothing looked at"
+        );
+        assert_eq!(server.hits("/p2/acme/etag.json"), 2);
+        assert_eq!(server.hits("/dist/acme/etag-1.0.0.zip"), 1);
+
+        let v2 = p2_version(
+            &server,
+            name,
+            "1.1.0",
+            "/dist/acme/etag-1.1.0.zip",
+            &sha1_hex(&zip2),
+        );
+        server.set("/p2/acme/etag.json", p2_document(name, &[v1, v2]));
+        let third = mirror_composer_package(&catalog, &store, up, name)
+            .await
+            .unwrap();
+        assert_eq!(third.mirrored.len(), 1, "the new version is mirrored");
+        assert_eq!(third.unchanged, 1);
+
+        // A new require-list forgets the validators.
+        catalog
+            .set_upstream_requires(
+                repo_id,
+                up,
+                &[sconce_catalog::UpstreamRequire::parse("acme/*").unwrap()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .upstream_validator(up, &meta_url)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(&cas).ok();
     }
 }

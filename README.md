@@ -51,6 +51,15 @@ Then in the UI: create an org + repo, add an upstream (a git URL or a Composer
 registry like `https://repo.mage-os.org` with a `^vendor/` match), hit **Sync**,
 and add a read token — the install snippet is shown on the token page.
 
+After that the worker keeps upstreams in sync by itself. Every two minutes it
+asks each git upstream for its tags (`git ls-remote`, no clone) and mirrors it
+only when a tag was added or moved. Every ten minutes it re-syncs each Composer
+upstream, fetching package metadata conditionally so an unchanged package costs
+one `304`. Change the intervals with `--git-check-interval` and
+`--composer-sync-interval` (seconds; `0` turns that kind off) on `serve` or
+`worker`. An upstream whose check fails is retried later and later, up to once
+an hour.
+
 Config is environment-based (12-factor): `DATABASE_URL`, `SCONCE_ADMIN_PASSWORD`,
 and `SCONCE_SECRET_KEY` (base64 of 32 bytes; needed only to store *private*
 upstream credentials). Run a dedicated worker instead of the in-process one with

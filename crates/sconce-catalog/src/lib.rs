@@ -449,6 +449,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0060_repo_members",
         include_str!("../migrations/0060_repo_members.sql"),
     ),
+    (
+        "0061_upstream_sync_schedule",
+        include_str!("../migrations/0061_upstream_sync_schedule.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -843,6 +847,41 @@ pub struct DependencyPlanEntry {
     pub status: String,
     pub resolver_upstream_id: Option<Uuid>,
     pub required_by: Option<String>,
+}
+
+/// An upstream whose scheduled check is due (see [`Catalog::claim_due_upstreams`]).
+#[derive(Debug, Clone)]
+pub struct DueUpstream {
+    pub id: Uuid,
+    pub kind: String,
+    /// git: digest of the tag set the last successful mirror saw (`None` = never).
+    pub synced_refs: Option<String>,
+    /// Whether the upstream has a require-list (a composer one can't sync without).
+    pub has_requires: bool,
+}
+
+/// HTTP validators of an upstream response, for a conditional request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpValidator {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// Forget what the last sync of an upstream saw (its git tag digest and HTTP
+/// validators), so the next check mirrors it in full.
+async fn forget_sync_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    upstream_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("update upstreams set synced_refs = null where id = $1")
+        .bind(upstream_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("delete from upstream_validators where upstream_id = $1")
+        .bind(upstream_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// An upstream loaded for mirroring — includes the encrypted credential blob.
@@ -5185,6 +5224,9 @@ impl Catalog {
             .execute(&mut *tx)
             .await?;
         }
+        // A new require-list can take in versions the last sync skipped, so
+        // forget what that sync saw: the next check mirrors everything again.
+        forget_sync_state(&mut tx, upstream_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5271,6 +5313,7 @@ impl Catalog {
             .execute(&mut *tx)
             .await?;
         }
+        forget_sync_state(&mut tx, upstream_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5404,6 +5447,164 @@ impl Catalog {
         )
         .bind(job_id)
         .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Claim up to `limit` upstreams whose check is due and move each one's
+    /// next check a full interval ahead (±10% jitter, so upstreams added
+    /// together drift apart), before checking them. Rows are claimed with
+    /// `skip locked`, so several workers never check the same upstream twice.
+    /// An interval of `None` leaves that kind of upstream unscheduled.
+    pub async fn claim_due_upstreams(
+        &self,
+        limit: i64,
+        git_interval_secs: Option<f64>,
+        composer_interval_secs: Option<f64>,
+    ) -> Result<Vec<DueUpstream>, sqlx::Error> {
+        let rows: Vec<(Uuid, String, Option<String>, bool)> = sqlx::query_as(
+            "update upstreams u set \
+                 next_check_at = now() + make_interval(secs => \
+                     (case u.kind when 'git' then $2 else $3 end) * (0.9 + random() * 0.2)) \
+             where u.id in ( \
+                 select id from upstreams \
+                 where next_check_at <= now() \
+                   and ((kind = 'git' and $2 is not null) or (kind = 'composer' and $3 is not null)) \
+                 order by next_check_at \
+                 for update skip locked \
+                 limit $1) \
+             returning u.id, u.kind, u.synced_refs, \
+                 exists (select 1 from upstream_requires r where r.upstream_id = u.id)",
+        )
+        .bind(limit)
+        .bind(git_interval_secs)
+        .bind(composer_interval_secs)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, synced_refs, has_requires)| DueUpstream {
+                id,
+                kind,
+                synced_refs,
+                has_requires,
+            })
+            .collect())
+    }
+
+    /// Record a check that succeeded (whether or not it queued a mirror).
+    pub async fn record_upstream_check_ok(&self, upstream_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update upstreams set last_checked_at = now(), check_failures = 0, \
+                 last_check_error = null \
+             where id = $1",
+        )
+        .bind(upstream_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a failed check. Each consecutive failure doubles the wait before
+    /// the next one (from `interval_secs`, capped at an hour), so an upstream
+    /// that is down or gone isn't hammered.
+    pub async fn record_upstream_check_failed(
+        &self,
+        upstream_id: Uuid,
+        interval_secs: f64,
+        error: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update upstreams set last_checked_at = now(), \
+                 check_failures = check_failures + 1, last_check_error = $3, \
+                 next_check_at = now() + make_interval(secs => \
+                     least($2 * power(2, least(check_failures + 1, 20)), 3600)) \
+             where id = $1",
+        )
+        .bind(upstream_id)
+        .bind(interval_secs)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The tag-set digest of the last successful git mirror (`None` = never).
+    pub async fn upstream_synced_refs(
+        &self,
+        upstream_id: Uuid,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, Option<String>>("select synced_refs from upstreams where id = $1")
+            .bind(upstream_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(Option::flatten)
+    }
+
+    /// Store the tag-set digest a git mirror just mirrored, so the next check
+    /// can tell whether anything changed since.
+    pub async fn set_upstream_synced_refs(
+        &self,
+        upstream_id: Uuid,
+        digest: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("update upstreams set synced_refs = $2 where id = $1")
+            .bind(upstream_id)
+            .bind(digest)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The validators (`ETag`, `Last-Modified`) of the last response from
+    /// `url` that was processed successfully, for a conditional request.
+    pub async fn upstream_validator(
+        &self,
+        upstream_id: Uuid,
+        url: &str,
+    ) -> Result<Option<HttpValidator>, sqlx::Error> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "select etag, last_modified from upstream_validators \
+             where upstream_id = $1 and url = $2",
+        )
+        .bind(upstream_id)
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(etag, last_modified)| HttpValidator {
+            etag,
+            last_modified,
+        }))
+    }
+
+    /// Remember the validators of a response from `url` once it has been
+    /// processed in full. A response without any validator clears the entry.
+    pub async fn set_upstream_validator(
+        &self,
+        upstream_id: Uuid,
+        url: &str,
+        validator: &HttpValidator,
+    ) -> Result<(), sqlx::Error> {
+        if validator.etag.is_none() && validator.last_modified.is_none() {
+            sqlx::query("delete from upstream_validators where upstream_id = $1 and url = $2")
+                .bind(upstream_id)
+                .bind(url)
+                .execute(&self.pool)
+                .await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "insert into upstream_validators (upstream_id, url, etag, last_modified) \
+             values ($1, $2, $3, $4) \
+             on conflict (upstream_id, url) do update set \
+                 etag = excluded.etag, last_modified = excluded.last_modified, \
+                 updated_at = now()",
+        )
+        .bind(upstream_id)
+        .bind(url)
+        .bind(validator.etag.as_deref())
+        .bind(validator.last_modified.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -9677,6 +9878,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id1, id2, "same email = same user");
+    }
+
+    #[tokio::test]
+    async fn due_upstreams_are_claimed_once_per_interval_and_back_off_on_failure() {
+        let Some((cat, repo_id)) = repo().await else {
+            return;
+        };
+        let add = |kind: &'static str| {
+            let cat = cat.clone();
+            async move {
+                cat.create_upstream(
+                    repo_id,
+                    kind,
+                    "https://example.test/x",
+                    Visibility::Public,
+                    None,
+                    None,
+                    "basic",
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let git = add("git").await;
+        let composer = add("composer").await;
+        let next_check = |id: Uuid| {
+            let cat = cat.clone();
+            async move {
+                sqlx::query_scalar::<_, f64>(
+                    "select extract(epoch from next_check_at - now())::float8 \
+                     from upstreams where id = $1",
+                )
+                .bind(id)
+                .fetch_one(&cat.pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // New upstreams are due at once. Composer syncs are off here, so only
+        // the git one is claimed; other tests' upstreams may come along too.
+        let due = cat
+            .claim_due_upstreams(10_000, Some(120.0), None)
+            .await
+            .unwrap();
+        assert!(due.iter().any(|d| d.id == git && d.synced_refs.is_none()));
+        assert!(due.iter().all(|d| d.id != composer));
+        let ahead = next_check(git).await;
+        assert!(
+            (100.0..=140.0).contains(&ahead),
+            "a full interval ahead: {ahead}"
+        );
+
+        // Claimed once per interval.
+        let again = cat
+            .claim_due_upstreams(10_000, Some(120.0), Some(600.0))
+            .await
+            .unwrap();
+        assert!(again.iter().all(|d| d.id != git));
+        let c = again
+            .iter()
+            .find(|d| d.id == composer)
+            .expect("composer due");
+        assert!(!c.has_requires);
+
+        // Failures double the wait, capped at an hour.
+        cat.record_upstream_check_failed(git, 120.0, "boom")
+            .await
+            .unwrap();
+        let after_one = next_check(git).await;
+        assert!(
+            (230.0..=250.0).contains(&after_one),
+            "2× interval: {after_one}"
+        );
+        for _ in 0..10 {
+            cat.record_upstream_check_failed(git, 120.0, "boom")
+                .await
+                .unwrap();
+        }
+        assert!(next_check(git).await <= 3600.0, "capped at an hour");
+        cat.record_upstream_check_ok(git).await.unwrap();
+        let (failures, error): (i32, Option<String>) =
+            sqlx::query_as("select check_failures, last_check_error from upstreams where id = $1")
+                .bind(git)
+                .fetch_one(&cat.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (failures, error),
+            (0, None),
+            "a good check resets the failures"
+        );
+
+        // Validators: stored, replaced, and cleared by an empty one.
+        let v = HttpValidator {
+            etag: Some("\"a\"".to_owned()),
+            last_modified: None,
+        };
+        cat.set_upstream_validator(composer, "u", &v).await.unwrap();
+        assert_eq!(
+            cat.upstream_validator(composer, "u").await.unwrap(),
+            Some(v)
+        );
+        cat.set_upstream_validator(composer, "u", &HttpValidator::default())
+            .await
+            .unwrap();
+        assert_eq!(cat.upstream_validator(composer, "u").await.unwrap(), None);
     }
 
     #[tokio::test]
