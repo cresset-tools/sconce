@@ -1,19 +1,5 @@
 # Changelog
 
-## [0.11.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.10.1...sconce-v0.11.0) (2026-11-11)
-
-
-### Features
-
-* **sconce:** keep git-mirrored versions when a tag moves ([5217487](https://github.com/cresset-tools/sconce/commit/5217487c30024710610d67a9364f3838e1da05ac))
-* **sconce:** sync upstreams automatically ([ddd8969](https://github.com/cresset-tools/sconce/commit/ddd896904e9cf6ed5db763d724339b73bc33527c))
-* **sconce:** use a GitHub token for GitHub upstreams ([0798b52](https://github.com/cresset-tools/sconce/commit/0798b52a5c955ad3a3f07179c6d46de99a14321d))
-
-
-### Bug Fixes
-
-* **console:** return to the page you were on after signing in ([2c0f662](https://github.com/cresset-tools/sconce/commit/2c0f662e7d354428551d34a0df50676b525b5119))
-
 ## [0.10.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.10.0...sconce-v0.10.1) (2026-11-08)
 
 
