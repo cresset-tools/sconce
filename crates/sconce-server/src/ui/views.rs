@@ -428,34 +428,6 @@ pub struct DeviceApproved {
     pub org: String,
 }
 
-/// `/authorize` — approve a `bougie login` authorization-code request: pick
-/// which org the CLI's read token should cover. The request's parameters ride
-/// along as hidden fields and are checked again on submit.
-#[derive(Template)]
-#[template(path = "authorize.html")]
-pub struct Authorize {
-    pub client_id: String,
-    pub redirect_uri: String,
-    pub code_challenge: String,
-    pub state: String,
-    /// Orgs the approver may scope the token to (member or above).
-    pub orgs: Vec<DeviceOrg>,
-    /// The code goes straight to the CLI's loopback listener, rather than to
-    /// the paste page.
-    pub loopback: bool,
-}
-
-/// The paste page `/authorize` redirects to when the CLI can't listen
-/// locally: shows `code#state` to copy into the terminal, or the error.
-#[derive(Template)]
-#[template(path = "authorize_code.html")]
-pub struct AuthorizeCode {
-    /// What to paste; empty when `error` is set.
-    pub code: String,
-    /// An RFC 6749 error code (`access_denied`, …), or empty.
-    pub error: String,
-}
-
 /// One version row in the package detail table.
 pub struct VersionRow {
     pub version: String,
@@ -756,8 +728,6 @@ pub struct RepoPage {
     pub total_versions: i64,
     pub policy_phrase: String,
     pub broken_count: usize,
-    /// Versions whose upstream changed after they were mirrored (kept as stored).
-    pub conflicts: Vec<sconce_catalog::VersionConflict>,
     pub read_only: bool,
     pub filtering: bool,
     pub approvals_count: i64,
@@ -919,7 +889,6 @@ mod tests {
             total_versions: 0,
             policy_phrase: "manual approval required".to_owned(),
             broken_count: 0,
-            conflicts: Vec::new(),
             read_only: false,
             filtering: false,
             approvals_count: 0,

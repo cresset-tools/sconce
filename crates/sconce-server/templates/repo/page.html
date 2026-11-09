@@ -6,7 +6,7 @@
       {% if private_packages %}<span class="badge slate">private packages</span>{% else %}<span class="badge blue">public-only</span>{% endif %}
       <span class="badge {{ sync_tone }}">{{ sync_label }}</span>
     </div>
-    <p class=sub>{{ pkg_count }} package(s) · {{ total_versions }} version(s) · {{ policy_phrase }}{% if broken_count > 0 %} · <span style="color:#a82c20">{{ broken_count }} can't sync</span>{% endif %}{% if !conflicts.is_empty() %} · <span style="color:#a82c20">{{ conflicts.len() }} changed upstream</span>{% endif %}</p>
+    <p class=sub>{{ pkg_count }} package(s) · {{ total_versions }} version(s) · {{ policy_phrase }}{% if broken_count > 0 %} · <span style="color:#a82c20">{{ broken_count }} can't sync</span>{% endif %}</p>
   </div>
   <div class=acts>
     <a class=btn href="/r/{{ org }}/{{ repo }}/settings">Settings</a>
@@ -40,10 +40,7 @@
 {# ---------- Overview ---------- #}
 <div class="tabpanel t-overview">
   {% if broken_count > 0 %}
-    <p class=banner><span>⚠ {{ broken_count }} package(s) can't sync — they keep serving their existing versions, but won't get new ones until fixed. See the <label for=rt-approvals style="color:inherit;cursor:pointer;font-weight:700;text-decoration:underline">Approvals</label> tab.</span></p>
-  {% endif %}
-  {% if !conflicts.is_empty() %}
-    <p class=banner><span>⚠ {{ conflicts.len() }} version(s) changed upstream after they were mirrored — a tag was moved or its files replaced. This repository keeps serving each version as first mirrored, so installs and lock files are unaffected. See the <label for=rt-approvals style="color:inherit;cursor:pointer;font-weight:700;text-decoration:underline">Approvals</label> tab.</span></p>
+    <p class=banner>⚠ {{ broken_count }} package(s) can't sync — they keep serving their existing versions, but won't get new ones until fixed. See the <label for=rt-approvals style="color:inherit;cursor:pointer;font-weight:700;text-decoration:underline">Approvals</label> tab.</p>
   {% endif %}
   <div class=ovgrid>
     <div>
@@ -284,25 +281,6 @@
       {% endif %}
     </div>
   </div>
-  {% endif %}
-
-  {# versions whose upstream changed after they were mirrored #}
-  {% if !conflicts.is_empty() %}
-    <h2 id=changed>Changed upstream</h2>
-    <p class=muted>The upstream now serves something else under these versions. Each keeps the content it was first mirrored with; ask the upstream to release the change as a new version. A warning clears by itself once the upstream matches again.</p>
-    <table>
-      <tr><th>Package</th><th>Version</th><th>What changed</th><th>Upstream</th><th>First seen</th><th>Last seen</th></tr>
-      {% for c in conflicts %}
-        <tr>
-          <td>{{ c.package }}</td>
-          <td><span class="badge amber">{{ c.version }}</span></td>
-          <td class=muted>{{ c.reason }}</td>
-          <td class=muted>{% if let Some(u) = c.upstream %}{{ u }}{% else %}—{% endif %}</td>
-          <td class=muted>{{ c.detected_at }}</td>
-          <td class=muted>{{ c.last_seen_at }}</td>
-        </tr>
-      {% endfor %}
-    </table>
   {% endif %}
 
   {# package sync-health (broken / stale / archived) #}
