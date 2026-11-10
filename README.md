@@ -66,16 +66,6 @@ git upstreams on `https://github.com` without a credential of their own use it,
 and so do dist downloads from `api.github.com` (where Packagist's zipballs
 live). It is sent to those two hosts only.
 
-A Composer upstream behind a login (Private Packagist, a vendor's paid
-registry) takes `--credential` like a git one: `user:password` as HTTP basic
-auth (Private Packagist's is `token:<key>`), or a token with `--credential-type`
-`bearer`, `github` or `gitlab` (sent in GitLab's `PRIVATE-TOKEN` header).
-It is sent only to the upstream's own scheme, host and port, never to dists
-hosted elsewhere. A registry that lists its packages at `list.json` instead of
-`available-packages`, as Packagist does, is enumerated from there. Visibility
-stays a licensing choice: an upstream that needs a login can still be public
-when its packages may be redistributed.
-
 Config is environment-based (12-factor): `DATABASE_URL`, `SCONCE_ADMIN_PASSWORD`,
 and `SCONCE_SECRET_KEY` (base64 of 32 bytes; needed only to store *private*
 upstream credentials). Run a dedicated worker instead of the in-process one with

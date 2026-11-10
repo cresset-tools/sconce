@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.1" # x-release-please-version
+version = "0.10.1" # x-release-please-version
 edition = "2024"
 rust-version = "1.96"
 # EUPL-1.2, like the rest of the cresset-tools family. Chosen deliberately over
@@ -32,13 +32,13 @@ repository = "https://github.com/cresset-tools/sconce"
 # lack a version). The trailing release-please marker lets the tool rewrite
 # all of them in lockstep with `[workspace.package].version` above.
 [workspace.dependencies]
-sconce-archive = { path = "crates/sconce-archive", version = "0.12.1" } # x-release-please-version
-sconce-cas = { path = "crates/sconce-cas", version = "0.12.1" } # x-release-please-version
-sconce-catalog = { path = "crates/sconce-catalog", version = "0.12.1" } # x-release-please-version
-sconce-git = { path = "crates/sconce-git", version = "0.12.1" } # x-release-please-version
-sconce-metadata = { path = "crates/sconce-metadata", version = "0.12.1" } # x-release-please-version
-sconce-mirror = { path = "crates/sconce-mirror", version = "0.12.1" } # x-release-please-version
-sconce-server = { path = "crates/sconce-server", version = "0.12.1" } # x-release-please-version
+sconce-archive = { path = "crates/sconce-archive", version = "0.10.1" } # x-release-please-version
+sconce-cas = { path = "crates/sconce-cas", version = "0.10.1" } # x-release-please-version
+sconce-catalog = { path = "crates/sconce-catalog", version = "0.10.1" } # x-release-please-version
+sconce-git = { path = "crates/sconce-git", version = "0.10.1" } # x-release-please-version
+sconce-metadata = { path = "crates/sconce-metadata", version = "0.10.1" } # x-release-please-version
+sconce-mirror = { path = "crates/sconce-mirror", version = "0.10.1" } # x-release-please-version
+sconce-server = { path = "crates/sconce-server", version = "0.10.1" } # x-release-please-version
 
 # Shared external deps.
 anyhow = "1"
@@ -49,7 +49,6 @@ composer-semver = "0.1.0"
 # Composer v2 repository wire format (p2/packages.json documents + the
 # composer/2.0 minify/expand algorithm), shared with bougie. Replaces sconce's
 # hand-rolled metadata rendering and the (expansion-less) upstream p2 parsing.
-composer-auth = "0.2"
 composer-wire = "0.1"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -81,7 +80,7 @@ dotenvy = "0.15"
 # working hash backend + rev-parse without pulling a network client (networking
 # is opt-in, not default). `attributes` adds `.gitattributes` evaluation for
 # honoring `export-ignore` when archiving a ref.
-gix = { version = "0.90", features = ["attributes"] }
+gix = { version = "0.70", features = ["attributes"] }
 # Postgres only, runtime queries only — NO `macros` feature (no compile-time DB
 # checks / query!/migrate! macros). Rows are mapped by hand.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "json"] }
@@ -90,7 +89,10 @@ uuid = { version = "1", features = ["v4"] }
 axum = "0.8"
 base64 = "0.22"
 # Compile-time, type-checked, auto-escaping HTML templates for the admin UI.
+# `askama_web` (axum feature) provides `#[derive(WebTemplate)]` → `IntoResponse`,
+# replacing the removed `askama_axum` integration crate.
 askama = "0.16"
+askama_web = { version = "0.16", features = ["axum-0.8"] }
 # SMTP email for the password-reset flow. rustls + bundled webpki roots so the
 # single static binary needs no system TLS / CA config; tokio async transport.
 lettre = { version = "0.11", default-features = false, features = [
