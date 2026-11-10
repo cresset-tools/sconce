@@ -60,6 +60,12 @@ one `304`. Change the intervals with `--git-check-interval` and
 `worker`. An upstream whose check fails is retried later and later, up to once
 an hour.
 
+Set `SCONCE_GITHUB_TOKEN` to a GitHub token (a fine-grained token with no
+permissions is enough for public repositories) to raise GitHub's rate limits:
+git upstreams on `https://github.com` without a credential of their own use it,
+and so do dist downloads from `api.github.com` (where Packagist's zipballs
+live). It is sent to those two hosts only.
+
 Config is environment-based (12-factor): `DATABASE_URL`, `SCONCE_ADMIN_PASSWORD`,
 and `SCONCE_SECRET_KEY` (base64 of 32 bytes; needed only to store *private*
 upstream credentials). Run a dedicated worker instead of the in-process one with

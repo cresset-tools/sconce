@@ -239,8 +239,8 @@ async fn mirror_git_clone(
     key: Option<&SecretKey>,
     sub: &Subscription,
 ) -> Result<Report, Error> {
-    let credential = decrypt_credential(up, key)?;
-    let checkout = TempCheckout::clone_repo(&up.base, credential.as_deref(), &up.credential_type)?;
+    let (credential, credential_type) = git_credential(up, key)?;
+    let checkout = TempCheckout::clone_repo(&up.base, credential.as_deref(), credential_type)?;
     let report = mirror_checkout(
         up.repo_id,
         checkout.path(),
@@ -277,6 +277,71 @@ fn decrypt_credential(
     Ok(Some(String::from_utf8_lossy(&plain).into_owned()))
 }
 
+/// The credential git uses for an upstream, with its type: the upstream's own,
+/// else the operator's GitHub token (`SCONCE_GITHUB_TOKEN`) for an https
+/// github.com upstream, so public repos count against the token's rate limit
+/// instead of the server's address.
+fn git_credential<'a>(
+    up: &'a sconce_catalog::UpstreamRow,
+    key: Option<&SecretKey>,
+) -> Result<(Option<String>, &'a str), Error> {
+    if let Some(own) = decrypt_credential(up, key)? {
+        return Ok((Some(own), &up.credential_type));
+    }
+    Ok(match github_token() {
+        Some(token) if is_github_git_url(&up.base) => (Some(token.to_owned()), "github"),
+        _ => (None, &up.credential_type),
+    })
+}
+
+/// The operator's GitHub token from `SCONCE_GITHUB_TOKEN`, if set. Read once.
+fn github_token() -> Option<&'static str> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("SCONCE_GITHUB_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+        })
+        .as_deref()
+}
+
+/// The host of an http(s) URL, lowercased, without userinfo or port.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    Some(host.to_ascii_lowercase())
+}
+
+/// An https URL of a repository on github.com.
+fn is_github_git_url(url: &str) -> bool {
+    url.starts_with("https://") && url_host(url).as_deref() == Some("github.com")
+}
+
+/// The `Authorization` header for a download from `url`: only the GitHub API
+/// (where Packagist's zipball dists live) gets the token. The API answers with
+/// a redirect to codeload.github.com, and ureq drops the header on redirects,
+/// so the token is sent to api.github.com alone.
+fn github_api_auth(url: &str, token: Option<&str>) -> Option<String> {
+    let token = token?;
+    (url.starts_with("https://") && url_host(url).as_deref() == Some("api.github.com"))
+        .then(|| format!("Bearer {token}"))
+}
+
+/// A GET for `url`, carrying the GitHub token when `url` is on the GitHub API.
+fn http_request(url: &str) -> ureq::Request {
+    let req = ureq::get(url);
+    match github_api_auth(url, github_token()) {
+        Some(auth) => req.set("Authorization", &auth),
+        None => req,
+    }
+}
+
 /// Whether a git upstream's tags differ from the set its last mirror saw —
 /// one `git ls-remote`, no clone. An upstream never mirrored has changed.
 pub fn git_upstream_changed(
@@ -284,9 +349,8 @@ pub fn git_upstream_changed(
     synced_refs: Option<&str>,
     key: Option<&SecretKey>,
 ) -> Result<bool, Error> {
-    let credential = decrypt_credential(up, key)?;
-    let (url, pre_args) =
-        build_clone_invocation(&up.base, credential.as_deref(), &up.credential_type);
+    let (credential, credential_type) = git_credential(up, key)?;
+    let (url, pre_args) = build_clone_invocation(&up.base, credential.as_deref(), credential_type);
     let digest = tags_digest(&url, &pre_args).map_err(|e| match (e, credential.as_deref()) {
         (Error::Clone(msg), Some(cred)) => Error::Clone(msg.replace(cred, "***")),
         (e, _) => e,
@@ -922,7 +986,7 @@ fn http_error(url: &str, e: ureq::Error) -> Error {
 }
 
 fn http_get_string(url: &str) -> Result<String, Error> {
-    ureq::get(url)
+    http_request(url)
         .call()
         .map_err(|e| http_error(url, e))?
         .into_string()
@@ -935,7 +999,7 @@ fn http_get_if_changed(
     url: &str,
     previous: Option<&sconce_catalog::HttpValidator>,
 ) -> Result<Option<(String, sconce_catalog::HttpValidator)>, Error> {
-    let mut req = ureq::get(url);
+    let mut req = http_request(url);
     if let Some(prev) = previous {
         if let Some(etag) = &prev.etag {
             req = req.set("If-None-Match", etag);
@@ -960,7 +1024,7 @@ fn http_get_if_changed(
 
 fn http_get_bytes(url: &str) -> Result<Vec<u8>, Error> {
     use std::io::Read as _;
-    let resp = ureq::get(url).call().map_err(|e| http_error(url, e))?;
+    let resp = http_request(url).call().map_err(|e| http_error(url, e))?;
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_DIST_BYTES + 1)
@@ -1711,6 +1775,38 @@ mod tests {
             let e = Error::Clone(s.to_owned());
             assert!(!e.is_terminal(), "{s:?} should retry");
             assert_eq!(e.reason(), None, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn github_token_goes_to_github_only() {
+        assert!(is_github_git_url(
+            "https://github.com/hyva-themes/magento2-theme-module.git"
+        ));
+        assert!(is_github_git_url("https://GitHub.com:443/a/b"));
+        assert!(!is_github_git_url("http://github.com/a/b"));
+        assert!(!is_github_git_url("git@github.com:a/b.git"));
+        assert!(!is_github_git_url("https://github.com.evil.example/a/b"));
+        assert!(!is_github_git_url("https://github.com@evil.example/a/b"));
+        assert!(!is_github_git_url("https://gitlab.com/a/b"));
+
+        let zipball = "https://api.github.com/repos/a/b/zipball/0123abc";
+        assert_eq!(
+            github_api_auth(zipball, Some("ghp_x")).as_deref(),
+            Some("Bearer ghp_x")
+        );
+        assert_eq!(github_api_auth(zipball, None), None);
+        for elsewhere in [
+            "https://codeload.github.com/a/b/legacy.zip/0123abc",
+            "https://repo.packagist.org/p2/a/b.json",
+            "https://api.github.com.evil.example/x",
+            "http://api.github.com/repos/a/b/zipball/0123abc",
+        ] {
+            assert_eq!(
+                github_api_auth(elsewhere, Some("ghp_x")),
+                None,
+                "{elsewhere}"
+            );
         }
     }
 
