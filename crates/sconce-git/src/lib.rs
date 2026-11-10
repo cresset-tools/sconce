@@ -33,12 +33,12 @@ use sconce_archive::{CanonicalArchive, Entry, Mode};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("opening git repository")]
-    Open(Box<gix::Error>),
+    Open(Box<gix::open::Error>),
     #[error("resolving ref {refspec:?}")]
     RevParse {
         refspec: String,
         #[source]
-        source: Box<gix::Error>,
+        source: Box<gix::revision::spec::parse::single::Error>,
     },
     #[error("peeling {refspec:?} to a tree")]
     PeelToTree {
@@ -47,7 +47,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("traversing the tree")]
-    Traverse(Box<gix::Error>),
+    Traverse(Box<gix::traverse::tree::breadthfirst::Error>),
     #[error("evaluating .gitattributes export-ignore")]
     Attributes(Box<dyn std::error::Error + Send + Sync>),
     #[error("listing tags")]
@@ -63,7 +63,7 @@ pub enum Error {
     FindObject {
         oid: gix::ObjectId,
         #[source]
-        source: Box<gix::Error>,
+        source: Box<gix::object::find::existing::Error>,
     },
     #[error("reading commit time of {refspec:?}")]
     CommitTime {
@@ -227,7 +227,7 @@ pub fn tags(repo_path: impl AsRef<std::path::Path>) -> Result<Vec<String>, Error
     let platform = repo.references().map_err(|e| Error::Refs(Box::new(e)))?;
     let mut out = Vec::new();
     for reference in platform.tags().map_err(|e| Error::Refs(Box::new(e)))? {
-        let reference = reference.map_err(|e| Error::Refs(Box::new(e)))?;
+        let reference = reference.map_err(Error::Refs)?;
         let short = reference.name().shorten();
         let name = short.to_str().map_err(|_| Error::NonUtf8Path {
             path: short.to_string(),
@@ -257,29 +257,6 @@ pub fn commit_time(repo_path: impl AsRef<std::path::Path>, refspec: &str) -> Res
         .peel_to_commit()
         .map_err(|e| err(Box::new(e)))?;
     Ok(commit.time().map_err(|e| err(Box::new(e)))?.seconds)
-}
-
-/// The id (hex) of the commit `refspec` resolves to, annotated tags peeled —
-/// what a mirrored version was built from, so a later sync can tell a moved
-/// tag from an unchanged one.
-pub fn commit_id(repo_path: impl AsRef<std::path::Path>, refspec: &str) -> Result<String, Error> {
-    let repo = gix::open(repo_path.as_ref()).map_err(|e| Error::Open(Box::new(e)))?;
-    let id = repo
-        .rev_parse_single(refspec)
-        .map_err(|source| Error::RevParse {
-            refspec: refspec.to_owned(),
-            source: Box::new(source),
-        })?;
-    let err = |source: Box<dyn std::error::Error + Send + Sync>| Error::CommitTime {
-        refspec: refspec.to_owned(),
-        source,
-    };
-    let commit = id
-        .object()
-        .map_err(|e| err(Box::new(e)))?
-        .peel_to_commit()
-        .map_err(|e| err(Box::new(e)))?;
-    Ok(commit.id.to_hex().to_string())
 }
 
 /// Read a file's bytes at `refspec`, or `None` if no such file exists there.

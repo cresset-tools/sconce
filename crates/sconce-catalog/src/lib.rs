@@ -453,14 +453,6 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0061_upstream_sync_schedule",
         include_str!("../migrations/0061_upstream_sync_schedule.sql"),
     ),
-    (
-        "0062_version_conflicts",
-        include_str!("../migrations/0062_version_conflicts.sql"),
-    ),
-    (
-        "0063_authorization_codes",
-        include_str!("../migrations/0063_authorization_codes.sql"),
-    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -762,21 +754,6 @@ pub enum PublishOutcome {
     /// The version already exists with **different** dist bytes — rejected, so
     /// published versions stay immutable.
     Conflict,
-}
-
-/// A stored version whose upstream changed after it was mirrored
-/// ([`Catalog::version_conflicts`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionConflict {
-    pub package: String,
-    /// The version as stored (its display form).
-    pub version: String,
-    pub reason: String,
-    /// The upstream that changed, when it still exists.
-    pub upstream: Option<String>,
-    /// `YYYY-MM-DD HH:MI` (UTC).
-    pub detected_at: String,
-    pub last_seen_at: String,
 }
 
 /// The dist identity already stored for one version ([`Catalog::stored_dists`]).
@@ -1139,19 +1116,6 @@ pub enum DeviceFlowPoll {
     Denied,
     /// Unknown `device_code`, or the flow expired.
     Expired,
-}
-
-/// What a member approved on the `/authorize` page, for
-/// [`Catalog::create_authorization_code`].
-#[derive(Debug)]
-pub struct AuthorizationGrant<'a> {
-    pub org_id: Uuid,
-    /// The approving user; `None` in single-tenant mode (no accounts).
-    pub approved_by: Option<Uuid>,
-    pub client_id: &'a str,
-    pub redirect_uri: &'a str,
-    /// `BASE64URL(SHA256(code_verifier))`, unpadded (RFC 7636 S256).
-    pub code_challenge: &'a str,
 }
 
 /// An org-scoped session token resolved for relay introspection: the org it
@@ -3749,75 +3713,6 @@ impl Catalog {
         })
     }
 
-    /// Issue a one-time authorization code (RFC 6749 §4.1) for a signed-in
-    /// member's approval: bound to `org_id`, the client, the exact
-    /// `redirect_uri` and the PKCE `code_challenge` (S256), stored only as its
-    /// sha256. Also clears out codes that expired unredeemed. TTL in seconds.
-    pub async fn create_authorization_code(
-        &self,
-        grant: &AuthorizationGrant<'_>,
-        ttl_secs: i64,
-    ) -> Result<String, sqlx::Error> {
-        sqlx::query("delete from authorization_codes where expires_at <= now()")
-            .execute(&self.pool)
-            .await?;
-        let code = generate_secret("scac_");
-        sqlx::query(
-            "insert into authorization_codes \
-             (code_hash, org_id, approved_by, client_id, redirect_uri, code_challenge, expires_at) \
-             values ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7::double precision))",
-        )
-        .bind(token_hash(&code))
-        .bind(grant.org_id)
-        .bind(grant.approved_by)
-        .bind(grant.client_id)
-        .bind(grant.redirect_uri)
-        .bind(grant.code_challenge)
-        .bind(ttl_secs)
-        .execute(&self.pool)
-        .await?;
-        Ok(code)
-    }
-
-    /// Redeem an authorization code: returns the org to mint a token for when
-    /// the code is fresh and the request repeats the same `client_id` and
-    /// `redirect_uri` and presents the PKCE verifier for its challenge.
-    ///
-    /// The code is consumed by the attempt whether or not it succeeds, so a
-    /// code that leaked can't be retried against with guessed verifiers.
-    pub async fn redeem_authorization_code(
-        &self,
-        code: &str,
-        client_id: &str,
-        redirect_uri: &str,
-        code_verifier: &str,
-    ) -> Result<Option<Uuid>, sqlx::Error> {
-        let row = sqlx::query(
-            "delete from authorization_codes where code_hash = $1 \
-             returning org_id, client_id, redirect_uri, code_challenge, \
-             expires_at > now() as fresh",
-        )
-        .bind(token_hash(code))
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let fresh: bool = row.try_get("fresh")?;
-        let bound_client: String = row.try_get("client_id")?;
-        let bound_redirect: String = row.try_get("redirect_uri")?;
-        let challenge: String = row.try_get("code_challenge")?;
-        let ok = fresh
-            && bound_client == client_id
-            && bound_redirect == redirect_uri
-            && pkce_s256_matches(code_verifier, &challenge);
-        Ok(if ok {
-            Some(row.try_get("org_id")?)
-        } else {
-            None
-        })
-    }
-
     /// Apply any pending migrations. Idempotent; safe to call on every startup.
     ///
     /// Concurrent migrators (multiple app instances starting at once, or
@@ -4582,7 +4477,8 @@ impl Catalog {
     }
 
     /// Insert a **published** (pushed) version *immutably*. Unlike
-    /// [`Self::upsert_package_version`] — which overwrites on conflict — a published version cannot be silently replaced:
+    /// [`Self::upsert_package_version`] — which overwrites on conflict, still used
+    /// by the git mirror — a published version cannot be silently replaced:
     /// re-publishing identical dist bytes is an idempotent no-op, and publishing
     /// *different* bytes for an existing version is rejected. Returns which of the
     /// three happened; the caller maps it to 201 / 200 / 409.
@@ -4648,157 +4544,6 @@ impl Catalog {
             None,
         )
         .await
-    }
-
-    /// Insert a version mirrored from a **git upstream**, immutably like
-    /// [`Self::insert_mirrored_version`]: a tag later moved to another commit
-    /// does not replace what Composer clients have locked. `commit` is the
-    /// tag's commit, stored as the version's `source_reference`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_git_version(
-        &self,
-        package_id: Uuid,
-        version: &str,
-        normalized_version: &str,
-        stability: &str,
-        composer_json: &Value,
-        dist_blob_sha256: &[u8; 32],
-        dist_shasum: &str,
-        commit: &str,
-        released_at_unix: Option<i64>,
-    ) -> Result<PublishOutcome, sqlx::Error> {
-        self.insert_version_once(
-            package_id,
-            version,
-            normalized_version,
-            stability,
-            composer_json,
-            dist_blob_sha256,
-            dist_shasum,
-            Some(commit),
-            None,
-            released_at_unix,
-        )
-        .await
-    }
-
-    /// Record the commit of a version stored before git versions kept theirs.
-    /// Never overwrites a recorded commit.
-    pub async fn backfill_source_reference(
-        &self,
-        package_id: Uuid,
-        normalized_version: &str,
-        reference: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "update package_versions set source_reference = $3 \
-             where package_id = $1 and normalized_version = $2 and source_reference is null",
-        )
-        .bind(package_id)
-        .bind(normalized_version)
-        .bind(reference)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Record that the upstream of a stored version now serves something else
-    /// for it. Repeated sightings keep the first `detected_at`.
-    pub async fn record_version_conflict(
-        &self,
-        repo_id: Uuid,
-        package: &str,
-        normalized_version: &str,
-        upstream_id: Option<Uuid>,
-        reason: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "insert into version_conflicts (package_id, normalized_version, upstream_id, reason) \
-             select p.id, $3, $4, $5 from packages p where p.repo_id = $1 and p.name = $2 \
-             on conflict (package_id, normalized_version) do update set \
-                 upstream_id = excluded.upstream_id, reason = excluded.reason, \
-                 last_seen_at = now()",
-        )
-        .bind(repo_id)
-        .bind(package)
-        .bind(normalized_version)
-        .bind(upstream_id)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Forget a recorded conflict: the upstream matches the stored version again.
-    pub async fn clear_version_conflict(
-        &self,
-        repo_id: Uuid,
-        package: &str,
-        normalized_version: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "delete from version_conflicts vc using packages p \
-             where p.id = vc.package_id and p.repo_id = $1 and p.name = $2 \
-               and vc.normalized_version = $3",
-        )
-        .bind(repo_id)
-        .bind(package)
-        .bind(normalized_version)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// `(package, normalized version)` of every recorded conflict in `repo_id`,
-    /// so a sync clears only those that exist.
-    pub async fn conflicted_versions(
-        &self,
-        repo_id: Uuid,
-    ) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "select p.name, vc.normalized_version from version_conflicts vc \
-             join packages p on p.id = vc.package_id where p.repo_id = $1",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().collect())
-    }
-
-    /// Versions in `repo_id` whose upstream changed after they were mirrored,
-    /// newest first.
-    pub async fn version_conflicts(
-        &self,
-        repo_id: Uuid,
-    ) -> Result<Vec<VersionConflict>, sqlx::Error> {
-        let rows = sqlx::query(
-            "select p.name, coalesce(pv.version, vc.normalized_version) as version, vc.reason, \
-                    u.base as upstream, \
-                    to_char(vc.detected_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as detected_at, \
-                    to_char(vc.last_seen_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as last_seen_at \
-             from version_conflicts vc \
-             join packages p on p.id = vc.package_id \
-             left join package_versions pv \
-                 on pv.package_id = vc.package_id and pv.normalized_version = vc.normalized_version \
-             left join upstreams u on u.id = vc.upstream_id \
-             where p.repo_id = $1 \
-             order by vc.detected_at desc, p.name, vc.normalized_version",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|r| {
-                Ok(VersionConflict {
-                    package: r.try_get("name")?,
-                    version: r.try_get("version")?,
-                    reason: r.try_get("reason")?,
-                    upstream: r.try_get("upstream")?,
-                    detected_at: r.try_get("detected_at")?,
-                    last_seen_at: r.try_get("last_seen_at")?,
-                })
-            })
-            .collect()
     }
 
     /// Record the upstream dist path of an already-stored version that has none
@@ -5277,9 +5022,12 @@ impl Catalog {
         credential: Option<&[u8]>,
         credential_type: &str,
     ) -> Result<Uuid, sqlx::Error> {
-        // The credential is about access and visibility about licensing, so
-        // a public upstream may need one too (an OSL package behind a paid
-        // registry).
+        // Public upstreams are unauthenticated by definition — never store a
+        // credential for one, whatever the caller passed.
+        let credential = match visibility {
+            Visibility::Public => None,
+            Visibility::Private => credential,
+        };
         sqlx::query_scalar(
             "insert into upstreams (repo_id, kind, base, visibility, label, credential, credential_type) \
              values ($1, $2, $3, $4, $5, $6, $7) returning id",
@@ -8381,30 +8129,6 @@ fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-/// RFC 7636 S256: whether `BASE64URL(SHA256(verifier))` equals `challenge`.
-/// A verifier outside the RFC's 43–128 unreserved characters never matches.
-fn pkce_s256_matches(verifier: &str, challenge: &str) -> bool {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    let well_formed = (43..=128).contains(&verifier.len())
-        && verifier
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
-    if !well_formed {
-        return false;
-    }
-    let digest = Sha256::digest(verifier.as_bytes());
-    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    // Both sides are public-length base64 of a digest; compare without an
-    // early exit anyway.
-    expected.len() == challenge.len()
-        && expected
-            .bytes()
-            .zip(challenge.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
-}
-
 /// Whether a query error is a Postgres unique-constraint violation (SQLSTATE
 /// 23505) — used to turn a lost idempotency race into a graceful replay.
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -9404,91 +9128,6 @@ mod tests {
         assert_eq!(got, ["api", "r", "web"]);
     }
 
-    #[test]
-    fn pkce_s256_matches_base64url_sha256_of_the_verifier() {
-        // Challenge computed independently:
-        // printf %s "$verifier" | openssl dgst -sha256 -binary | basenc --base64url
-        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
-        let challenge = "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o";
-        assert!(pkce_s256_matches(verifier, challenge));
-        assert!(!pkce_s256_matches(
-            "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Z",
-            challenge
-        ));
-        assert!(
-            !pkce_s256_matches("short", challenge),
-            "too short to be a verifier"
-        );
-    }
-
-    #[tokio::test]
-    async fn authorization_code_redeems_once_with_matching_pkce_and_redirect() {
-        let Some((cat, repo_id)) = repo().await else {
-            return;
-        };
-        let org_id = org_of(&cat, repo_id).await;
-        let verifier = "dBjftJeZ4CVP-mJ92K9u0IQUVjD9Kob7j4kN1_kmQ3Y";
-        let redirect = "http://127.0.0.1:53682/callback";
-        let grant = AuthorizationGrant {
-            org_id,
-            approved_by: None,
-            client_id: "bougie-cli",
-            redirect_uri: redirect,
-            code_challenge: "Ec9IvtMd785zId6XVxyiEaErn5iBJrDupf7sT_YRe6o",
-        };
-
-        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            Some(org_id)
-        );
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            None,
-            "a code works once"
-        );
-
-        // A wrong redirect_uri fails, and burns the code.
-        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
-        let other = "http://127.0.0.1:1/callback";
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", other, verifier)
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            None,
-            "a failed attempt consumes the code"
-        );
-
-        // A wrong verifier fails.
-        let code = cat.create_authorization_code(&grant, 300).await.unwrap();
-        let wrong = "x".repeat(43);
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, &wrong)
-                .await
-                .unwrap(),
-            None
-        );
-
-        // An expired code fails.
-        let code = cat.create_authorization_code(&grant, -1).await.unwrap();
-        assert_eq!(
-            cat.redeem_authorization_code(&code, "bougie-cli", redirect, verifier)
-                .await
-                .unwrap(),
-            None
-        );
-    }
-
     #[tokio::test]
     async fn device_flow_approve_mints_org_scoped_token() {
         let Some((cat, repo_id)) = repo().await else {
@@ -10403,27 +10042,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_upstream_keeps_its_credential() {
+    async fn public_upstream_drops_any_credential() {
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
-        // Redistributable packages behind a registry that needs a login.
+        // A credential passed for a PUBLIC upstream must not be stored.
         let id = cat
             .create_upstream(
                 repo_id,
                 "composer",
-                "https://registry.example/acme",
+                "https://repo.packagist.org",
                 Visibility::Public,
                 None,
-                Some(b"enc"),
-                "basic",
+                Some(b"should-be-dropped"),
+                "github",
             )
             .await
             .unwrap();
         let got = cat.get_upstream(id).await.unwrap().unwrap();
-        assert_eq!(got.credential.as_deref(), Some(&b"enc"[..]));
+        assert!(
+            got.credential.is_none(),
+            "public upstream stores no credential"
+        );
         let listed = cat.list_upstreams(repo_id).await.unwrap();
-        assert!(listed.iter().find(|u| u.id == id).unwrap().has_credential);
+        assert!(!listed.iter().find(|u| u.id == id).unwrap().has_credential);
     }
 
     #[tokio::test]

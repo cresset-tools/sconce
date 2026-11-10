@@ -19,7 +19,6 @@ pub use subscription::Subscription;
 
 use std::path::Path;
 
-use composer_auth::AuthCredentials;
 use composer_wire::{PackageDocument, RootManifest};
 use sconce_cas::BlobStore;
 use sconce_catalog::secret::SecretKey;
@@ -226,10 +225,7 @@ pub async fn mirror_upstream(
     let sub = Subscription::compile(&up.requires)?;
     match up.kind.as_str() {
         "git" => mirror_git_clone(catalog, store, &up, key, &sub).await,
-        "composer" => {
-            let auth = RegistryAuth::for_upstream(&up, key)?;
-            mirror_composer_registry(catalog, store, &up, &sub, &auth).await
-        }
+        "composer" => mirror_composer_registry(catalog, store, &up, &sub).await,
         other => Err(Error::Http(format!("unknown upstream kind: {other}"))),
     }
 }
@@ -337,91 +333,12 @@ fn github_api_auth(url: &str, token: Option<&str>) -> Option<String> {
         .then(|| format!("Bearer {token}"))
 }
 
-/// A GET for `url`, carrying the upstream's credential when `url` is on the
-/// upstream's own origin, else the GitHub token when it is on the GitHub API.
-fn http_request(url: &str, auth: &RegistryAuth) -> ureq::Request {
+/// A GET for `url`, carrying the GitHub token when `url` is on the GitHub API.
+fn http_request(url: &str) -> ureq::Request {
     let req = ureq::get(url);
-    if let Some((name, value)) = auth.header_for(url) {
-        return req.set(name, &value);
-    }
     match github_api_auth(url, github_token()) {
-        Some(value) => req.set("Authorization", &value),
+        Some(auth) => req.set("Authorization", &auth),
         None => req,
-    }
-}
-
-/// The `scheme://host[:port]` of an http(s) URL, lowercased, without userinfo.
-fn url_origin(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit('@').next()?;
-    Some(format!("{scheme}://{}", host_port.to_ascii_lowercase()))
-}
-
-/// How requests to a composer upstream authenticate: a credential sent only
-/// to the upstream's own origin (scheme, host and port), so a dist hosted
-/// elsewhere never sees it. ureq drops it on redirects.
-#[derive(Debug, Default, Clone)]
-struct RegistryAuth {
-    origin: Option<String>,
-    credentials: Option<AuthCredentials>,
-}
-
-impl RegistryAuth {
-    /// From the upstream's stored credential, per its `credential_type`, as
-    /// Composer sends it: `bearer` as `Authorization: Bearer`, `github` as
-    /// `Authorization: token`, `gitlab` in a `PRIVATE-TOKEN` header, and
-    /// `basic`, the default, as HTTP basic auth (`user:password`, e.g.
-    /// Private Packagist's `token:<key>`).
-    fn for_upstream(
-        up: &sconce_catalog::UpstreamRow,
-        key: Option<&SecretKey>,
-    ) -> Result<Self, Error> {
-        let Some(secret) = decrypt_credential(up, key)? else {
-            return Ok(Self::default());
-        };
-        Ok(Self::new(&up.base, &up.credential_type, &secret))
-    }
-
-    fn new(base: &str, credential_type: &str, secret: &str) -> Self {
-        let token = secret.to_owned();
-        let credentials = match credential_type {
-            "bearer" => AuthCredentials::Bearer { token },
-            "github" => AuthCredentials::GitHubToken { token },
-            "gitlab" => AuthCredentials::GitLabToken { token },
-            _ => AuthCredentials::basic_from_userinfo(secret),
-        };
-        Self {
-            origin: url_origin(base),
-            credentials: Some(credentials),
-        }
-    }
-
-    /// The header (name, value) for a request to `url`, if it goes to the
-    /// upstream's origin.
-    fn header_for(&self, url: &str) -> Option<(&'static str, String)> {
-        let origin = self.origin.as_deref()?;
-        if url_origin(url).as_deref() != Some(origin) {
-            return None;
-        }
-        let credentials = self.credentials.as_ref()?;
-        Some((credentials.header_name(), credentials.header_value()))
-    }
-}
-
-/// Resolve a URL a registry gives (absolute, host-relative `/…`, or relative
-/// to the repository) against the upstream's `base`.
-fn resolve_registry_url(base: &str, path: &str) -> String {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        return path.to_owned();
-    }
-    match (path.strip_prefix('/'), url_origin(base)) {
-        (Some(_), Some(origin)) => format!("{origin}{path}"),
-        _ => format!("{}/{path}", base.trim_end_matches('/')),
     }
 }
 
@@ -528,15 +445,13 @@ pub async fn mirror_composer_package(
     store: &(impl BlobStore + Sync),
     upstream_id: Uuid,
     package: &str,
-    key: Option<&SecretKey>,
 ) -> Result<Report, Error> {
     let up = load_composer_upstream(catalog, upstream_id).await?;
-    let auth = RegistryAuth::for_upstream(&up, key)?;
     // An explicit single-package sync still honors a floor if the upstream's
     // require-list opts this package in; a package matched by no entry mirrors
     // every version (the operator asked for it by name).
     let sub = Subscription::compile(&up.requires)?;
-    mirror_one_composer_package(catalog, store, &up, package, &sub, &auth).await
+    mirror_one_composer_package(catalog, store, &up, package, &sub).await
 }
 
 /// Mirror **every** package a composer upstream's require-list selects from its
@@ -547,12 +462,10 @@ pub async fn mirror_composer_upstream(
     catalog: &Catalog,
     store: &(impl BlobStore + Sync),
     upstream_id: Uuid,
-    key: Option<&SecretKey>,
 ) -> Result<Report, Error> {
     let up = load_composer_upstream(catalog, upstream_id).await?;
-    let auth = RegistryAuth::for_upstream(&up, key)?;
     let sub = Subscription::compile(&up.requires)?;
-    mirror_composer_registry(catalog, store, &up, &sub, &auth).await
+    mirror_composer_registry(catalog, store, &up, &sub).await
 }
 
 /// Registry-mirror core (shared by the CLI and the worker's `mirror_upstream`):
@@ -562,7 +475,6 @@ async fn mirror_composer_registry(
     store: &(impl BlobStore + Sync),
     up: &sconce_catalog::UpstreamRow,
     sub: &Subscription,
-    auth: &RegistryAuth,
 ) -> Result<Report, Error> {
     if up.kind != "composer" {
         return Err(Error::Http("expected a 'composer' upstream".to_owned()));
@@ -575,21 +487,15 @@ async fn mirror_composer_registry(
     }
 
     let base = up.base.trim_end_matches('/');
-    let body = http_get_string(&format!("{base}/packages.json"), auth)?;
+    let body = http_get_string(&format!("{base}/packages.json"))?;
     let root = RootManifest::parse(body.as_bytes()).map_err(|_| Error::BadMetadata {
         package: "packages.json".to_owned(),
     })?;
-    // Packagist and Private Packagist list their packages at `list` instead.
-    let listed = match &root.available_packages {
-        Some(_) => None,
-        None => list_package_names(base, &body, auth)?,
-    };
     // The full set the registry concretely lists (None for pattern-only
     // registries that publish `available-package-patterns` instead). We need the
     // *unfiltered* set to reconcile removals independently of the sync filter.
     let available: Option<std::collections::HashSet<String>> = root
         .available_packages
-        .or(listed)
         .map(|names| names.into_iter().collect());
     let names: Vec<String> = available
         .iter()
@@ -615,7 +521,7 @@ async fn mirror_composer_registry(
             report.skipped.push((name, "archived".to_owned()));
             continue;
         }
-        match mirror_one_composer_package(catalog, store, up, &name, sub, auth).await {
+        match mirror_one_composer_package(catalog, store, up, &name, sub).await {
             Ok(r) => {
                 report.mirrored.extend(r.mirrored);
                 report.skipped.extend(r.skipped);
@@ -680,9 +586,8 @@ async fn mirror_one_composer_package(
     up: &sconce_catalog::UpstreamRow,
     package: &str,
     sub: &Subscription,
-    auth: &RegistryAuth,
 ) -> Result<Report, Error> {
-    let result = mirror_one_composer_package_inner(catalog, store, up, package, sub, auth).await;
+    let result = mirror_one_composer_package_inner(catalog, store, up, package, sub).await;
     match &result {
         Ok(_) => {
             let _ = catalog.mark_package_synced(up.repo_id, package).await;
@@ -706,7 +611,6 @@ async fn mirror_one_composer_package_inner(
     up: &sconce_catalog::UpstreamRow,
     package: &str,
     sub: &Subscription,
-    auth: &RegistryAuth,
 ) -> Result<Report, Error> {
     // p2 metadata: {base}/p2/{vendor}/{name}.json (the standard metadata-url).
     let base = up.base.trim_end_matches('/');
@@ -717,7 +621,7 @@ async fn mirror_one_composer_package_inner(
         .upstream_validator(up.id, &meta_url)
         .await
         .map_err(|e| Error::Catalog(Box::new(e)))?;
-    let Some((body, validator)) = http_get_if_changed(&meta_url, previous.as_ref(), auth)? else {
+    let Some((body, validator)) = http_get_if_changed(&meta_url, previous.as_ref())? else {
         return Ok(Report::default());
     };
     // Parse + apply composer/2.0 minified-expansion. Packagist and many mirrors
@@ -742,10 +646,6 @@ async fn mirror_one_composer_package_inner(
     // instead of replacing bytes Composer clients have locked.
     let stored = catalog
         .stored_dists(up.repo_id, package)
-        .await
-        .map_err(|e| Error::Catalog(Box::new(e)))?;
-    let conflicted = catalog
-        .conflicted_versions(up.repo_id)
         .await
         .map_err(|e| Error::Catalog(Box::new(e)))?;
 
@@ -793,7 +693,6 @@ async fn mirror_one_composer_package_inner(
             match upstream_change(existing, shasum, reference) {
                 None => {
                     report.unchanged += 1;
-                    clear_conflict(catalog, &conflicted, up.repo_id, package, normalized).await?;
                     if let (None, Some(path)) =
                         (&existing.upstream_dist_path, upstream_dist_path.as_deref())
                     {
@@ -803,19 +702,9 @@ async fn mirror_one_composer_package_inner(
                             .map_err(|e| Error::Catalog(Box::new(e)))?;
                     }
                 }
-                Some(reason) => {
-                    record_conflict(
-                        catalog,
-                        &mut report,
-                        up.repo_id,
-                        Some(up.id),
-                        package,
-                        normalized,
-                        format!("{package} {version}"),
-                        reason,
-                    )
-                    .await?;
-                }
+                Some(reason) => report
+                    .conflicts
+                    .push((format!("{package} {version}"), reason.to_owned())),
             }
             continue;
         }
@@ -823,7 +712,7 @@ async fn mirror_one_composer_package_inner(
         // Download verbatim and verify the upstream's sha1 when it publishes one.
         // Without one, record the sha1 of the bytes we stored: that is what
         // Composer verifies against from here on.
-        let bytes = http_get_bytes(dist_url, auth)?;
+        let bytes = http_get_bytes(dist_url)?;
         let actual_shasum = sha1_hex(&bytes);
         if shasum.is_some_and(|expected| expected != actual_shasum) {
             return Err(Error::ShasumMismatch {
@@ -876,17 +765,10 @@ async fn mirror_one_composer_package_inner(
                 continue;
             }
             sconce_catalog::PublishOutcome::Conflict => {
-                record_conflict(
-                    catalog,
-                    &mut report,
-                    up.repo_id,
-                    Some(up.id),
-                    package,
-                    normalized,
+                report.conflicts.push((
                     format!("{package} {version}"),
-                    "dist bytes differ from the stored version",
-                )
-                .await?;
+                    "dist bytes differ from the stored version".to_owned(),
+                ));
                 continue;
             }
         }
@@ -949,7 +831,6 @@ const MAX_CLOSURE: usize = 2000;
 pub async fn resolve_closure(
     catalog: &Catalog,
     repo_id: Uuid,
-    key: Option<&SecretKey>,
 ) -> Result<Vec<sconce_catalog::DependencyPlanEntry>, Error> {
     use std::collections::{HashSet, VecDeque};
     let boxed = |e: sconce_catalog::SqlxError| Error::Catalog(Box::new(e));
@@ -969,15 +850,6 @@ pub async fn resolve_closure(
         .filter(|u| u.kind == "composer")
         .collect();
     upstreams.sort_by_key(|u| u8::from(u.visibility != "private"));
-    // An upstream whose credential can't be read is probed without one.
-    let mut auths: Vec<RegistryAuth> = Vec::with_capacity(upstreams.len());
-    for u in &upstreams {
-        let row = catalog.get_upstream(u.id).await.map_err(boxed)?;
-        auths.push(
-            row.and_then(|row| RegistryAuth::for_upstream(&row, key).ok())
-                .unwrap_or_default(),
-        );
-    }
 
     let mut queue: VecDeque<(String, String)> = VecDeque::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1001,8 +873,8 @@ pub async fn resolve_closure(
         }
         // Probe each composer upstream by name; first hit resolves + classifies.
         let mut resolved = None;
-        for (u, auth) in upstreams.iter().zip(&auths) {
-            if let Ok(Some(versions)) = fetch_p2(&u.base, &dep, auth) {
+        for u in &upstreams {
+            if let Ok(Some(versions)) = fetch_p2(&u.base, &dep) {
                 resolved = Some((u, versions));
                 break;
             }
@@ -1051,13 +923,9 @@ fn plan_entry(
 /// GET `{base}/p2/{package}.json`. `Ok(Some(versions))` if present, `Ok(None)`
 /// on 404 (not in this registry), `Err` on any other failure (so the caller
 /// tries the next upstream and only records `missing` if all fail/404).
-fn fetch_p2(
-    base: &str,
-    package: &str,
-    auth: &RegistryAuth,
-) -> Result<Option<Vec<serde_json::Value>>, Error> {
+fn fetch_p2(base: &str, package: &str) -> Result<Option<Vec<serde_json::Value>>, Error> {
     let url = format!("{}/p2/{package}.json", base.trim_end_matches('/'));
-    match http_request(&url, auth).call() {
+    match ureq::get(&url).call() {
         Ok(resp) => {
             let body = resp.into_string().map_err(|e| Error::Http(e.to_string()))?;
             // Expand composer/2.0 minified p2 before reading versions (same
@@ -1107,39 +975,6 @@ fn composer_stability(version: &str) -> String {
 
 /// Map a `ureq` failure to our error, **preserving the HTTP status** (so a
 /// permanent `404`/`403` is distinguishable from a transient transport error).
-/// The package names a registry lists at the `list` URL of its
-/// `packages.json` (Packagist's `{"packageNames": [...]}`), or `None` when it
-/// has none.
-fn list_package_names(
-    base: &str,
-    root_body: &str,
-    auth: &RegistryAuth,
-) -> Result<Option<Vec<String>>, Error> {
-    let bad = || Error::BadMetadata {
-        package: "packages.json".to_owned(),
-    };
-    let root: serde_json::Value = serde_json::from_str(root_body).map_err(|_| bad())?;
-    let Some(list) = root.get("list").and_then(serde_json::Value::as_str) else {
-        return Ok(None);
-    };
-    let url = resolve_registry_url(base, list);
-    let body: serde_json::Value =
-        serde_json::from_str(&http_get_string(&url, auth)?).map_err(|_| Error::BadMetadata {
-            package: "list.json".to_owned(),
-        })?;
-    let names = body
-        .get("packageNames")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| Error::BadMetadata {
-            package: "list.json".to_owned(),
-        })?
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    Ok(Some(names))
-}
-
 fn http_error(url: &str, e: ureq::Error) -> Error {
     match e {
         ureq::Error::Status(code, _) => Error::HttpStatus {
@@ -1150,8 +985,8 @@ fn http_error(url: &str, e: ureq::Error) -> Error {
     }
 }
 
-fn http_get_string(url: &str, auth: &RegistryAuth) -> Result<String, Error> {
-    http_request(url, auth)
+fn http_get_string(url: &str) -> Result<String, Error> {
+    http_request(url)
         .call()
         .map_err(|e| http_error(url, e))?
         .into_string()
@@ -1163,9 +998,8 @@ fn http_get_string(url: &str, auth: &RegistryAuth) -> Result<String, Error> {
 fn http_get_if_changed(
     url: &str,
     previous: Option<&sconce_catalog::HttpValidator>,
-    auth: &RegistryAuth,
 ) -> Result<Option<(String, sconce_catalog::HttpValidator)>, Error> {
-    let mut req = http_request(url, auth);
+    let mut req = http_request(url);
     if let Some(prev) = previous {
         if let Some(etag) = &prev.etag {
             req = req.set("If-None-Match", etag);
@@ -1188,11 +1022,9 @@ fn http_get_if_changed(
     Ok(Some((body, validator)))
 }
 
-fn http_get_bytes(url: &str, auth: &RegistryAuth) -> Result<Vec<u8>, Error> {
+fn http_get_bytes(url: &str) -> Result<Vec<u8>, Error> {
     use std::io::Read as _;
-    let resp = http_request(url, auth)
-        .call()
-        .map_err(|e| http_error(url, e))?;
+    let resp = http_request(url).call().map_err(|e| http_error(url, e))?;
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_DIST_BYTES + 1)
@@ -1222,17 +1054,6 @@ async fn mirror_checkout(
 ) -> Result<Report, Error> {
     let git_url = source_url;
     let mut report = Report::default();
-    // What each package already has, loaded on first sight of the package.
-    let mut stored_by_pkg: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, sconce_catalog::StoredDist>,
-    > = std::collections::HashMap::new();
-    let conflicted = catalog
-        .conflicted_versions(repo_id)
-        .await
-        .map_err(|e| Error::Catalog(Box::new(e)))?;
-    // Packages this sync saw intact (mirrored or unchanged).
-    let mut synced: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // A monorepo upstream lists each package's subdirectory; the common single-
     // package case (no explicit paths) mirrors the repo root (`""`).
@@ -1295,41 +1116,6 @@ async fn mirror_checkout(
                 continue;
             }
 
-            if !stored_by_pkg.contains_key(&name) {
-                let stored = catalog
-                    .stored_dists(repo_id, &name)
-                    .await
-                    .map_err(|e| Error::Catalog(Box::new(e)))?;
-                stored_by_pkg.insert(name.clone(), stored);
-            }
-            let existing = stored_by_pkg[&name].get(&parsed.normalized).cloned();
-            let commit = sconce_git::commit_id(repo_path, &tag)?;
-            let item = format!("{name} {tag}");
-
-            // A version keeps the commit it was first mirrored from: the same
-            // commit is unchanged, another one means the tag moved.
-            if let Some(stored_commit) = existing.as_ref().and_then(|e| e.reference.as_deref()) {
-                if stored_commit == commit {
-                    report.unchanged += 1;
-                    clear_conflict(catalog, &conflicted, repo_id, &name, &parsed.normalized)
-                        .await?;
-                    synced.insert(name);
-                } else {
-                    record_conflict(
-                        catalog,
-                        &mut report,
-                        repo_id,
-                        upstream_id,
-                        &name,
-                        &parsed.normalized,
-                        item,
-                        TAG_MOVED,
-                    )
-                    .await?;
-                }
-                continue;
-            }
-
             // Archive the package's subtree and store it; the blob is content-
             // addressed. The subtree archives with paths relative to it, so its
             // `dist.shasum` is stable and dedupes independently of siblings.
@@ -1360,71 +1146,20 @@ async fn mirror_checkout(
                 .set_package_source_path(package_id, sp)
                 .await
                 .map_err(|e| Error::Catalog(Box::new(e)))?;
-            // Stored before versions kept their commit: the same bytes mean the
-            // same version, so record its commit; other bytes mean it changed.
-            if let Some(existing) = &existing {
-                if existing.shasum.as_deref() == Some(dist_shasum.as_str()) {
-                    catalog
-                        .backfill_source_reference(package_id, &parsed.normalized, &commit)
-                        .await
-                        .map_err(|e| Error::Catalog(Box::new(e)))?;
-                    report.unchanged += 1;
-                    clear_conflict(catalog, &conflicted, repo_id, &name, &parsed.normalized)
-                        .await?;
-                    synced.insert(name);
-                } else {
-                    record_conflict(
-                        catalog,
-                        &mut report,
-                        repo_id,
-                        upstream_id,
-                        &name,
-                        &parsed.normalized,
-                        item,
-                        TAG_CHANGED,
-                    )
-                    .await?;
-                }
-                continue;
-            }
-            let outcome = catalog
-                .insert_git_version(
+            catalog
+                .upsert_package_version(
                     package_id,
                     &tag,
                     &parsed.normalized,
                     &parsed.stability,
                     &composer_json,
-                    blob.as_bytes(),
-                    &dist_shasum,
-                    &commit,
+                    Some(blob.as_bytes()),
+                    Some(&dist_shasum),
+                    None, // source_reference (commit sha) — added later
                     released_at,
                 )
                 .await
                 .map_err(|e| Error::Catalog(Box::new(e)))?;
-            match outcome {
-                sconce_catalog::PublishOutcome::Created => {}
-                // A concurrent sync stored it between the lookup and the insert.
-                sconce_catalog::PublishOutcome::AlreadyPublished => {
-                    report.unchanged += 1;
-                    synced.insert(name);
-                    continue;
-                }
-                sconce_catalog::PublishOutcome::Conflict => {
-                    record_conflict(
-                        catalog,
-                        &mut report,
-                        repo_id,
-                        upstream_id,
-                        &name,
-                        &parsed.normalized,
-                        item,
-                        TAG_CHANGED,
-                    )
-                    .await?;
-                    continue;
-                }
-            }
-            synced.insert(name.clone());
 
             report.mirrored.push(Mirrored {
                 tag: tag.clone(),
@@ -1436,55 +1171,15 @@ async fn mirror_checkout(
     }
 
     // A successful clone+mirror clears any earlier broken flag on the packages it
-    // saw (best-effort).
-    for name in &synced {
-        let _ = catalog.mark_package_synced(repo_id, name).await;
+    // produced (best-effort; distinct names only).
+    let mut synced: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in &report.mirrored {
+        if synced.insert(m.package.as_str()) {
+            let _ = catalog.mark_package_synced(repo_id, &m.package).await;
+        }
     }
 
     Ok(report)
-}
-
-const TAG_MOVED: &str = "tag moved to another commit since it was mirrored";
-const TAG_CHANGED: &str = "tag content changed since it was mirrored";
-
-/// Note that the upstream now serves something else for a stored version:
-/// in the sync report, and in the catalog for the admin UI. The stored
-/// version is left as it is.
-#[allow(clippy::too_many_arguments)]
-async fn record_conflict(
-    catalog: &Catalog,
-    report: &mut Report,
-    repo_id: Uuid,
-    upstream_id: Option<Uuid>,
-    package: &str,
-    normalized: &str,
-    item: String,
-    reason: &str,
-) -> Result<(), Error> {
-    catalog
-        .record_version_conflict(repo_id, package, normalized, upstream_id, reason)
-        .await
-        .map_err(|e| Error::Catalog(Box::new(e)))?;
-    report.conflicts.push((item, reason.to_owned()));
-    Ok(())
-}
-
-/// Forget a recorded conflict once the upstream matches the stored version
-/// again. `conflicted` is the repo's recorded set, so this is free otherwise.
-async fn clear_conflict(
-    catalog: &Catalog,
-    conflicted: &std::collections::HashSet<(String, String)>,
-    repo_id: Uuid,
-    package: &str,
-    normalized: &str,
-) -> Result<(), Error> {
-    if conflicted.contains(&(package.to_owned(), normalized.to_owned())) {
-        catalog
-            .clear_version_conflict(repo_id, package, normalized)
-            .await
-            .map_err(|e| Error::Catalog(Box::new(e)))?;
-    }
-    Ok(())
 }
 
 /// Lowercase sha1 hex of `bytes` — Composer's `dist.shasum` format.
@@ -1848,7 +1543,7 @@ mod tests {
             .unwrap();
 
         let pkg = "mage-os/composer";
-        let report = mirror_composer_package(&catalog, &store, up, pkg, None)
+        let report = mirror_composer_package(&catalog, &store, up, pkg)
             .await
             .unwrap();
         assert!(
@@ -1918,7 +1613,7 @@ mod tests {
             .unwrap();
 
         let pkg = "magento/composer";
-        let report = mirror_composer_package(&catalog, &store, up, pkg, None)
+        let report = mirror_composer_package(&catalog, &store, up, pkg)
             .await
             .unwrap();
         assert!(!report.mirrored.is_empty(), "mirrored at least one version");
@@ -1967,7 +1662,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let report = mirror_composer_upstream(&catalog, &store, up, None)
+        let report = mirror_composer_upstream(&catalog, &store, up)
             .await
             .unwrap();
 
@@ -2081,66 +1776,6 @@ mod tests {
             assert!(!e.is_terminal(), "{s:?} should retry");
             assert_eq!(e.reason(), None, "{s:?}");
         }
-    }
-
-    #[test]
-    fn registry_credential_goes_to_the_upstream_origin_only() {
-        let auth = RegistryAuth::new(
-            "https://hyva-themes.repo.packagist.com/acme",
-            "basic",
-            "token:s3cret",
-        );
-        let basic = Some(("authorization", "Basic dG9rZW46czNjcmV0".to_owned()));
-        for own in [
-            "https://hyva-themes.repo.packagist.com/acme/p2/a/b.json",
-            "https://HYVA-THEMES.repo.packagist.com/acme/dists/a/b/1.0.0/rabc.zip",
-            "https://hyva-themes.repo.packagist.com/other/list.json",
-        ] {
-            assert_eq!(auth.header_for(own), basic, "{own}");
-        }
-        for elsewhere in [
-            "http://hyva-themes.repo.packagist.com/acme/p2/a/b.json",
-            "https://hyva-themes.repo.packagist.com:8443/acme/x",
-            "https://repo.packagist.com/acme/x",
-            "https://hyva-themes.repo.packagist.com.evil.example/acme",
-            "https://codeload.github.com/a/b/legacy.zip/abc",
-        ] {
-            assert_eq!(auth.header_for(elsewhere), None, "{elsewhere}");
-        }
-        assert_eq!(
-            RegistryAuth::new("https://r.example", "bearer", "tok")
-                .header_for("https://r.example/x"),
-            Some(("authorization", "Bearer tok".to_owned()))
-        );
-        assert_eq!(
-            RegistryAuth::new("https://gitlab.example", "gitlab", "glpat").header_for(
-                "https://gitlab.example/api/v4/group/1/-/packages/composer/packages.json"
-            ),
-            Some(("private-token", "glpat".to_owned()))
-        );
-        assert_eq!(
-            RegistryAuth::new("https://r.example", "github", "ghp")
-                .header_for("https://r.example/x"),
-            Some(("authorization", "token ghp".to_owned()))
-        );
-        assert_eq!(
-            RegistryAuth::default().header_for("https://r.example/x"),
-            None
-        );
-
-        let base = "https://hyva-themes.repo.packagist.com/acme";
-        assert_eq!(
-            resolve_registry_url(base, "/acme/list.json"),
-            "https://hyva-themes.repo.packagist.com/acme/list.json"
-        );
-        assert_eq!(
-            resolve_registry_url(base, "list.json"),
-            "https://hyva-themes.repo.packagist.com/acme/list.json"
-        );
-        assert_eq!(
-            resolve_registry_url(base, "https://elsewhere.example/list.json"),
-            "https://elsewhere.example/list.json"
-        );
     }
 
     #[test]
@@ -2376,7 +2011,7 @@ mod tests {
             Err(Error::FilterRequired)
         ));
         assert!(matches!(
-            mirror_composer_upstream(&catalog, &store, up, None).await,
+            mirror_composer_upstream(&catalog, &store, up).await,
             Err(Error::FilterRequired)
         ));
 
@@ -2456,11 +2091,6 @@ mod tests {
         /// When on, responses carry an `ETag` and a matching `If-None-Match`
         /// gets a 304 (off by default, like a static registry without one).
         etags: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        /// When set, a request without exactly this `Authorization` is a 401.
-        auth: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-        /// The `Authorization` each path was last requested with.
-        seen_auth:
-            std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
     }
 
     impl FixtureServer {
@@ -2478,14 +2108,7 @@ mod tests {
                 usize,
             >::new()));
             let etags = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let auth = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-            let seen_auth =
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-                    String,
-                    Option<String>,
-                >::new()));
             let (r, h, e) = (routes.clone(), hits.clone(), etags.clone());
-            let (wanted_auth, auth_log) = (auth.clone(), seen_auth.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
@@ -2497,15 +2120,12 @@ mod tests {
                     // Read the headers (keeping If-None-Match); fixture requests
                     // never carry a body.
                     let mut if_none_match = None;
-                    let mut authorization = None;
                     let mut line = String::new();
                     while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
-                        if let Some((k, v)) = line.split_once(':') {
-                            if k.eq_ignore_ascii_case("if-none-match") {
-                                if_none_match = Some(v.trim().to_owned());
-                            } else if k.eq_ignore_ascii_case("authorization") {
-                                authorization = Some(v.trim().to_owned());
-                            }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.eq_ignore_ascii_case("if-none-match")
+                        {
+                            if_none_match = Some(v.trim().to_owned());
                         }
                         line.clear();
                     }
@@ -2515,17 +2135,6 @@ mod tests {
                         .unwrap_or("/")
                         .to_owned();
                     *h.lock().unwrap().entry(path.clone()).or_default() += 1;
-                    auth_log
-                        .lock()
-                        .unwrap()
-                        .insert(path.clone(), authorization.clone());
-                    let required = wanted_auth.lock().unwrap().clone();
-                    if required.is_some() && required != authorization {
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                        continue;
-                    }
                     let mut body = r.lock().unwrap().get(&path).cloned();
                     let etag = body
                         .as_ref()
@@ -2557,17 +2166,7 @@ mod tests {
                 routes,
                 hits,
                 etags,
-                auth,
-                seen_auth,
             }
-        }
-
-        fn require_auth(&self, value: &str) {
-            *self.auth.lock().unwrap() = Some(value.to_owned());
-        }
-
-        fn seen_auth(&self, path: &str) -> Option<String> {
-            self.seen_auth.lock().unwrap().get(path).cloned().flatten()
         }
 
         fn enable_etags(&self) {
@@ -2673,7 +2272,7 @@ mod tests {
             ),
         );
 
-        let report = mirror_composer_package(&catalog, &store, up, name, None)
+        let report = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(report.mirrored.len(), 1, "skipped: {:?}", report.skipped);
@@ -2721,7 +2320,7 @@ mod tests {
             ),
         );
 
-        let err = mirror_composer_package(&catalog, &store, up, name, None)
+        let err = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::ShasumMismatch { .. }), "{err:?}");
@@ -2767,11 +2366,11 @@ mod tests {
             ),
         );
 
-        let first = mirror_composer_package(&catalog, &store, up, name, None)
+        let first = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(first.mirrored.len(), 1);
-        let second = mirror_composer_package(&catalog, &store, up, name, None)
+        let second = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert!(second.mirrored.is_empty());
@@ -2817,7 +2416,7 @@ mod tests {
                 )],
             ),
         );
-        mirror_composer_package(&catalog, &store, up, name, None)
+        mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
 
@@ -2848,7 +2447,7 @@ mod tests {
                 ],
             ),
         );
-        let report = mirror_composer_package(&catalog, &store, up, name, None)
+        let report = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(report.conflicts.len(), 1, "{report:?}");
@@ -2901,19 +2500,19 @@ mod tests {
         };
 
         server.set("/p2/acme/zipref.json", document("aaaa"));
-        let first = mirror_composer_package(&catalog, &store, up, name, None)
+        let first = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(first.mirrored.len(), 1);
 
-        let same = mirror_composer_package(&catalog, &store, up, name, None)
+        let same = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(same.unchanged, 1);
         assert!(same.conflicts.is_empty());
 
         server.set("/p2/acme/zipref.json", document("bbbb"));
-        let moved = mirror_composer_package(&catalog, &store, up, name, None)
+        let moved = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(moved.conflicts.len(), 1, "{moved:?}");
@@ -2986,7 +2585,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = mirror_composer_package(&catalog, &store, up, name, None)
+        let report = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(report.unchanged, 1);
@@ -3062,134 +2661,6 @@ mod tests {
             digest_ls_remote(a),
             digest_ls_remote("1111\trefs/tags/v1.0.0\n")
         );
-    }
-
-    /// A git-mirrored version keeps the commit it was first built from: a moved
-    /// tag is recorded as a conflict and serves the original, and the conflict
-    /// clears once the tag points back. A version stored before commits were
-    /// kept gets its commit filled in when its bytes still match.
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn git_mirrored_versions_stay_put_when_a_tag_moves() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let catalog = Catalog::connect(&url).await.unwrap();
-        catalog.migrate().await.unwrap();
-        let slug = format!("gfrz{}", std::process::id());
-        catalog.create_org(&slug, None).await.unwrap();
-        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
-        let name = format!("acme/frz-{}", std::process::id());
-        let dir = fixture_repo(&name);
-        let cas = unique_temp("cas");
-        let store = FsBlobStore::open(&cas).unwrap();
-        let up_id = catalog
-            .create_upstream(
-                repo_id,
-                "git",
-                &dir.to_string_lossy(),
-                Visibility::Public,
-                None,
-                None,
-                "basic",
-            )
-            .await
-            .unwrap();
-        let stored = |v: &'static str| {
-            let catalog = catalog.clone();
-            let name = name.clone();
-            async move { catalog.stored_dists(repo_id, &name).await.unwrap()[v].clone() }
-        };
-        let rev = |r: &str| {
-            let out = Command::new("git")
-                .args(["rev-parse", &format!("{r}^{{commit}}")])
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout).unwrap().trim().to_owned()
-        };
-
-        let report = mirror_upstream(&catalog, &store, up_id, None)
-            .await
-            .unwrap();
-        assert_eq!(report.mirrored.len(), 2, "{report:?}");
-        let original = stored("1.0.0.0").await;
-        assert_eq!(original.reference.as_deref(), Some(rev("v1.0.0").as_str()));
-        let original_commit = rev("v1.0.0");
-
-        // Unchanged tags are recognised by commit, without re-archiving.
-        let report = mirror_upstream(&catalog, &store, up_id, None)
-            .await
-            .unwrap();
-        assert!(
-            report.mirrored.is_empty() && report.conflicts.is_empty(),
-            "{report:?}"
-        );
-        assert_eq!(report.unchanged, 2);
-
-        // Move v1.0.0 onto a commit with other content.
-        std::fs::write(dir.join("src/Lib.php"), b"<?php // changed\n").unwrap();
-        git(&dir, &["commit", "-qam", "rewrite"]);
-        git(&dir, &["tag", "-f", "v1.0.0"]);
-        let report = mirror_upstream(&catalog, &store, up_id, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            report.conflicts,
-            vec![(format!("{name} v1.0.0"), TAG_MOVED.to_owned())]
-        );
-        assert_eq!(
-            stored("1.0.0.0").await,
-            original,
-            "the stored version stands"
-        );
-        let conflicts = catalog.version_conflicts(repo_id).await.unwrap();
-        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-        assert_eq!(conflicts[0].package, name);
-        assert_eq!(conflicts[0].version, "v1.0.0");
-        assert_eq!(conflicts[0].reason, TAG_MOVED);
-        assert_eq!(
-            conflicts[0].upstream.as_deref(),
-            Some(&*dir.to_string_lossy())
-        );
-
-        // Point it back: the conflict clears.
-        git(&dir, &["tag", "-f", "v1.0.0", &original_commit]);
-        let report = mirror_upstream(&catalog, &store, up_id, None)
-            .await
-            .unwrap();
-        assert!(report.conflicts.is_empty(), "{report:?}");
-        assert!(catalog.version_conflicts(repo_id).await.unwrap().is_empty());
-
-        // A version from before commits were kept: same bytes → commit recorded.
-        let before = stored("1.1.0.0").await;
-        let package_id = catalog
-            .upsert_package(repo_id, &name, "git", None, Visibility::Public)
-            .await
-            .unwrap();
-        catalog
-            .upsert_package_version(
-                package_id,
-                "v1.1.0",
-                "1.1.0.0",
-                "stable",
-                &serde_json::json!({"name": name}),
-                None,
-                before.shasum.as_deref(),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(stored("1.1.0.0").await.reference, None);
-        let report = mirror_upstream(&catalog, &store, up_id, None)
-            .await
-            .unwrap();
-        assert!(report.conflicts.is_empty(), "{report:?}");
-        assert_eq!(stored("1.1.0.0").await.reference, before.reference);
-
-        std::fs::remove_dir_all(&cas).ok();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The scheduler's git check: an upstream never mirrored has changed; after
@@ -3276,116 +2747,6 @@ mod tests {
 
     /// With an `ETag`, re-syncing an unchanged package is one 304: no parsing,
     /// no download. A changed document is fetched and mirrored again.
-    /// A registry that needs a login and lists its packages at `list` (Private
-    /// Packagist): the stored credential is sent to the registry, the dists on
-    /// it are downloaded, and a dist on another host gets no credential.
-    #[tokio::test]
-    async fn credentialed_registry_with_a_package_list_mirrors() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let catalog = Catalog::connect(&url).await.unwrap();
-        catalog.migrate().await.unwrap();
-        let server = FixtureServer::start();
-        let elsewhere = FixtureServer::start();
-        let basic = "Basic dG9rZW46czNjcmV0"; // token:s3cret
-        server.require_auth(basic);
-
-        let slug = format!("cauth{}", std::process::id());
-        catalog.create_org(&slug, None).await.unwrap();
-        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
-        let key = SecretKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
-        let base = format!("{}/acme", server.base);
-        let up = catalog
-            .create_upstream(
-                repo_id,
-                "composer",
-                &base,
-                Visibility::Public,
-                None,
-                Some(&key.encrypt(b"token:s3cret")),
-                "basic",
-            )
-            .await
-            .unwrap();
-        catalog
-            .set_upstream_requires(
-                repo_id,
-                up,
-                &[sconce_catalog::UpstreamRequire::parse("acme/").unwrap()],
-            )
-            .await
-            .unwrap();
-
-        // packages.json names no packages; list.json does (host-relative URL).
-        server.set(
-            "/acme/packages.json",
-            serde_json::to_vec(&serde_json::json!({
-                "packages": [],
-                "metadata-url": "/acme/p2/%package%.json",
-                "list": "/acme/list.json",
-            }))
-            .unwrap(),
-        );
-        server.set(
-            "/acme/list.json",
-            serde_json::to_vec(&serde_json::json!({
-                "packageNames": ["acme/own", "acme/far", "other/skip"]
-            }))
-            .unwrap(),
-        );
-        let own_zip = b"PK\x03\x04own-1.0.0".to_vec();
-        let far_zip = b"PK\x03\x04far-1.0.0".to_vec();
-        server.set("/acme/dists/own-1.0.0.zip", own_zip.clone());
-        elsewhere.set("/far-1.0.0.zip", far_zip.clone());
-        for (name, dist, zip) in [
-            ("acme/own", format!("{base}/dists/own-1.0.0.zip"), &own_zip),
-            (
-                "acme/far",
-                format!("{}/far-1.0.0.zip", elsewhere.base),
-                &far_zip,
-            ),
-        ] {
-            let version = serde_json::json!({
-                "name": name, "version": "1.0.0", "version_normalized": "1.0.0.0",
-                "dist": {"type": "zip", "url": dist, "shasum": sha1_hex(zip)},
-            });
-            server.set(
-                &format!("/acme/p2/{name}.json"),
-                p2_document(name, std::slice::from_ref(&version)),
-            );
-        }
-        let cas = unique_temp("cas");
-        let store = FsBlobStore::open(&cas).unwrap();
-
-        // Without the key the credential can't be read.
-        assert!(
-            mirror_composer_upstream(&catalog, &store, up, None)
-                .await
-                .is_err()
-        );
-
-        let report = mirror_composer_upstream(&catalog, &store, up, Some(&key))
-            .await
-            .unwrap();
-        let mut got: Vec<_> = report.mirrored.iter().map(|m| m.package.as_str()).collect();
-        got.sort_unstable();
-        assert_eq!(got, ["acme/far", "acme/own"], "{report:?}");
-        assert_eq!(server.seen_auth("/acme/list.json").as_deref(), Some(basic));
-        assert_eq!(
-            server.seen_auth("/acme/dists/own-1.0.0.zip").as_deref(),
-            Some(basic)
-        );
-        assert_eq!(elsewhere.hits("/far-1.0.0.zip"), 1);
-        assert_eq!(
-            elsewhere.seen_auth("/far-1.0.0.zip"),
-            None,
-            "no credential off-origin"
-        );
-
-        std::fs::remove_dir_all(&cas).ok();
-    }
-
     #[tokio::test]
     async fn composer_resync_of_an_unchanged_package_is_one_conditional_request() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -3416,7 +2777,7 @@ mod tests {
             p2_document(name, std::slice::from_ref(&v1)),
         );
 
-        let first = mirror_composer_package(&catalog, &store, up, name, None)
+        let first = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(first.mirrored.len(), 1);
@@ -3430,7 +2791,7 @@ mod tests {
             "the ETag is remembered after a complete sync"
         );
 
-        let second = mirror_composer_package(&catalog, &store, up, name, None)
+        let second = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert!(
@@ -3448,7 +2809,7 @@ mod tests {
             &sha1_hex(&zip2),
         );
         server.set("/p2/acme/etag.json", p2_document(name, &[v1, v2]));
-        let third = mirror_composer_package(&catalog, &store, up, name, None)
+        let third = mirror_composer_package(&catalog, &store, up, name)
             .await
             .unwrap();
         assert_eq!(third.mirrored.len(), 1, "the new version is mirrored");
