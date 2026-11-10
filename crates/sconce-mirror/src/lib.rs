@@ -648,6 +648,10 @@ async fn mirror_one_composer_package_inner(
         .stored_dists(up.repo_id, package)
         .await
         .map_err(|e| Error::Catalog(Box::new(e)))?;
+    let conflicted = catalog
+        .conflicted_versions(up.repo_id)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
 
     let mut report = Report::default();
     for obj in &versions {
@@ -693,6 +697,7 @@ async fn mirror_one_composer_package_inner(
             match upstream_change(existing, shasum, reference) {
                 None => {
                     report.unchanged += 1;
+                    clear_conflict(catalog, &conflicted, up.repo_id, package, normalized).await?;
                     if let (None, Some(path)) =
                         (&existing.upstream_dist_path, upstream_dist_path.as_deref())
                     {
@@ -702,9 +707,19 @@ async fn mirror_one_composer_package_inner(
                             .map_err(|e| Error::Catalog(Box::new(e)))?;
                     }
                 }
-                Some(reason) => report
-                    .conflicts
-                    .push((format!("{package} {version}"), reason.to_owned())),
+                Some(reason) => {
+                    record_conflict(
+                        catalog,
+                        &mut report,
+                        up.repo_id,
+                        Some(up.id),
+                        package,
+                        normalized,
+                        format!("{package} {version}"),
+                        reason,
+                    )
+                    .await?;
+                }
             }
             continue;
         }
@@ -765,10 +780,17 @@ async fn mirror_one_composer_package_inner(
                 continue;
             }
             sconce_catalog::PublishOutcome::Conflict => {
-                report.conflicts.push((
+                record_conflict(
+                    catalog,
+                    &mut report,
+                    up.repo_id,
+                    Some(up.id),
+                    package,
+                    normalized,
                     format!("{package} {version}"),
-                    "dist bytes differ from the stored version".to_owned(),
-                ));
+                    "dist bytes differ from the stored version",
+                )
+                .await?;
                 continue;
             }
         }
@@ -1054,6 +1076,17 @@ async fn mirror_checkout(
 ) -> Result<Report, Error> {
     let git_url = source_url;
     let mut report = Report::default();
+    // What each package already has, loaded on first sight of the package.
+    let mut stored_by_pkg: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, sconce_catalog::StoredDist>,
+    > = std::collections::HashMap::new();
+    let conflicted = catalog
+        .conflicted_versions(repo_id)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
+    // Packages this sync saw intact (mirrored or unchanged).
+    let mut synced: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // A monorepo upstream lists each package's subdirectory; the common single-
     // package case (no explicit paths) mirrors the repo root (`""`).
@@ -1116,6 +1149,41 @@ async fn mirror_checkout(
                 continue;
             }
 
+            if !stored_by_pkg.contains_key(&name) {
+                let stored = catalog
+                    .stored_dists(repo_id, &name)
+                    .await
+                    .map_err(|e| Error::Catalog(Box::new(e)))?;
+                stored_by_pkg.insert(name.clone(), stored);
+            }
+            let existing = stored_by_pkg[&name].get(&parsed.normalized).cloned();
+            let commit = sconce_git::commit_id(repo_path, &tag)?;
+            let item = format!("{name} {tag}");
+
+            // A version keeps the commit it was first mirrored from: the same
+            // commit is unchanged, another one means the tag moved.
+            if let Some(stored_commit) = existing.as_ref().and_then(|e| e.reference.as_deref()) {
+                if stored_commit == commit {
+                    report.unchanged += 1;
+                    clear_conflict(catalog, &conflicted, repo_id, &name, &parsed.normalized)
+                        .await?;
+                    synced.insert(name);
+                } else {
+                    record_conflict(
+                        catalog,
+                        &mut report,
+                        repo_id,
+                        upstream_id,
+                        &name,
+                        &parsed.normalized,
+                        item,
+                        TAG_MOVED,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+
             // Archive the package's subtree and store it; the blob is content-
             // addressed. The subtree archives with paths relative to it, so its
             // `dist.shasum` is stable and dedupes independently of siblings.
@@ -1146,20 +1214,71 @@ async fn mirror_checkout(
                 .set_package_source_path(package_id, sp)
                 .await
                 .map_err(|e| Error::Catalog(Box::new(e)))?;
-            catalog
-                .upsert_package_version(
+            // Stored before versions kept their commit: the same bytes mean the
+            // same version, so record its commit; other bytes mean it changed.
+            if let Some(existing) = &existing {
+                if existing.shasum.as_deref() == Some(dist_shasum.as_str()) {
+                    catalog
+                        .backfill_source_reference(package_id, &parsed.normalized, &commit)
+                        .await
+                        .map_err(|e| Error::Catalog(Box::new(e)))?;
+                    report.unchanged += 1;
+                    clear_conflict(catalog, &conflicted, repo_id, &name, &parsed.normalized)
+                        .await?;
+                    synced.insert(name);
+                } else {
+                    record_conflict(
+                        catalog,
+                        &mut report,
+                        repo_id,
+                        upstream_id,
+                        &name,
+                        &parsed.normalized,
+                        item,
+                        TAG_CHANGED,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            let outcome = catalog
+                .insert_git_version(
                     package_id,
                     &tag,
                     &parsed.normalized,
                     &parsed.stability,
                     &composer_json,
-                    Some(blob.as_bytes()),
-                    Some(&dist_shasum),
-                    None, // source_reference (commit sha) — added later
+                    blob.as_bytes(),
+                    &dist_shasum,
+                    &commit,
                     released_at,
                 )
                 .await
                 .map_err(|e| Error::Catalog(Box::new(e)))?;
+            match outcome {
+                sconce_catalog::PublishOutcome::Created => {}
+                // A concurrent sync stored it between the lookup and the insert.
+                sconce_catalog::PublishOutcome::AlreadyPublished => {
+                    report.unchanged += 1;
+                    synced.insert(name);
+                    continue;
+                }
+                sconce_catalog::PublishOutcome::Conflict => {
+                    record_conflict(
+                        catalog,
+                        &mut report,
+                        repo_id,
+                        upstream_id,
+                        &name,
+                        &parsed.normalized,
+                        item,
+                        TAG_CHANGED,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+            synced.insert(name.clone());
 
             report.mirrored.push(Mirrored {
                 tag: tag.clone(),
@@ -1171,15 +1290,55 @@ async fn mirror_checkout(
     }
 
     // A successful clone+mirror clears any earlier broken flag on the packages it
-    // produced (best-effort; distinct names only).
-    let mut synced: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for m in &report.mirrored {
-        if synced.insert(m.package.as_str()) {
-            let _ = catalog.mark_package_synced(repo_id, &m.package).await;
-        }
+    // saw (best-effort).
+    for name in &synced {
+        let _ = catalog.mark_package_synced(repo_id, name).await;
     }
 
     Ok(report)
+}
+
+const TAG_MOVED: &str = "tag moved to another commit since it was mirrored";
+const TAG_CHANGED: &str = "tag content changed since it was mirrored";
+
+/// Note that the upstream now serves something else for a stored version:
+/// in the sync report, and in the catalog for the admin UI. The stored
+/// version is left as it is.
+#[allow(clippy::too_many_arguments)]
+async fn record_conflict(
+    catalog: &Catalog,
+    report: &mut Report,
+    repo_id: Uuid,
+    upstream_id: Option<Uuid>,
+    package: &str,
+    normalized: &str,
+    item: String,
+    reason: &str,
+) -> Result<(), Error> {
+    catalog
+        .record_version_conflict(repo_id, package, normalized, upstream_id, reason)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?;
+    report.conflicts.push((item, reason.to_owned()));
+    Ok(())
+}
+
+/// Forget a recorded conflict once the upstream matches the stored version
+/// again. `conflicted` is the repo's recorded set, so this is free otherwise.
+async fn clear_conflict(
+    catalog: &Catalog,
+    conflicted: &std::collections::HashSet<(String, String)>,
+    repo_id: Uuid,
+    package: &str,
+    normalized: &str,
+) -> Result<(), Error> {
+    if conflicted.contains(&(package.to_owned(), normalized.to_owned())) {
+        catalog
+            .clear_version_conflict(repo_id, package, normalized)
+            .await
+            .map_err(|e| Error::Catalog(Box::new(e)))?;
+    }
+    Ok(())
 }
 
 /// Lowercase sha1 hex of `bytes` — Composer's `dist.shasum` format.
@@ -2661,6 +2820,134 @@ mod tests {
             digest_ls_remote(a),
             digest_ls_remote("1111\trefs/tags/v1.0.0\n")
         );
+    }
+
+    /// A git-mirrored version keeps the commit it was first built from: a moved
+    /// tag is recorded as a conflict and serves the original, and the conflict
+    /// clears once the tag points back. A version stored before commits were
+    /// kept gets its commit filled in when its bytes still match.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn git_mirrored_versions_stay_put_when_a_tag_moves() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let catalog = Catalog::connect(&url).await.unwrap();
+        catalog.migrate().await.unwrap();
+        let slug = format!("gfrz{}", std::process::id());
+        catalog.create_org(&slug, None).await.unwrap();
+        let repo_id = catalog.create_repo(&slug, "r").await.unwrap();
+        let name = format!("acme/frz-{}", std::process::id());
+        let dir = fixture_repo(&name);
+        let cas = unique_temp("cas");
+        let store = FsBlobStore::open(&cas).unwrap();
+        let up_id = catalog
+            .create_upstream(
+                repo_id,
+                "git",
+                &dir.to_string_lossy(),
+                Visibility::Public,
+                None,
+                None,
+                "basic",
+            )
+            .await
+            .unwrap();
+        let stored = |v: &'static str| {
+            let catalog = catalog.clone();
+            let name = name.clone();
+            async move { catalog.stored_dists(repo_id, &name).await.unwrap()[v].clone() }
+        };
+        let rev = |r: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("{r}^{{commit}}")])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+
+        let report = mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        assert_eq!(report.mirrored.len(), 2, "{report:?}");
+        let original = stored("1.0.0.0").await;
+        assert_eq!(original.reference.as_deref(), Some(rev("v1.0.0").as_str()));
+        let original_commit = rev("v1.0.0");
+
+        // Unchanged tags are recognised by commit, without re-archiving.
+        let report = mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        assert!(
+            report.mirrored.is_empty() && report.conflicts.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(report.unchanged, 2);
+
+        // Move v1.0.0 onto a commit with other content.
+        std::fs::write(dir.join("src/Lib.php"), b"<?php // changed\n").unwrap();
+        git(&dir, &["commit", "-qam", "rewrite"]);
+        git(&dir, &["tag", "-f", "v1.0.0"]);
+        let report = mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.conflicts,
+            vec![(format!("{name} v1.0.0"), TAG_MOVED.to_owned())]
+        );
+        assert_eq!(
+            stored("1.0.0.0").await,
+            original,
+            "the stored version stands"
+        );
+        let conflicts = catalog.version_conflicts(repo_id).await.unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].package, name);
+        assert_eq!(conflicts[0].version, "v1.0.0");
+        assert_eq!(conflicts[0].reason, TAG_MOVED);
+        assert_eq!(
+            conflicts[0].upstream.as_deref(),
+            Some(&*dir.to_string_lossy())
+        );
+
+        // Point it back: the conflict clears.
+        git(&dir, &["tag", "-f", "v1.0.0", &original_commit]);
+        let report = mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        assert!(report.conflicts.is_empty(), "{report:?}");
+        assert!(catalog.version_conflicts(repo_id).await.unwrap().is_empty());
+
+        // A version from before commits were kept: same bytes → commit recorded.
+        let before = stored("1.1.0.0").await;
+        let package_id = catalog
+            .upsert_package(repo_id, &name, "git", None, Visibility::Public)
+            .await
+            .unwrap();
+        catalog
+            .upsert_package_version(
+                package_id,
+                "v1.1.0",
+                "1.1.0.0",
+                "stable",
+                &serde_json::json!({"name": name}),
+                None,
+                before.shasum.as_deref(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored("1.1.0.0").await.reference, None);
+        let report = mirror_upstream(&catalog, &store, up_id, None)
+            .await
+            .unwrap();
+        assert!(report.conflicts.is_empty(), "{report:?}");
+        assert_eq!(stored("1.1.0.0").await.reference, before.reference);
+
+        std::fs::remove_dir_all(&cas).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The scheduler's git check: an upstream never mirrored has changed; after

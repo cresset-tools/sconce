@@ -259,6 +259,29 @@ pub fn commit_time(repo_path: impl AsRef<std::path::Path>, refspec: &str) -> Res
     Ok(commit.time().map_err(|e| err(Box::new(e)))?.seconds)
 }
 
+/// The id (hex) of the commit `refspec` resolves to, annotated tags peeled —
+/// what a mirrored version was built from, so a later sync can tell a moved
+/// tag from an unchanged one.
+pub fn commit_id(repo_path: impl AsRef<std::path::Path>, refspec: &str) -> Result<String, Error> {
+    let repo = gix::open(repo_path.as_ref()).map_err(|e| Error::Open(Box::new(e)))?;
+    let id = repo
+        .rev_parse_single(refspec)
+        .map_err(|source| Error::RevParse {
+            refspec: refspec.to_owned(),
+            source: Box::new(source),
+        })?;
+    let err = |source: Box<dyn std::error::Error + Send + Sync>| Error::CommitTime {
+        refspec: refspec.to_owned(),
+        source,
+    };
+    let commit = id
+        .object()
+        .map_err(|e| err(Box::new(e)))?
+        .peel_to_commit()
+        .map_err(|e| err(Box::new(e)))?;
+    Ok(commit.id.to_hex().to_string())
+}
+
 /// Read a file's bytes at `refspec`, or `None` if no such file exists there.
 /// Used to pull `composer.json` from each tag during mirroring.
 pub fn read_file(

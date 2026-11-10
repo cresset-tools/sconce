@@ -728,6 +728,8 @@ pub struct RepoPage {
     pub total_versions: i64,
     pub policy_phrase: String,
     pub broken_count: usize,
+    /// Versions whose upstream changed after they were mirrored (kept as stored).
+    pub conflicts: Vec<sconce_catalog::VersionConflict>,
     pub read_only: bool,
     pub filtering: bool,
     pub approvals_count: i64,
@@ -889,6 +891,7 @@ mod tests {
             total_versions: 0,
             policy_phrase: "manual approval required".to_owned(),
             broken_count: 0,
+            conflicts: Vec::new(),
             read_only: false,
             filtering: false,
             approvals_count: 0,

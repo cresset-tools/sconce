@@ -453,6 +453,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0061_upstream_sync_schedule",
         include_str!("../migrations/0061_upstream_sync_schedule.sql"),
     ),
+    (
+        "0062_version_conflicts",
+        include_str!("../migrations/0062_version_conflicts.sql"),
+    ),
 ];
 
 /// Fold a git remote URL to a canonical `host/path` key so every clone-URL form
@@ -754,6 +758,21 @@ pub enum PublishOutcome {
     /// The version already exists with **different** dist bytes — rejected, so
     /// published versions stay immutable.
     Conflict,
+}
+
+/// A stored version whose upstream changed after it was mirrored
+/// ([`Catalog::version_conflicts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionConflict {
+    pub package: String,
+    /// The version as stored (its display form).
+    pub version: String,
+    pub reason: String,
+    /// The upstream that changed, when it still exists.
+    pub upstream: Option<String>,
+    /// `YYYY-MM-DD HH:MI` (UTC).
+    pub detected_at: String,
+    pub last_seen_at: String,
 }
 
 /// The dist identity already stored for one version ([`Catalog::stored_dists`]).
@@ -4477,8 +4496,7 @@ impl Catalog {
     }
 
     /// Insert a **published** (pushed) version *immutably*. Unlike
-    /// [`Self::upsert_package_version`] — which overwrites on conflict, still used
-    /// by the git mirror — a published version cannot be silently replaced:
+    /// [`Self::upsert_package_version`] — which overwrites on conflict — a published version cannot be silently replaced:
     /// re-publishing identical dist bytes is an idempotent no-op, and publishing
     /// *different* bytes for an existing version is rejected. Returns which of the
     /// three happened; the caller maps it to 201 / 200 / 409.
@@ -4544,6 +4562,157 @@ impl Catalog {
             None,
         )
         .await
+    }
+
+    /// Insert a version mirrored from a **git upstream**, immutably like
+    /// [`Self::insert_mirrored_version`]: a tag later moved to another commit
+    /// does not replace what Composer clients have locked. `commit` is the
+    /// tag's commit, stored as the version's `source_reference`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_git_version(
+        &self,
+        package_id: Uuid,
+        version: &str,
+        normalized_version: &str,
+        stability: &str,
+        composer_json: &Value,
+        dist_blob_sha256: &[u8; 32],
+        dist_shasum: &str,
+        commit: &str,
+        released_at_unix: Option<i64>,
+    ) -> Result<PublishOutcome, sqlx::Error> {
+        self.insert_version_once(
+            package_id,
+            version,
+            normalized_version,
+            stability,
+            composer_json,
+            dist_blob_sha256,
+            dist_shasum,
+            Some(commit),
+            None,
+            released_at_unix,
+        )
+        .await
+    }
+
+    /// Record the commit of a version stored before git versions kept theirs.
+    /// Never overwrites a recorded commit.
+    pub async fn backfill_source_reference(
+        &self,
+        package_id: Uuid,
+        normalized_version: &str,
+        reference: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update package_versions set source_reference = $3 \
+             where package_id = $1 and normalized_version = $2 and source_reference is null",
+        )
+        .bind(package_id)
+        .bind(normalized_version)
+        .bind(reference)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that the upstream of a stored version now serves something else
+    /// for it. Repeated sightings keep the first `detected_at`.
+    pub async fn record_version_conflict(
+        &self,
+        repo_id: Uuid,
+        package: &str,
+        normalized_version: &str,
+        upstream_id: Option<Uuid>,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "insert into version_conflicts (package_id, normalized_version, upstream_id, reason) \
+             select p.id, $3, $4, $5 from packages p where p.repo_id = $1 and p.name = $2 \
+             on conflict (package_id, normalized_version) do update set \
+                 upstream_id = excluded.upstream_id, reason = excluded.reason, \
+                 last_seen_at = now()",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .bind(normalized_version)
+        .bind(upstream_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget a recorded conflict: the upstream matches the stored version again.
+    pub async fn clear_version_conflict(
+        &self,
+        repo_id: Uuid,
+        package: &str,
+        normalized_version: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "delete from version_conflicts vc using packages p \
+             where p.id = vc.package_id and p.repo_id = $1 and p.name = $2 \
+               and vc.normalized_version = $3",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .bind(normalized_version)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// `(package, normalized version)` of every recorded conflict in `repo_id`,
+    /// so a sync clears only those that exist.
+    pub async fn conflicted_versions(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "select p.name, vc.normalized_version from version_conflicts vc \
+             join packages p on p.id = vc.package_id where p.repo_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Versions in `repo_id` whose upstream changed after they were mirrored,
+    /// newest first.
+    pub async fn version_conflicts(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<Vec<VersionConflict>, sqlx::Error> {
+        let rows = sqlx::query(
+            "select p.name, coalesce(pv.version, vc.normalized_version) as version, vc.reason, \
+                    u.base as upstream, \
+                    to_char(vc.detected_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as detected_at, \
+                    to_char(vc.last_seen_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as last_seen_at \
+             from version_conflicts vc \
+             join packages p on p.id = vc.package_id \
+             left join package_versions pv \
+                 on pv.package_id = vc.package_id and pv.normalized_version = vc.normalized_version \
+             left join upstreams u on u.id = vc.upstream_id \
+             where p.repo_id = $1 \
+             order by vc.detected_at desc, p.name, vc.normalized_version",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(VersionConflict {
+                    package: r.try_get("name")?,
+                    version: r.try_get("version")?,
+                    reason: r.try_get("reason")?,
+                    upstream: r.try_get("upstream")?,
+                    detected_at: r.try_get("detected_at")?,
+                    last_seen_at: r.try_get("last_seen_at")?,
+                })
+            })
+            .collect()
     }
 
     /// Record the upstream dist path of an already-stored version that has none

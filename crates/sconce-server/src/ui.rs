@@ -2932,6 +2932,11 @@ async fn repo_page(
     let upstreams = s.catalog.list_upstreams(summary.id).await.map_err(e500)?;
     let ci_policies = s.catalog.ci_policies(summary.id).await.map_err(e500)?;
     let packages = s.catalog.list_packages(summary.id).await.map_err(e500)?;
+    let conflicts = s
+        .catalog
+        .version_conflicts(summary.id)
+        .await
+        .map_err(e500)?;
     let dep_plan = s
         .catalog
         .list_dependency_plan(summary.id)
@@ -3534,6 +3539,7 @@ async fn repo_page(
         total_versions,
         policy_phrase,
         broken_count,
+        conflicts,
         read_only: !user.can_admin(summary.org_id),
         filtering,
         approvals_count: pending_count + held_count,
