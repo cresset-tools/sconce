@@ -5277,12 +5277,9 @@ impl Catalog {
         credential: Option<&[u8]>,
         credential_type: &str,
     ) -> Result<Uuid, sqlx::Error> {
-        // Public upstreams are unauthenticated by definition — never store a
-        // credential for one, whatever the caller passed.
-        let credential = match visibility {
-            Visibility::Public => None,
-            Visibility::Private => credential,
-        };
+        // The credential is about access and visibility about licensing, so
+        // a public upstream may need one too (an OSL package behind a paid
+        // registry).
         sqlx::query_scalar(
             "insert into upstreams (repo_id, kind, base, visibility, label, credential, credential_type) \
              values ($1, $2, $3, $4, $5, $6, $7) returning id",
@@ -10406,30 +10403,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_upstream_drops_any_credential() {
+    async fn public_upstream_keeps_its_credential() {
         let Some((cat, repo_id)) = repo().await else {
             return;
         };
-        // A credential passed for a PUBLIC upstream must not be stored.
+        // Redistributable packages behind a registry that needs a login.
         let id = cat
             .create_upstream(
                 repo_id,
                 "composer",
-                "https://repo.packagist.org",
+                "https://registry.example/acme",
                 Visibility::Public,
                 None,
-                Some(b"should-be-dropped"),
-                "github",
+                Some(b"enc"),
+                "basic",
             )
             .await
             .unwrap();
         let got = cat.get_upstream(id).await.unwrap().unwrap();
-        assert!(
-            got.credential.is_none(),
-            "public upstream stores no credential"
-        );
+        assert_eq!(got.credential.as_deref(), Some(&b"enc"[..]));
         let listed = cat.list_upstreams(repo_id).await.unwrap();
-        assert!(!listed.iter().find(|u| u.id == id).unwrap().has_credential);
+        assert!(listed.iter().find(|u| u.id == id).unwrap().has_credential);
     }
 
     #[tokio::test]

@@ -23,6 +23,8 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 # Fetching Composer-repo metadata + dist zips (composer-kind upstreams).
 ureq = { workspace = true }
+# HTTP basic credentials for composer upstreams.
+base64 = { workspace = true }
 # Filtering available-packages for whole-registry mirroring.
 regex = { workspace = true }
 
