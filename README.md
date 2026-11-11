@@ -68,8 +68,7 @@ live). It is sent to those two hosts only.
 
 A Composer upstream behind a login (Private Packagist, a vendor's paid
 registry) takes `--credential` like a git one: `user:password` as HTTP basic
-auth (Private Packagist's is `token:<key>`), or a token with `--credential-type`
-`bearer`, `github` or `gitlab` (sent in GitLab's `PRIVATE-TOKEN` header).
+auth (Private Packagist's is `token:<key>`), or `--credential-type bearer`.
 It is sent only to the upstream's own scheme, host and port, never to dists
 hosted elsewhere. A registry that lists its packages at `list.json` instead of
 `available-packages`, as Packagist does, is enumerated from there. Visibility
