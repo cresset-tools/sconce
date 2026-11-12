@@ -16,6 +16,7 @@ sconce-catalog = { workspace = true }
 # Composer version normalization + constraint matching (tags, subscriptions).
 composer-semver = { workspace = true }
 # Composer v2 wire format: parse + expand upstream p2/packages.json metadata.
+composer-auth = { workspace = true }
 composer-wire = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
@@ -24,7 +25,6 @@ uuid = { workspace = true }
 # Fetching Composer-repo metadata + dist zips (composer-kind upstreams).
 ureq = { workspace = true }
 # HTTP basic credentials for composer upstreams.
-base64 = { workspace = true }
 # Filtering available-packages for whole-registry mirroring.
 regex = { workspace = true }
 

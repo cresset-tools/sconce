@@ -49,6 +49,7 @@ composer-semver = "0.1.0"
 # Composer v2 repository wire format (p2/packages.json documents + the
 # composer/2.0 minify/expand algorithm), shared with bougie. Replaces sconce's
 # hand-rolled metadata rendering and the (expansion-less) upstream p2 parsing.
+composer-auth = "0.2"
 composer-wire = "0.1"
 sha2 = "0.10"
 sha1 = "0.10"
