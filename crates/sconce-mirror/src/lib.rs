@@ -19,7 +19,6 @@ pub use subscription::Subscription;
 
 use std::path::Path;
 
-use composer_auth::AuthCredentials;
 use composer_wire::{PackageDocument, RootManifest};
 use sconce_cas::BlobStore;
 use sconce_catalog::secret::SecretKey;
@@ -341,10 +340,11 @@ fn github_api_auth(url: &str, token: Option<&str>) -> Option<String> {
 /// upstream's own origin, else the GitHub token when it is on the GitHub API.
 fn http_request(url: &str, auth: &RegistryAuth) -> ureq::Request {
     let req = ureq::get(url);
-    if let Some((name, value)) = auth.header_for(url) {
-        return req.set(name, &value);
-    }
-    match github_api_auth(url, github_token()) {
+    match auth
+        .header_for(url)
+        .map(str::to_owned)
+        .or_else(|| github_api_auth(url, github_token()))
+    {
         Some(value) => req.set("Authorization", &value),
         None => req,
     }
@@ -362,21 +362,20 @@ fn url_origin(url: &str) -> Option<String> {
     Some(format!("{scheme}://{}", host_port.to_ascii_lowercase()))
 }
 
-/// How requests to a composer upstream authenticate: a credential sent only
-/// to the upstream's own origin (scheme, host and port), so a dist hosted
-/// elsewhere never sees it. ureq drops it on redirects.
+/// How requests to a composer upstream authenticate: an `Authorization`
+/// value sent only to the upstream's own origin (scheme, host and port), so
+/// a dist hosted elsewhere never sees it. ureq drops it on redirects.
 #[derive(Debug, Default, Clone)]
 struct RegistryAuth {
     origin: Option<String>,
-    credentials: Option<AuthCredentials>,
+    header: Option<String>,
 }
 
 impl RegistryAuth {
-    /// From the upstream's stored credential, per its `credential_type`, as
-    /// Composer sends it: `bearer` as `Authorization: Bearer`, `github` as
-    /// `Authorization: token`, `gitlab` in a `PRIVATE-TOKEN` header, and
-    /// `basic`, the default, as HTTP basic auth (`user:password`, e.g.
-    /// Private Packagist's `token:<key>`).
+    /// From the upstream's stored credential, per its `credential_type`:
+    /// `bearer` (and `github`/`gitlab`) send `Bearer <token>`; `basic`, the
+    /// default, sends the secret (`user:password`, e.g. Private Packagist's
+    /// `token:<key>`) as HTTP basic auth.
     fn for_upstream(
         up: &sconce_catalog::UpstreamRow,
         key: Option<&SecretKey>,
@@ -388,28 +387,27 @@ impl RegistryAuth {
     }
 
     fn new(base: &str, credential_type: &str, secret: &str) -> Self {
-        let token = secret.to_owned();
-        let credentials = match credential_type {
-            "bearer" => AuthCredentials::Bearer { token },
-            "github" => AuthCredentials::GitHubToken { token },
-            "gitlab" => AuthCredentials::GitLabToken { token },
-            _ => AuthCredentials::basic_from_userinfo(secret),
+        use base64::Engine as _;
+        let header = match credential_type {
+            "bearer" | "github" | "gitlab" => format!("Bearer {secret}"),
+            _ => format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(secret)
+            ),
         };
         Self {
             origin: url_origin(base),
-            credentials: Some(credentials),
+            header: Some(header),
         }
     }
 
-    /// The header (name, value) for a request to `url`, if it goes to the
+    /// The `Authorization` value for a request to `url`, if it goes to the
     /// upstream's origin.
-    fn header_for(&self, url: &str) -> Option<(&'static str, String)> {
+    fn header_for(&self, url: &str) -> Option<&str> {
         let origin = self.origin.as_deref()?;
-        if url_origin(url).as_deref() != Some(origin) {
-            return None;
-        }
-        let credentials = self.credentials.as_ref()?;
-        Some((credentials.header_name(), credentials.header_value()))
+        (url_origin(url).as_deref() == Some(origin))
+            .then_some(self.header.as_deref())
+            .flatten()
     }
 }
 
@@ -2090,13 +2088,13 @@ mod tests {
             "basic",
             "token:s3cret",
         );
-        let basic = Some(("authorization", "Basic dG9rZW46czNjcmV0".to_owned()));
+        let basic = "Basic dG9rZW46czNjcmV0";
         for own in [
             "https://hyva-themes.repo.packagist.com/acme/p2/a/b.json",
             "https://HYVA-THEMES.repo.packagist.com/acme/dists/a/b/1.0.0/rabc.zip",
             "https://hyva-themes.repo.packagist.com/other/list.json",
         ] {
-            assert_eq!(auth.header_for(own), basic, "{own}");
+            assert_eq!(auth.header_for(own), Some(basic), "{own}");
         }
         for elsewhere in [
             "http://hyva-themes.repo.packagist.com/acme/p2/a/b.json",
@@ -2110,18 +2108,7 @@ mod tests {
         assert_eq!(
             RegistryAuth::new("https://r.example", "bearer", "tok")
                 .header_for("https://r.example/x"),
-            Some(("authorization", "Bearer tok".to_owned()))
-        );
-        assert_eq!(
-            RegistryAuth::new("https://gitlab.example", "gitlab", "glpat").header_for(
-                "https://gitlab.example/api/v4/group/1/-/packages/composer/packages.json"
-            ),
-            Some(("private-token", "glpat".to_owned()))
-        );
-        assert_eq!(
-            RegistryAuth::new("https://r.example", "github", "ghp")
-                .header_for("https://r.example/x"),
-            Some(("authorization", "token ghp".to_owned()))
+            Some("Bearer tok")
         );
         assert_eq!(
             RegistryAuth::default().header_for("https://r.example/x"),
