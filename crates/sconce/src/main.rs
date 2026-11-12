@@ -1921,16 +1921,9 @@ fn mirror_package(
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
 
-        let key = sconce_catalog::secret::SecretKey::from_env().ok();
-        let report = sconce_mirror::mirror_composer_package(
-            &catalog,
-            &store,
-            upstream,
-            package,
-            key.as_ref(),
-        )
-        .await
-        .with_context(|| format!("mirroring {package} from upstream {upstream}"))?;
+        let report = sconce_mirror::mirror_composer_package(&catalog, &store, upstream, package)
+            .await
+            .with_context(|| format!("mirroring {package} from upstream {upstream}"))?;
         for m in &report.mirrored {
             println!("  + {} {} ({})", m.package, m.tag, m.stability);
         }
@@ -1962,11 +1955,9 @@ fn mirror_registry(upstream: uuid::Uuid, cas: Option<&Path>, database_url: &str)
             .context("connecting to Postgres")?;
         catalog.migrate().await.context("applying migrations")?;
 
-        let key = sconce_catalog::secret::SecretKey::from_env().ok();
-        let report =
-            sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream, key.as_ref())
-                .await
-                .with_context(|| format!("mirroring registry upstream {upstream}"))?;
+        let report = sconce_mirror::mirror_composer_upstream(&catalog, &store, upstream)
+            .await
+            .with_context(|| format!("mirroring registry upstream {upstream}"))?;
         // Summarize per package so a big run is readable.
         let mut by_pkg: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for m in &report.mirrored {
@@ -2205,7 +2196,7 @@ async fn run_job(
                 .package
                 .as_deref()
                 .ok_or_else(|| bad_job("job missing package"))?;
-            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg, key).await?;
+            let r = sconce_mirror::mirror_composer_package(catalog, store, uid, pkg).await?;
             log_conflicts(&r);
             Ok(format!(
                 "{pkg}: {} version(s), {} unchanged, {} conflict(s)",
@@ -2216,7 +2207,7 @@ async fn run_job(
         }
         "resolve_closure" => {
             let rid = job.repo_id.ok_or_else(|| bad_job("job missing repo_id"))?;
-            let plan = sconce_mirror::resolve_closure(catalog, rid, key).await?;
+            let plan = sconce_mirror::resolve_closure(catalog, rid).await?;
             // A DB write failure here is transient — retry, don't give up.
             catalog
                 .replace_dependency_plan(rid, &plan)
