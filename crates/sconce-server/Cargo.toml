@@ -31,6 +31,7 @@ jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 # Admin UI: compile-time, auto-escaping HTML templates + axum IntoResponse glue.
 askama = { workspace = true }
+askama_web = { workspace = true }
 # SMTP email for the password-reset flow.
 lettre = { workspace = true }
 # Emit log events; the binary installs the subscriber.
