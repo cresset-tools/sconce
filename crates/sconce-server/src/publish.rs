@@ -421,6 +421,24 @@ fn assemble_and_archive(
     archive_targz(&input, expected_name, store, cap)
 }
 
+/// Read `reader` to its end, refusing as soon as it yields more than `remaining` bytes.
+///
+/// The limit has to be enforced *while* reading. A few kilobytes of gzip expand to gigabytes
+/// of zeros, so reading an entry to its end and checking its size afterwards lets one small
+/// upload exhaust the server's memory before the check ever runs. Here at most
+/// `remaining + 1` bytes are buffered.
+fn read_capped(reader: &mut impl Read, remaining: u64) -> Result<Vec<u8>, PrepareError> {
+    let mut content = Vec::new();
+    reader
+        .take(remaining.saturating_add(1))
+        .read_to_end(&mut content)
+        .map_err(|_| PrepareError::Bad("could not read a tar entry".into()))?;
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > remaining {
+        return Err(PrepareError::TooLarge);
+    }
+    Ok(content)
+}
+
 /// The heart of the ingest: gunzip + untar a package, re-archive it deterministically,
 /// validate its `composer.json`, and store the zip in the CAS.
 fn archive_targz(
@@ -471,14 +489,8 @@ fn archive_targz(
             archive.add(Entry::new(rel, Mode::Symlink, content));
         } else if kind.is_file() {
             let mode = entry.header().mode().unwrap_or(0o644);
-            let mut content = Vec::new();
-            entry
-                .read_to_end(&mut content)
-                .map_err(|_| PrepareError::Bad("could not read a tar entry".into()))?;
+            let content = read_capped(&mut entry, cap.saturating_sub(unpacked))?;
             unpacked = unpacked.saturating_add(u64::try_from(content.len()).unwrap_or(u64::MAX));
-            if unpacked > cap {
-                return Err(PrepareError::TooLarge);
-            }
             if rel == "composer.json" {
                 composer_json =
                     Some(serde_json::from_slice(&content).map_err(|_| {
@@ -700,6 +712,47 @@ mod tests {
     /// A pushed tarball is re-archived to *exactly* the same bytes as building the
     /// canonical archive directly from the same tree — the property that makes
     /// pushed and mirrored packages dedupe and share a stable `dist.shasum`.
+    #[test]
+    fn read_capped_stops_at_the_limit_instead_of_buffering_the_stream() {
+        /// An endless stream of zeros that counts how much was pulled from it.
+        struct Zeros(u64);
+        impl Read for Zeros {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0);
+                self.0 += buf.len() as u64;
+                Ok(buf.len())
+            }
+        }
+
+        let mut bomb = Zeros(0);
+        assert!(matches!(
+            read_capped(&mut bomb, 1000),
+            Err(PrepareError::TooLarge)
+        ));
+        assert_eq!(bomb.0, 1001, "one byte past the limit proves the overrun");
+
+        let mut exact = &[7u8; 1000][..];
+        assert_eq!(read_capped(&mut exact, 1000).expect("fits").len(), 1000);
+    }
+
+    #[test]
+    fn archive_targz_enforces_the_cap_across_entries() {
+        let store = tmp_store();
+        let composer = br#"{"name":"acme/tool"}"#;
+        let big = vec![0u8; 64 * 1024];
+        let tar = targz(&[
+            ("composer.json", composer, 0o644),
+            ("a.bin", &big, 0o644),
+            ("b.bin", &big, 0o644),
+        ]);
+        // Either entry fits alone; together they do not.
+        assert!(matches!(
+            archive_targz(&tar, "acme/tool", &store, 100 * 1024),
+            Err(PrepareError::TooLarge)
+        ));
+        assert!(archive_targz(&tar, "acme/tool", &store, 200 * 1024).is_ok());
+    }
+
     #[test]
     fn archive_targz_is_deterministic_and_validates() {
         let cj = br#"{"name":"acme/tool"}"#;
