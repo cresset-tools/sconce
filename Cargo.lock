@@ -191,30 +191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "askama_web"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33d7972c9dc206f9832a16dbba72d589ce8cc313732bd82db36638e70a0b222c"
-dependencies = [
- "askama",
- "askama_web_derive",
- "axum-core",
- "bytes",
- "http",
-]
-
-[[package]]
-name = "askama_web_derive"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "940074e50ab8a902980dec23d265697dd1e8789e66be664d183dbb24c79b8e7c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3600,7 +3576,6 @@ version = "0.12.0"
 dependencies = [
  "gix",
  "sconce-archive",
- "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -3638,7 +3613,6 @@ name = "sconce-server"
 version = "0.12.0"
 dependencies = [
  "askama",
- "askama_web",
  "axum",
  "base64 0.22.1",
  "composer-semver",
