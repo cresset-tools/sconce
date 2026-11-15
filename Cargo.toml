@@ -81,7 +81,7 @@ dotenvy = "0.15"
 # working hash backend + rev-parse without pulling a network client (networking
 # is opt-in, not default). `attributes` adds `.gitattributes` evaluation for
 # honoring `export-ignore` when archiving a ref.
-gix = { version = "0.70", features = ["attributes"] }
+gix = { version = "0.90", features = ["attributes"] }
 # Postgres only, runtime queries only — NO `macros` feature (no compile-time DB
 # checks / query!/migrate! macros). Rows are mapped by hand.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "json"] }
