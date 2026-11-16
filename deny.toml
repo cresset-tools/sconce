@@ -1,0 +1,11 @@
+# cargo-deny configuration. Only the advisory check runs (see
+# .github/workflows/advisories.yml); licences, bans and sources are not checked.
+#
+# Every ignored advisory needs a reason that says why it does not apply or
+# what has to happen before the entry can go.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 (Marvin timing attack) has no fixed release. It arrives through openidconnect, which only verifies signatures with public keys here" },
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml is unmaintained, not vulnerable. It is a build-time dependency of askama_derive" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable. It arrives through openidconnect and oauth2; nothing here depends on it directly" },
+]
