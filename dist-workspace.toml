@@ -92,12 +92,13 @@ github-custom-job-permissions = { "publish-mirror" = { contents = "read" } }
 
 # The musl static build compiles C (the rustls crypto provider / ring build);
 # musl-tools provides the musl-targeting C compiler and cmake covers the C
-# build systems. No Homebrew dependency for macOS: the build runs on the Mac
-# mini, which has cmake already, and dist's `brew bundle exec` wrapper fails
-# there ("failed to brew bundle exec"), which skipped the 0.12.1 upload.
+# build systems. cmake on macOS too for the aarch64-apple-darwin build.
 [dist.dependencies.apt]
 cmake = '*'
 musl-tools = '*'
+
+[dist.dependencies.homebrew]
+cmake = '*'
 
 [dist.binaries]
 "*" = ["sconce"]
