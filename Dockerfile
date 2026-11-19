@@ -9,7 +9,7 @@
 
 # Tracks rust-toolchain.toml (the toolchain file still wins at build time; this
 # only picks the base image). Bumps flow through PRs so the image stays pinned.
-ARG RUST_VERSION=1.96
+ARG RUST_VERSION=1.100
 
 # ---- build ----
 # rustls everywhere (sqlx, ureq) so the build needs no OpenSSL/native libs.
