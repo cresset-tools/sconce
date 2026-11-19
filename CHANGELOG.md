@@ -1,28 +1,5 @@
 # Changelog
 
-## [0.14.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.13.0...sconce-v0.14.0) (2026-11-25)
-
-
-### Features
-
-* **sconce:** export an organization and import it on another instance ([4544bd1](https://github.com/cresset-tools/sconce/commit/4544bd1cccc6f6068f1fe21d1d641a98439ee53c))
-
-## [0.13.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.2...sconce-v0.13.0) (2026-11-24)
-
-
-### Features
-
-* **sconce:** add upstream set-requires to change an upstream's require-list ([d682bf9](https://github.com/cresset-tools/sconce/commit/d682bf98a5ce43a8cc27138b3742bf6aaef23a72))
-
-## [0.12.2](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.1...sconce-v0.12.2) (2026-11-24)
-
-
-### Bug Fixes
-
-* **sconce:** build the macOS release binary without Homebrew ([7d72a33](https://github.com/cresset-tools/sconce/commit/7d72a33db83cfab19b393cbf23fd225547f58e87))
-* **sconce:** bump url to 2.5.9 for RUSTSEC-2026-0592 ([79829ca](https://github.com/cresset-tools/sconce/commit/79829ca839e11a341227c2a998314a133f8ca863))
-* **sconce:** stop reading Packagist's full package list ([68ecf59](https://github.com/cresset-tools/sconce/commit/68ecf59c8924165e63779be75654367fe3fa6ef2))
-
 ## [0.12.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.0...sconce-v0.12.1) (2026-11-19)
 
 
