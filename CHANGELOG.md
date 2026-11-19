@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.0...sconce-v0.12.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **sconce:** bump gix to 0.90 ([948f5f6](https://github.com/cresset-tools/sconce/commit/948f5f61d14031f3005a60b0c5e2a18418aa6c53))
+* **sconce:** bump lettre to 0.11.24 for six SMTP advisories ([d58f65a](https://github.com/cresset-tools/sconce/commit/d58f65afc33c21281e4c5fe258699730953a6d39))
+* **sconce:** enforce the publish size cap while unpacking, not after ([566d68c](https://github.com/cresset-tools/sconce/commit/566d68c6e62eb49d1430559c2cbbf01ac93eb5a7))
+* **sconce:** update locked dependencies ([77379df](https://github.com/cresset-tools/sconce/commit/77379df5115cb1bdcf43b9ea41ae023f730f5d81))
+
 ## [0.12.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.11.0...sconce-v0.12.0) (2026-11-12)
 
 
