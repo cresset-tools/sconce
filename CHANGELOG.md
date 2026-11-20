@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.1...sconce-v0.12.2) (2026-11-20)
+
+
+### Bug Fixes
+
+* **sconce:** build the macOS release binary without Homebrew ([7d72a33](https://github.com/cresset-tools/sconce/commit/7d72a33db83cfab19b393cbf23fd225547f58e87))
+
 ## [0.12.1](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.0...sconce-v0.12.1) (2026-11-19)
 
 
