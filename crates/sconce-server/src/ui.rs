@@ -1840,10 +1840,6 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Authenticate a SCIM request → the org it provisions into.
-#[expect(
-    clippy::result_large_err,
-    reason = "the error is the HTTP response the handler returns as-is"
-)]
 async fn scim_org(s: &Ui, headers: &HeaderMap) -> Result<uuid::Uuid, Response> {
     let token = bearer(headers)
         .ok_or_else(|| scim_error(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
