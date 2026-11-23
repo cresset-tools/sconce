@@ -17,6 +17,7 @@ mod version;
 
 pub use subscription::Subscription;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use composer_auth::AuthCredentials;
@@ -579,24 +580,42 @@ async fn mirror_composer_registry(
     let root = RootManifest::parse(body.as_bytes()).map_err(|_| Error::BadMetadata {
         package: "packages.json".to_owned(),
     })?;
-    // Packagist and Private Packagist list their packages at `list` instead.
-    let listed = match &root.available_packages {
-        Some(_) => None,
-        None => list_package_names(base, &body, auth)?,
-    };
-    // The full set the registry concretely lists (None for pattern-only
-    // registries that publish `available-package-patterns` instead). We need the
-    // *unfiltered* set to reconcile removals independently of the sync filter.
-    let available: Option<std::collections::HashSet<String>> = root
-        .available_packages
-        .or(listed)
-        .map(|names| names.into_iter().collect());
-    let names: Vec<String> = available
-        .iter()
-        .flatten()
-        .filter(|n| sub.matches_name(n))
-        .cloned()
+    // What this upstream already mirrors. A listing keeps these too, so that
+    // one that has vanished from the registry can be told apart from one the
+    // subscription no longer selects. (Pattern-only registries publish
+    // `available-package-patterns` and no listing at all.)
+    let existing: HashSet<String> = catalog
+        .upstream_package_names(up.id)
+        .await
+        .map_err(|e| Error::Catalog(Box::new(e)))?
+        .into_iter()
         .collect();
+    let available = match root.available_packages {
+        Some(names) => Some(Listing {
+            names: names.into_iter().collect(),
+            covers: Coverage::All,
+        }),
+        // Packagist and Private Packagist list their packages at `list` instead.
+        None => list_package_names(base, &body, sub, &existing, auth)?,
+    };
+    // Exact names a listing doesn't speak for are requested as they are; one the
+    // registry lacks fails on its own p2 request.
+    let mut names: Vec<String> = sub
+        .exact_names()
+        .into_iter()
+        .filter(|n| available.as_ref().is_none_or(|l| !l.covers(n)))
+        .collect();
+    if let Some(listing) = &available {
+        names.extend(
+            listing
+                .names
+                .iter()
+                .filter(|n| sub.matches_name(n))
+                .cloned(),
+        );
+    }
+    names.sort_unstable();
+    names.dedup();
 
     // Archived packages are frozen — never re-mirror them (that would un-freeze
     // version discovery).
@@ -629,16 +648,13 @@ async fn mirror_composer_registry(
     }
 
     // Reconcile removals: a package we already mirror from this upstream that has
-    // vanished from a concretely-published `available-packages` was yanked
-    // upstream → flag it broken (source_gone). Only when the registry actually
-    // enumerates (never for pattern-only registries, where absence ≠ removal).
+    // vanished from a listing that covers it was yanked upstream → flag it
+    // broken (source_gone). Only where the registry actually enumerated (never
+    // for pattern-only registries, where absence ≠ removal).
     if let Some(available) = &available {
-        for existing in catalog
-            .upstream_package_names(up.id)
-            .await
-            .map_err(|e| Error::Catalog(Box::new(e)))?
-        {
-            if !available.contains(&existing)
+        for existing in existing {
+            if available.covers(&existing)
+                && !available.names.contains(&existing)
                 && catalog
                     .mark_package_broken(up.repo_id, &existing, "source_gone")
                     .await
@@ -1107,37 +1123,152 @@ fn composer_stability(version: &str) -> String {
 
 /// Map a `ureq` failure to our error, **preserving the HTTP status** (so a
 /// permanent `404`/`403` is distinguishable from a transient transport error).
-/// The package names a registry lists at the `list` URL of its
-/// `packages.json` (Packagist's `{"packageNames": [...]}`), or `None` when it
-/// has none.
+/// Package names a registry listed, and which names the listing speaks for.
+struct Listing {
+    names: HashSet<String>,
+    covers: Coverage,
+}
+
+enum Coverage {
+    /// Every package in the registry.
+    All,
+    /// Only these vendors' packages.
+    Vendors(HashSet<String>),
+}
+
+impl Listing {
+    /// Whether the listing would have named `package` if the registry had it.
+    fn covers(&self, package: &str) -> bool {
+        match &self.covers {
+            Coverage::All => true,
+            Coverage::Vendors(vendors) => package
+                .split_once('/')
+                .is_some_and(|(vendor, _)| vendors.contains(vendor)),
+        }
+    }
+}
+
+/// The packages a registry without `available-packages` lists at the `list`
+/// URL of its `packages.json` (Packagist's `{"packageNames": [...]}`), as far
+/// as the subscription needs them; `None` when it has no list or none is
+/// needed.
+///
+/// Packagist's full list is several hundred thousand names, so it is fetched
+/// only for a subscription that cannot say otherwise (`*`, a regex, a partial
+/// prefix). Exact names need no listing at all, and whole vendors are listed
+/// one by one with `?vendor=`. Whatever is fetched is read as a stream that
+/// keeps only the names the subscription selects or `existing` holds.
 fn list_package_names(
     base: &str,
     root_body: &str,
+    sub: &Subscription,
+    existing: &HashSet<String>,
     auth: &RegistryAuth,
-) -> Result<Option<Vec<String>>, Error> {
-    let bad = || Error::BadMetadata {
-        package: "packages.json".to_owned(),
-    };
-    let root: serde_json::Value = serde_json::from_str(root_body).map_err(|_| bad())?;
+) -> Result<Option<Listing>, Error> {
+    let root: serde_json::Value =
+        serde_json::from_str(root_body).map_err(|_| Error::BadMetadata {
+            package: "packages.json".to_owned(),
+        })?;
     let Some(list) = root.get("list").and_then(serde_json::Value::as_str) else {
         return Ok(None);
     };
     let url = resolve_registry_url(base, list);
-    let body: serde_json::Value =
-        serde_json::from_str(&http_get_string(&url, auth)?).map_err(|_| Error::BadMetadata {
-            package: "list.json".to_owned(),
-        })?;
-    let names = body
-        .get("packageNames")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| Error::BadMetadata {
-            package: "list.json".to_owned(),
-        })?
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    Ok(Some(names))
+    let keep = |name: &str| sub.matches_name(name) || existing.contains(name);
+    match sub.vendors() {
+        None => Ok(Some(Listing {
+            names: fetch_package_names(&url, auth, keep)?,
+            covers: Coverage::All,
+        })),
+        Some(vendors) if vendors.is_empty() => Ok(None),
+        Some(vendors) => {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            let mut names = HashSet::new();
+            for vendor in &vendors {
+                names.extend(fetch_package_names(
+                    &format!("{url}{sep}vendor={vendor}"),
+                    auth,
+                    // A registry that ignores `vendor` still lists only this
+                    // vendor's names as far as the caller can tell.
+                    |name| name.split_once('/').is_some_and(|(v, _)| v == vendor) && keep(name),
+                )?);
+            }
+            Ok(Some(Listing {
+                names,
+                covers: Coverage::Vendors(vendors.into_iter().collect()),
+            }))
+        }
+    }
+}
+
+/// GET a `{"packageNames": [...]}` document and return the names `keep`
+/// accepts, without holding the body or the rest of the names in memory.
+fn fetch_package_names(
+    url: &str,
+    auth: &RegistryAuth,
+    keep: impl Fn(&str) -> bool,
+) -> Result<HashSet<String>, Error> {
+    let resp = http_request(url, auth)
+        .call()
+        .map_err(|e| http_error(url, e))?;
+    let reader = std::io::BufReader::new(resp.into_reader());
+    read_package_names(reader, keep).map_err(|_| Error::BadMetadata {
+        package: "list.json".to_owned(),
+    })
+}
+
+fn read_package_names(
+    reader: impl std::io::Read,
+    keep: impl Fn(&str) -> bool,
+) -> Result<HashSet<String>, serde_json::Error> {
+    use serde::de::{
+        DeserializeSeed, Deserializer, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor,
+    };
+
+    struct Doc<F>(F);
+    struct Names<'a, F>(&'a F);
+
+    impl<'de, F: Fn(&str) -> bool> Visitor<'de> for Doc<F> {
+        type Value = HashSet<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an object with packageNames")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut names = None;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "packageNames" {
+                    names = Some(map.next_value_seed(Names(&self.0))?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            names.ok_or_else(|| A::Error::missing_field("packageNames"))
+        }
+    }
+
+    impl<'de, F: Fn(&str) -> bool> DeserializeSeed<'de> for Names<'_, F> {
+        type Value = HashSet<String>;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+
+    impl<'de, F: Fn(&str) -> bool> Visitor<'de> for Names<'_, F> {
+        type Value = HashSet<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a list of package names")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut names = HashSet::new();
+            while let Some(name) = seq.next_element::<std::borrow::Cow<'de, str>>()? {
+                if (self.0)(&name) {
+                    names.insert(name.into_owned());
+                }
+            }
+            Ok(names)
+        }
+    }
+
+    serde_json::Deserializer::from_reader(reader).deserialize_map(Doc(keep))
 }
 
 fn http_error(url: &str, e: ureq::Error) -> Error {
@@ -1981,6 +2112,26 @@ mod tests {
         assert!(!report.mirrored.is_empty());
 
         std::fs::remove_dir_all(&cas).ok();
+    }
+
+    #[test]
+    fn package_names_are_read_as_a_filtered_stream() {
+        let body = br#"{"meta": {"x": [1, {"y": "z"}]}, "packageNames": ["a/one", "b/two", "a/three"], "tail": true}"#;
+        let mut got: Vec<_> = read_package_names(&body[..], |n| n.starts_with("a/"))
+            .unwrap()
+            .into_iter()
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, ["a/one", "a/three"]);
+        // Escaped names arrive decoded.
+        let escaped = br#"{"packageNames": ["a\/esc"]}"#;
+        assert!(
+            read_package_names(&escaped[..], |_| true)
+                .unwrap()
+                .contains("a/esc")
+        );
+        assert!(read_package_names(&br#"{"other": []}"#[..], |_| true).is_err());
+        assert!(read_package_names(&br#"{"packageNames": [1]}"#[..], |_| true).is_err());
     }
 
     #[test]
@@ -3327,8 +3478,10 @@ mod tests {
             }))
             .unwrap(),
         );
+        // An `acme/` subscription lists only that vendor. This registry
+        // ignores `vendor` and lists everything, which must not leak through.
         server.set(
-            "/acme/list.json",
+            "/acme/list.json?vendor=acme",
             serde_json::to_vec(&serde_json::json!({
                 "packageNames": ["acme/own", "acme/far", "other/skip"]
             }))
@@ -3371,7 +3524,11 @@ mod tests {
         let mut got: Vec<_> = report.mirrored.iter().map(|m| m.package.as_str()).collect();
         got.sort_unstable();
         assert_eq!(got, ["acme/far", "acme/own"], "{report:?}");
-        assert_eq!(server.seen_auth("/acme/list.json").as_deref(), Some(basic));
+        assert_eq!(
+            server.seen_auth("/acme/list.json?vendor=acme").as_deref(),
+            Some(basic)
+        );
+        assert_eq!(server.hits("/acme/list.json"), 0, "never the full list");
         assert_eq!(
             server.seen_auth("/acme/dists/own-1.0.0.zip").as_deref(),
             Some(basic)
@@ -3382,6 +3539,22 @@ mod tests {
             None,
             "no credential off-origin"
         );
+
+        // A subscription of exact names needs no listing at all.
+        catalog
+            .set_upstream_requires(
+                repo_id,
+                up,
+                &[sconce_catalog::UpstreamRequire::parse("acme/own").unwrap()],
+            )
+            .await
+            .unwrap();
+        mirror_composer_upstream(&catalog, &store, up, Some(&key))
+            .await
+            .unwrap();
+        assert_eq!(server.hits("/acme/list.json?vendor=acme"), 1);
+        assert_eq!(server.hits("/acme/list.json"), 0);
+        assert_eq!(server.hits("/acme/p2/acme/own.json"), 2);
 
         std::fs::remove_dir_all(&cas).ok();
     }
