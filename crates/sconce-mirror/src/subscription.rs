@@ -82,6 +82,43 @@ impl Subscription {
         self.0.is_empty()
     }
 
+    /// The packages the subscription names one by one (its exact entries). A
+    /// registry need not be enumerated to find them.
+    #[must_use]
+    pub fn exact_names(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .filter_map(|c| match &c.matcher {
+                Match::Exact(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The vendors its other entries select, when each of them is a whole
+    /// vendor (`acme/`, `acme/*`); `None` when any is not (`*`, a regex, a
+    /// prefix such as `acme/foo-`), which only a full listing can answer.
+    #[must_use]
+    pub fn vendors(&self) -> Option<Vec<String>> {
+        let mut vendors = Vec::new();
+        for c in &self.0 {
+            match &c.matcher {
+                Match::Exact(_) => {}
+                Match::Prefix(p) => {
+                    let vendor = p.strip_suffix('/')?;
+                    if vendor.is_empty() || vendor.contains('/') {
+                        return None;
+                    }
+                    if !vendors.iter().any(|v| v == vendor) {
+                        vendors.push(vendor.to_owned());
+                    }
+                }
+                Match::All | Match::Regex(_) => return None,
+            }
+        }
+        Some(vendors)
+    }
+
     /// Whether any entry matches this package name (the package-selection gate).
     #[must_use]
     pub fn matches_name(&self, name: &str) -> bool {
@@ -239,6 +276,32 @@ mod tests {
         let sub = Subscription::compile(&[req("prefix", "x/", Some("  "))]).unwrap();
         assert!(sub.version_allowed("x/y", "0.0.1.0"));
         assert!(sub.version_allowed("x/y", "99.0.0.0"));
+    }
+
+    #[test]
+    fn exact_names_and_vendors_say_what_to_list() {
+        let sub = Subscription::compile(&[
+            req("exact", "psr/log", Some(">=1.0")),
+            req("prefix", "symfony/*", None),
+            req("prefix", "laminas/", None),
+            req("prefix", "symfony/", Some("^7")),
+        ])
+        .unwrap();
+        assert_eq!(sub.exact_names(), ["psr/log"]);
+        assert_eq!(sub.vendors().unwrap(), ["symfony", "laminas"]);
+
+        let only_exact = Subscription::compile(&[req("exact", "psr/log", None)]).unwrap();
+        assert_eq!(only_exact.vendors().unwrap(), Vec::<String>::new());
+
+        for (kind, pattern) in [
+            ("all", ""),
+            ("regex", "^a/"),
+            ("prefix", "acme/foo-"),
+            ("prefix", "acme"),
+        ] {
+            let sub = Subscription::compile(&[req(kind, pattern, None)]).unwrap();
+            assert!(sub.vendors().is_none(), "{kind} {pattern}");
+        }
     }
 
     #[test]

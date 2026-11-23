@@ -3869,6 +3869,7 @@ dependencies = [
  "sconce-cas",
  "sconce-catalog",
  "sconce-git",
+ "serde",
  "serde_json",
  "sha1",
  "sqlx",
