@@ -3431,6 +3431,7 @@ mod tests {
     /// Packagist): the stored credential is sent to the registry, the dists on
     /// it are downloaded, and a dist on another host gets no credential.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn credentialed_registry_with_a_package_list_mirrors() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             return;
