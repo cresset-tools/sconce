@@ -837,8 +837,10 @@ enum UpstreamAction {
         /// Mirror subscription entry, repeatable (OR-union). Forms:
         /// `vendor/*` or `vendor/` (a vendor prefix), `vendor/pkg` (one package),
         /// `*` (the whole registry — require-all), `re:<regex>` (advanced). Append
-        /// `@<version>` for a version floor, e.g. `mage-os/*@2.4`. Required for a
-        /// composer upstream; optional floor for a git one (use `*@<version>`).
+        /// `@<constraint>` to limit versions with a Composer constraint, e.g.
+        /// `mage-os/*@>=2.4` or `psr/log@^3.0`; a bare `@2.4` means `2.4.*`, as
+        /// in composer.json. Required for a composer upstream; optional for a git
+        /// one (use `*@<constraint>`).
         #[arg(long = "require")]
         require: Vec<String>,
         /// git-only: a monorepo subdirectory to mirror as its own package
@@ -864,6 +866,26 @@ enum UpstreamAction {
         repo: String,
         /// Upstream id to remove.
         id: uuid::Uuid,
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+    },
+    /// Replace an upstream's require-list (its mirror subscription) with the
+    /// given entries. Already-mirrored versions stay; the next sync mirrors by
+    /// the new list.
+    SetRequires {
+        /// Repository, as `<org>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// Upstream id (see `upstream list`).
+        id: uuid::Uuid,
+        /// Subscription entry, repeatable — same form as `upstream add
+        /// --require` (e.g. `mage-os/*@>=2.4`, `psr/log@^3.0`).
+        #[arg(long = "require")]
+        require: Vec<String>,
+        /// Read more entries from a file, one per line (`-` for stdin). Blank
+        /// lines and lines starting with `#` are skipped.
+        #[arg(long)]
+        require_file: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
@@ -1360,6 +1382,13 @@ fn main() -> Result<()> {
                 id,
                 database_url,
             } => upstream_remove(&repo, id, &database_url),
+            UpstreamAction::SetRequires {
+                repo,
+                id,
+                require,
+                require_file,
+                database_url,
+            } => upstream_set_requires(&repo, id, &require, require_file.as_deref(), &database_url),
         },
         Command::MirrorUpstream {
             id,
@@ -1868,6 +1897,69 @@ fn upstream_remove(repo: &str, id: uuid::Uuid, database_url: &str) -> Result<()>
             anyhow::bail!("no such upstream {id} in {repo}")
         }
     })
+}
+
+fn upstream_set_requires(
+    repo: &str,
+    id: uuid::Uuid,
+    require: &[String],
+    require_file: Option<&Path>,
+    database_url: &str,
+) -> Result<()> {
+    let mut specs = require.to_vec();
+    if let Some(path) = require_file {
+        let text = if path == Path::new("-") {
+            std::io::read_to_string(std::io::stdin()).context("reading requires from stdin")?
+        } else {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading requires from {}", path.display()))?
+        };
+        specs.extend(require_file_entries(&text));
+    }
+    let requires = specs
+        .iter()
+        .map(|r| sconce_catalog::UpstreamRequire::parse(r).map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<Vec<_>>>()?;
+    // Reject a bad constraint now rather than at the next sync.
+    sconce_mirror::Subscription::compile(&requires).map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_catalog(database_url, async |catalog| {
+        let repo_id = resolve_repo(&catalog, repo).await?;
+        let upstream = catalog
+            .get_upstream(id)
+            .await
+            .context("loading upstream")?
+            .filter(|u| u.repo_id == repo_id)
+            .ok_or_else(|| anyhow::anyhow!("no such upstream {id} in {repo}"))?;
+        // Same rule as `upstream add`: an empty list would mirror the whole
+        // registry, so a composer upstream must keep at least one entry.
+        if upstream.kind == "composer" && requires.is_empty() {
+            anyhow::bail!(
+                "a composer upstream needs at least one require entry \
+                 (use --require '*' to mirror everything)"
+            );
+        }
+        catalog
+            .set_upstream_requires(repo_id, id, &requires)
+            .await
+            .context("setting mirror subscription")?;
+        eprintln!(
+            "Set {} require entr{} on upstream {id} (was {}).",
+            requires.len(),
+            if requires.len() == 1 { "y" } else { "ies" },
+            upstream.requires.len()
+        );
+        Ok(())
+    })
+}
+
+/// The entries in a `--require-file`: one per line, blank lines and `#`
+/// comments skipped.
+fn require_file_entries(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn mirror_upstream(id: uuid::Uuid, cas: Option<&Path>, database_url: &str) -> Result<()> {
@@ -4461,7 +4553,13 @@ fn file_mode(path: &Path) -> Result<Mode> {
 
 #[cfg(test)]
 mod tests {
-    use super::retry_backoff_secs;
+    use super::{require_file_entries, retry_backoff_secs};
+
+    #[test]
+    fn require_file_skips_blank_lines_and_comments() {
+        let text = "# demo store\npsr/log@>=3.0.2\n\n  mage-os/*  \n#symfony/*\n";
+        assert_eq!(require_file_entries(text), ["psr/log@>=3.0.2", "mage-os/*"]);
+    }
 
     /// `--help` must never print an environment variable's value: they carry
     /// the database password, the admin password and publish tokens, and help
