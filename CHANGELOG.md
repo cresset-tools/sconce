@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.2...sconce-v0.13.0) (2026-11-24)
+
+
+### Features
+
+* **sconce:** add upstream set-requires to change an upstream's require-list ([d682bf9](https://github.com/cresset-tools/sconce/commit/d682bf98a5ce43a8cc27138b3742bf6aaef23a72))
+
 ## [0.12.2](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.1...sconce-v0.12.2) (2026-11-24)
 
 
