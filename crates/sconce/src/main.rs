@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod org_transfer;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -155,6 +157,41 @@ enum Command {
         slug: String,
         #[arg(long)]
         name: Option<String>,
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+    },
+
+    /// Export an organization — its repositories, packages and their dists,
+    /// upstreams, editions, license keys and tokens — to one file, to move it
+    /// to another instance with `org-import`. Upstream credentials and license
+    /// keys are written decrypted (the target has its own `SCONCE_SECRET_KEY`),
+    /// so the file is created owner-only and should be deleted after use.
+    /// Accounts and sign-in settings stay behind.
+    OrgExport {
+        /// Organization slug.
+        org: String,
+        /// File to write (`.tar.gz`); must not exist yet.
+        #[arg(long)]
+        out: PathBuf,
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
+        #[arg(long)]
+        cas: Option<PathBuf>,
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database_url: String,
+    },
+
+    /// Import an organization exported with `org-export`. Refused when the
+    /// organization already exists here or the export was made by a newer
+    /// sconce; otherwise its rows are written in one transaction, after its
+    /// blobs are stored.
+    OrgImport {
+        /// File written by `org-export`.
+        bundle: PathBuf,
+        /// Directory of the filesystem CAS. Omit when the S3 backend is
+        /// configured via the `SCONCE_S3`_* environment variables.
+        #[arg(long)]
+        cas: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         database_url: String,
     },
@@ -1346,6 +1383,17 @@ fn main() -> Result<()> {
             name,
             database_url,
         } => org_create(&slug, name.as_deref(), &database_url),
+        Command::OrgExport {
+            org,
+            out,
+            cas,
+            database_url,
+        } => org_transfer::export(&org, &out, cas.as_deref(), &database_url),
+        Command::OrgImport {
+            bundle,
+            cas,
+            database_url,
+        } => org_transfer::import(&bundle, cas.as_deref(), &database_url),
         Command::OrgSettings {
             org,
             allow_raw_tokens,
