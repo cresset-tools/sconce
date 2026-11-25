@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod secret;
+pub mod transfer;
 
 use std::time::Duration;
 
@@ -8376,7 +8377,7 @@ fn generate_secret(prefix: &str) -> String {
 }
 
 /// sha256 of a token — what we store and compare against.
-fn token_hash(token: &str) -> Vec<u8> {
+pub(crate) fn token_hash(token: &str) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(token.as_bytes()).to_vec()
 }
