@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.13.0...sconce-v0.14.0) (2026-11-25)
+
+
+### Features
+
+* **sconce:** export an organization and import it on another instance ([4544bd1](https://github.com/cresset-tools/sconce/commit/4544bd1cccc6f6068f1fe21d1d641a98439ee53c))
+
 ## [0.13.0](https://github.com/cresset-tools/sconce/compare/sconce-v0.12.2...sconce-v0.13.0) (2026-11-24)
 
 
