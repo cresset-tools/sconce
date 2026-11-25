@@ -1168,9 +1168,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.3"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
+checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "sconce"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3809,14 +3809,14 @@ dependencies = [
 
 [[package]]
 name = "sconce-archive"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "sconce-cas"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "hmac 0.12.1",
  "sha2 0.10.9",
@@ -3825,7 +3825,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-catalog"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3842,7 +3842,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-git"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "gix",
  "sconce-archive",
@@ -3851,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-metadata"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "composer-wire",
  "sconce-catalog",
@@ -3860,7 +3860,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-mirror"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "composer-auth",
  "composer-semver",
@@ -3869,7 +3869,6 @@ dependencies = [
  "sconce-cas",
  "sconce-catalog",
  "sconce-git",
- "serde",
  "serde_json",
  "sha1",
  "sqlx",
@@ -3881,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "sconce-server"
-version = "0.14.0"
+version = "0.12.1"
 dependencies = [
  "askama",
  "axum",
@@ -4191,9 +4190,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.6"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 dependencies = [
  "serde",
 ]
@@ -4863,9 +4862,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.9"
+version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
+checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
 dependencies = [
  "form_urlencoded",
  "idna",
