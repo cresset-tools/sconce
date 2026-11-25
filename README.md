@@ -183,31 +183,6 @@ Large packages upload in **resumable chunks**, so a single request body limit
 Per-request and whole-package caps are `SCONCE_MAX_UPLOAD_BYTES` (default 100 MiB)
 and `SCONCE_MAX_PACKAGE_BYTES` (default 1 GiB).
 
-## Moving an organization to another instance
-
-`org-export` writes one organization to a file — its repositories, packages and
-their dists, upstreams, package sets, editions, license keys, tokens and CI
-policies — and `org-import` loads it on another instance:
-
-```bash
-sconce org-export acme --out acme.tar.gz --cas /var/lib/sconce/cas   # old instance
-sconce org-import acme.tar.gz --cas /var/lib/sconce/cas              # new instance
-```
-
-Rows keep their ids and token hashes, so read tokens, service tokens and license
-keys issued on the old instance work unchanged on the new one. Upstream
-credentials and recoverable license keys are encrypted with each instance's own
-`SCONCE_SECRET_KEY`, so the export holds them **decrypted** and the import
-re-encrypts them: the file is created owner-only (`0600`); delete it once
-imported. User accounts and SSO settings stay behind (people sign in again),
-as do rows that point into another organization, which the export lists.
-
-An import is refused when the organization already exists on the target or
-the export came from a newer sconce (upgrade the target first); otherwise it
-stores the blobs, then writes every row in one transaction. Composer URLs carry
-the instance's host, so clients and the store front pointing at the old one
-need its new base URL.
-
 ## Workspace
 
 | Crate | Role |
